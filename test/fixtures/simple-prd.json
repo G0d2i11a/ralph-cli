@@ -1,0 +1,27 @@
+{
+  "id": "simple-todo",
+  "title": "Simple Todo App",
+  "description": "A basic command-line todo application",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Add todo item",
+      "description": "As a user, I want to add a new todo item",
+      "acceptanceCriteria": [
+        "User can add a todo with a description",
+        "Todo is saved to a JSON file",
+        "Success message is displayed"
+      ]
+    },
+    {
+      "id": "US-002",
+      "title": "List todo items",
+      "description": "As a user, I want to see all my todo items",
+      "acceptanceCriteria": [
+        "Display all todos with their status",
+        "Show todo ID and description",
+        "Handle empty list gracefully"
+      ]
+    }
+  ]
+}
