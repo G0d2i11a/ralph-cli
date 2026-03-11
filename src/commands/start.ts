@@ -21,19 +21,9 @@ export async function startCommand(
     // Check dependencies
     const stateManager = new StateManager();
     const depCheck = await checkDependencies(prd, stateManager);
-    if (!depCheck.satisfied) {
-      console.error(JSON.stringify({
-        error: `Dependencies not satisfied: ${depCheck.pending.join(', ')}`
-      }));
-      process.exit(1);
-    }
     
     // Generate task ID
     const taskId = generateTaskId();
-    
-    // Create worktree
-    const worktreeManager = new WorktreeManager();
-    const worktreePath = await worktreeManager.createWorktree(repoPath, taskId);
     
     // Create log path
     const logDir = path.join(os.homedir(), '.ralph', 'tasks', taskId);
@@ -43,6 +33,43 @@ export async function startCommand(
     if (!fs.existsSync(logDir)) {
       fs.mkdirSync(logDir, { recursive: true });
     }
+    
+    if (!depCheck.satisfied) {
+      // Dependencies not satisfied - create pending task
+      const task: Task = {
+        id: taskId,
+        prdPath: path.resolve(prdPath),
+        status: 'pending',
+        startTime: Date.now(),
+        completedUS: [],
+        worktree: '', // Will be created when dependencies are satisfied
+        logPath,
+        agent,
+        repoPath,
+        loopCount: 0,
+        consecutiveNoProgress: 0,
+        consecutiveErrors: 0,
+        lastProgressTime: Date.now(),
+        lastFilesChanged: 0
+      };
+      
+      await stateManager.saveTask(task);
+      
+      console.log(JSON.stringify({
+        taskId,
+        status: 'pending',
+        reason: 'waiting for dependencies',
+        dependencies: depCheck.pending,
+        message: 'Task will start automatically when dependencies are completed'
+      }));
+      
+      return;
+    }
+    
+    // Dependencies satisfied - start immediately
+    // Create worktree
+    const worktreeManager = new WorktreeManager();
+    const worktreePath = await worktreeManager.createWorktree(repoPath, taskId);
     
     // Create task with stagnation fields initialized
     const task: Task = {

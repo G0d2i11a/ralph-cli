@@ -12,6 +12,7 @@ import { updateCommand } from './commands/update';
 import { retryCommand } from './commands/retry';
 import { resetStagnationCommand } from './commands/reset-stagnation';
 import { completionCommand } from './commands/completion';
+import { watch } from './commands/watch';
 
 const program = new Command();
 
@@ -125,6 +126,27 @@ program
 Examples:
   $ ralph reset-stagnation task-1772544497775-wdat8zyr5`)
   .action(resetStagnationCommand);
+
+program
+  .command('watch')
+  .description('Watch for pending tasks and start them when dependencies are satisfied')
+  .option('--interval <ms>', 'Polling interval in milliseconds', '30000')
+  .addHelpText('after', `
+Examples:
+  $ ralph watch
+  $ ralph watch --interval 10000
+  
+Description:
+  Starts a background watcher that monitors pending tasks.
+  When a task's dependencies are satisfied, it automatically starts the task.
+  
+  This enables dependency-based task queuing:
+  1. Start tasks with dependencies using 'ralph start' (they become pending)
+  2. Run 'ralph watch' to monitor and auto-start them
+  3. Tasks start automatically when their dependencies complete
+  
+  Press Ctrl+C to stop the watcher.`)
+  .action((options) => watch({ interval: parseInt(options.interval) }));
 
 program
   .command('completion <shell>')
