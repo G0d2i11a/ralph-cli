@@ -89,7 +89,7 @@ export async function mergeBranch(
       execSync('git add .', { cwd: repoPath });
       
       // Complete merge
-      execSync(`git commit -m "Merge ${branchName} (auto-resolved with ${strategy})"`, {
+      execSync(`git commit -m "feat: merge ${branchName} (auto-resolved with ${strategy})"`, {
         cwd: repoPath
       });
       
