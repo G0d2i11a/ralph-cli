@@ -3,7 +3,8 @@ import * as os from 'os';
 import * as fs from 'fs';
 import { StateManager } from '../core/state';
 import { WorktreeManager } from '../core/worktree';
-import { AgentRunner, AgentType } from '../core/agent';
+import { AgentType } from '../core/agent';
+import { bootstrapWorktreeDeps } from '../core/bootstrap';
 import { generateTaskId, parsePRD, checkDependencies } from '../utils/helpers';
 import { Task } from '../types/task';
 
@@ -70,7 +71,12 @@ export async function startCommand(
     // Create worktree
     const worktreeManager = new WorktreeManager();
     const worktreePath = await worktreeManager.createWorktree(repoPath, taskId);
-    
+
+    bootstrapWorktreeDeps(worktreePath, {
+      repoPath,
+      logPath,
+    });
+
     // Create task with stagnation fields initialized
     const task: Task = {
       id: taskId,
@@ -91,10 +97,8 @@ export async function startCommand(
     
     // Save task
     await stateManager.saveTask(task);
-    
+
     // Start agent in background
-    const runner = new AgentRunner();
-    
     // Fork process to run in background
     const { fork } = require('child_process');
     const workerPath = path.join(__dirname, '../worker.js');

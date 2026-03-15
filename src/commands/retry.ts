@@ -1,4 +1,5 @@
 import { StateManager } from '../core/state';
+import { bootstrapWorktreeDeps } from '../core/bootstrap';
 import * as path from 'path';
 import { fork } from 'child_process';
 
@@ -32,6 +33,12 @@ export async function retryCommand(taskId: string) {
     task.status = 'running';
 
     await stateManager.saveTask(task);
+
+    // Re-check dependency links before the agent is restarted.
+    bootstrapWorktreeDeps(task.worktree, {
+      repoPath: task.repoPath,
+      logPath: task.logPath,
+    });
 
     // Restart agent worker
     const workerPath = path.join(__dirname, '../worker.js');
