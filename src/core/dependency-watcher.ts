@@ -1,5 +1,6 @@
 import { StateManager } from '../core/state';
 import { WorktreeManager } from '../core/worktree';
+import { bootstrapWorktreeDeps } from '../core/bootstrap';
 import { parsePRD, checkDependencies } from '../utils/helpers';
 import * as path from 'path';
 
@@ -75,6 +76,12 @@ export class DependencyWatcher {
         task.worktree = worktreePath;
         await this.stateManager.updateTask(task.id, { worktree: worktreePath });
       }
+
+      // Bootstrap dependencies so retries or older tasks are also covered.
+      bootstrapWorktreeDeps(task.worktree, {
+        repoPath: task.repoPath,
+        logPath: task.logPath,
+      });
 
       // Fork worker process
       const workerPath = path.join(__dirname, '../worker.js');

@@ -1,5 +1,6 @@
 import { StateManager } from './core/state';
 import { AgentRunner, AgentType } from './core/agent';
+import { bootstrapWorktreeDeps } from './core/bootstrap';
 import { parsePRD, detectStagnation } from './utils/helpers';
 import { execSync } from 'child_process';
 import * as fs from 'fs';
@@ -21,6 +22,13 @@ async function runWorker(taskId: string) {
   console.log(`[Worker] Agent: ${task.agent}`);
   
   try {
+    if (task.worktree) {
+      bootstrapWorktreeDeps(task.worktree, {
+        repoPath: task.repoPath,
+        logPath: task.logPath,
+      });
+    }
+
     // Parse PRD
     console.log(`[Worker] Parsing PRD from ${task.prdPath}`);
     const prd = parsePRD(task.prdPath);
