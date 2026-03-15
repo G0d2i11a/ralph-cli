@@ -564,13 +564,7 @@ export function bootstrapWorktreeDeps(
     const message =
       error instanceof Error ? error.message : String(error);
     logger(`Dependency bootstrap failed: ${message}`, 'error');
-
-    return {
-      bootstrapped: false,
-      packageManager: inspection.packageManager,
-      installRoot: inspection.installRoot,
-      message,
-    };
+    throw error;
   }
 
   logger(
