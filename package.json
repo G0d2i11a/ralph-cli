@@ -9,7 +9,7 @@
   "scripts": {
     "build": "tsc",
     "dev": "tsc --watch",
-    "test": "npm run build && node --test test/bootstrap.test.js",
+    "test": "npm run build && node --test test/*.test.js",
     "prepare": "npm run build"
   },
   "keywords": [

@@ -129,7 +129,7 @@ Examples:
 
 program
   .command('watch')
-  .description('Watch for pending tasks and start them when dependencies are satisfied')
+  .description('Poll pending tasks and start any that are dependency-ready and within concurrency limits')
   .option('--interval <ms>', 'Polling interval in milliseconds', '30000')
   .addHelpText('after', `
 Examples:
@@ -137,13 +137,12 @@ Examples:
   $ ralph watch --interval 10000
   
 Description:
-  Starts a background watcher that monitors pending tasks.
-  When a task's dependencies are satisfied, it automatically starts the task.
+  Starts a background watcher that reconciles the pending queue.
+  When a task's dependencies are satisfied and a concurrency slot is available,
+  it automatically starts the task.
   
-  This enables dependency-based task queuing:
-  1. Start tasks with dependencies using 'ralph start' (they become pending)
-  2. Run 'ralph watch' to monitor and auto-start them
-  3. Tasks start automatically when their dependencies complete
+  Ralph now auto-starts queued tasks when running tasks finish, fail, or stop.
+  This watcher remains useful as a polling safety net for pending tasks.
   
   Press Ctrl+C to stop the watcher.`)
   .action((options) => watch({ interval: parseInt(options.interval) }));

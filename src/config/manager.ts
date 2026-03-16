@@ -38,6 +38,27 @@ const DEFAULT_CONFIG: RalphConfig = {
   }
 };
 
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function mergeConfig<T extends Record<string, any>>(defaults: T, overrides: Partial<T>): T {
+  const merged: Record<string, unknown> = { ...defaults };
+
+  for (const [key, value] of Object.entries(overrides)) {
+    const defaultValue = merged[key];
+
+    if (isPlainObject(defaultValue) && isPlainObject(value)) {
+      merged[key] = mergeConfig(defaultValue, value);
+      continue;
+    }
+
+    merged[key] = value;
+  }
+
+  return merged as T;
+}
+
 export class ConfigManager {
   private configPath: string;
   private config: RalphConfig;
@@ -59,7 +80,7 @@ export class ConfigManager {
 
     try {
       const content = fs.readFileSync(this.configPath, 'utf-8');
-      return { ...DEFAULT_CONFIG, ...JSON.parse(content) };
+      return mergeConfig(DEFAULT_CONFIG, JSON.parse(content));
     } catch (error) {
       console.error('Failed to load config, using defaults:', error);
       return DEFAULT_CONFIG;

@@ -1,4 +1,5 @@
 import { StateManager } from '../core/state';
+import { finalizeTask } from '../core/scheduler';
 import { isProcessRunning } from '../utils/helpers';
 
 export async function stopCommand(taskId: string): Promise<void> {
@@ -21,7 +22,7 @@ export async function stopCommand(taskId: string): Promise<void> {
         message: 'Process already stopped',
         taskId 
       }));
-      await stateManager.updateTaskStatus(taskId, 'failed', Date.now());
+      await finalizeTask(task, 'failed', { stateManager });
       return;
     }
     
@@ -37,7 +38,7 @@ export async function stopCommand(taskId: string): Promise<void> {
         process.kill(task.pid, 'SIGKILL');
       }
       
-      await stateManager.updateTaskStatus(taskId, 'failed', Date.now());
+      await finalizeTask(task, 'failed', { stateManager });
       
       console.log(JSON.stringify({
         message: 'Task stopped',

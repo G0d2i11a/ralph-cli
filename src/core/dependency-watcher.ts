@@ -1,10 +1,6 @@
 import { StateManager } from '../core/state';
 import { WorktreeManager } from '../core/worktree';
-import { bootstrapWorktreeDeps } from '../core/bootstrap';
-import { parsePRD, checkDependencies } from '../utils/helpers';
-import * as path from 'path';
-
-const { fork } = require('child_process');
+import { schedulePendingTasks } from './scheduler';
 
 export class DependencyWatcher {
   private stateManager: StateManager;
@@ -45,64 +41,13 @@ export class DependencyWatcher {
   }
 
   private async checkPendingTasks(): Promise<void> {
-    const pendingTasks = await this.stateManager.listTasks('pending');
+    const startedTasks = await schedulePendingTasks({
+      stateManager: this.stateManager,
+      worktreeManager: this.worktreeManager,
+    });
 
-    for (const task of pendingTasks) {
-      try {
-        // Parse PRD to get dependencies
-        const prd = parsePRD(task.prdPath);
-
-        // Check if dependencies are satisfied
-        const depCheck = await checkDependencies(prd, this.stateManager);
-
-        if (depCheck.satisfied) {
-          console.log(`Dependencies satisfied for task ${task.id}, starting...`);
-          await this.startTask(task);
-        }
-      } catch (error) {
-        console.error(`Error processing task ${task.id}:`, error);
-      }
-    }
-  }
-
-  private async startTask(task: any): Promise<void> {
-    try {
-      // Create worktree if not exists
-      if (!task.worktree) {
-        const worktreePath = await this.worktreeManager.createWorktree(
-          task.repoPath,
-          task.id
-        );
-        task.worktree = worktreePath;
-        await this.stateManager.updateTask(task.id, { worktree: worktreePath });
-      }
-
-      // Bootstrap dependencies so retries or older tasks are also covered.
-      bootstrapWorktreeDeps(task.worktree, {
-        repoPath: task.repoPath,
-        logPath: task.logPath,
-      });
-
-      // Fork worker process
-      const workerPath = path.join(__dirname, '../worker.js');
-      const child = fork(workerPath, [task.id], {
-        detached: true,
-        stdio: 'ignore'
-      });
-
-      child.unref();
-
-      // Update task status
-      await this.stateManager.updateTask(task.id, {
-        pid: child.pid,
-        status: 'running',
-        startTime: Date.now()
-      });
-
-      console.log(`Task ${task.id} started (PID: ${child.pid})`);
-    } catch (error) {
-      console.error(`Failed to start task ${task.id}:`, error);
-      await this.stateManager.updateTaskStatus(task.id, 'failed');
+    for (const task of startedTasks) {
+      console.log(`Task ${task.id} started (PID: ${task.pid})`);
     }
   }
 }

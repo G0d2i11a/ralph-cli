@@ -1,10 +1,9 @@
 import { StateManager } from '../core/state';
-import { bootstrapWorktreeDeps } from '../core/bootstrap';
-import * as path from 'path';
-import { fork } from 'child_process';
+import { TaskScheduler } from '../core/scheduler';
 
 export async function retryCommand(taskId: string) {
   const stateManager = new StateManager();
+  const scheduler = new TaskScheduler({ stateManager });
 
   try {
     const task = await stateManager.loadTask(taskId);
@@ -30,36 +29,39 @@ export async function retryCommand(taskId: string) {
     task.consecutiveNoProgress = 0;
     task.consecutiveErrors = 0;
     task.lastProgressTime = Date.now();
-    task.status = 'running';
+    task.lastError = undefined;
+    task.status = 'pending';
+    task.endTime = undefined;
+    task.pid = undefined;
+    task.currentUS = undefined;
 
     await stateManager.saveTask(task);
+    await scheduler.schedulePendingTasks();
 
-    // Re-check dependency links before the agent is restarted.
-    bootstrapWorktreeDeps(task.worktree, {
-      repoPath: task.repoPath,
-      logPath: task.logPath,
-    });
+    const latestTask = await stateManager.loadTask(taskId);
+    if (!latestTask) {
+      throw new Error(`Task ${taskId} not found after retry scheduling`);
+    }
 
-    // Restart agent worker
-    const workerPath = path.join(__dirname, '../worker.js');
-    const child = fork(workerPath, [taskId], {
-      detached: true,
-      stdio: 'ignore'
-    });
-    child.unref();
+    if (latestTask.status !== 'running' && latestTask.status !== 'pending') {
+      throw new Error(`Task ${taskId} could not be rescheduled (status: ${latestTask.status})`);
+    }
 
-    // Update task with new PID
-    task.pid = child.pid;
-    await stateManager.saveTask(task);
+    const pendingState = latestTask.status === 'pending'
+      ? await scheduler.describePendingTask(latestTask)
+      : null;
 
     console.log(JSON.stringify({
       success: true,
       taskId,
       previousStatus,
-      currentStatus: 'running',
-      completedUS: task.completedUS.length,
-      worktree: task.worktree,
-      logPath: task.logPath
+      currentStatus: latestTask.status,
+      reason: pendingState?.reason,
+      dependencies: pendingState?.dependencies,
+      concurrencyLimit: pendingState?.maxConcurrent,
+      completedUS: latestTask.completedUS.length,
+      worktree: latestTask.worktree,
+      logPath: latestTask.logPath
     }));
   } catch (error) {
     console.error(JSON.stringify({

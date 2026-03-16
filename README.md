@@ -94,6 +94,8 @@ ralph start ./prd-api.json --repo ~/Code/my-project
 ralph batch-start prds/*.json --agent claude
 ```
 
+Tasks beyond the configured concurrency limit stay `pending` and start automatically as running tasks finish.
+
 ### Check task status
 
 ```bash
@@ -292,14 +294,30 @@ Ralph CLI stores configuration in `~/.ralph/config.json`:
 
 ```json
 {
-  "defaultAgent": "claude",
-  "litellmUrl": "http://localhost:4000",
-  "maxConcurrentTasks": 3,
-  "stagnationThreshold": 300,
-  "qualityGates": {
-    "typeCheck": true,
-    "lint": true,
-    "build": true
+  "agent": {
+    "path": "claude",
+    "timeout": 600,
+    "model": "claude-opus-4-6-thinking-xchai"
+  },
+  "runner": {
+    "maxConcurrent": 3,
+    "stagnationTimeout": 1800,
+    "pollInterval": 10
+  },
+  "notification": {
+    "enabled": false,
+    "channel": "feishu",
+    "target": ""
+  }
+}
+```
+
+Set concurrency to `2` by changing `runner.maxConcurrent`:
+
+```json
+{
+  "runner": {
+    "maxConcurrent": 2
   }
 }
 ```
@@ -357,8 +375,8 @@ src/
 |---------|-----------|-----------|
 | **Interface** | Command line | MCP protocol (Claude Desktop) |
 | **Agent Support** | Claude Code, Codex | Claude Code only |
-| **Parallel Execution** | Manual (batch-start) | Automatic (Runner) |
-| **Dependency Management** | Manual | Automatic |
+| **Parallel Execution** | Automatic queueing up to configured concurrency | Automatic (Runner) |
+| **Dependency Management** | Automatic task queueing | Automatic |
 | **Stagnation Detection** | Manual reset | Automatic |
 | **Notifications** | None | Windows Toast |
 | **Best For** | CLI users, Codex support | Claude Desktop integration |
