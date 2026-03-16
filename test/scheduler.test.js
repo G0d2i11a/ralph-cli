@@ -238,6 +238,83 @@ test('schedulePendingTasks skips dependency-blocked tasks and starts later ready
   assert.equal(ready.status, 'running');
 });
 
+test('schedulePendingTasks claims a slot before fork so stale worker snapshots cannot overbook', async () => {
+  const runningTask = createTask({
+    id: 'running-task',
+    prdId: 'running-task',
+    status: 'running',
+    startTime: 100,
+    worktree: '/worktrees/running-task',
+    pid: 3100,
+  });
+  const raceTask = createTask({
+    id: 'race-task',
+    prdId: 'race-task',
+    prdPath: '/race.json',
+    startTime: 200,
+  });
+  const queuedTask = createTask({
+    id: 'queued-task',
+    prdId: 'queued-task',
+    prdPath: '/queued.json',
+    startTime: 300,
+  });
+
+  const stateManager = new FakeStateManager([runningTask, raceTask, queuedTask]);
+  const forkCalls = [];
+  const lockDir = path.join(
+    os.tmpdir(),
+    `ralph-scheduler-race-test-${process.pid}-${Math.random().toString(36).slice(2)}`
+  );
+  let nextPid = 7000;
+  let staleWorkerSnapshot;
+
+  const scheduler = new TaskScheduler({
+    stateManager,
+    configManager: {
+      get: (key) => key === 'runner.maxConcurrent' ? 2 : undefined,
+    },
+    worktreeManager: {
+      createWorktree: async (_repoPath, taskId) => `/worktrees/${taskId}`,
+    },
+    bootstrapWorktreeDeps: () => {},
+    parsePRD: createParsePrd({
+      '/race.json': { id: 'race-task', dependencies: [] },
+      '/queued.json': { id: 'queued-task', dependencies: [] },
+    }),
+    checkDependencies: dependencyChecker,
+    lockDir,
+    forkProcess: (_modulePath, args) => {
+      const taskId = args[0];
+      forkCalls.push(taskId);
+      staleWorkerSnapshot = { ...stateManager.tasks.get(taskId) };
+
+      return {
+        pid: nextPid++,
+        unref() {},
+      };
+    },
+  });
+
+  const initiallyStarted = await scheduler.schedulePendingTasks();
+
+  assert.equal(initiallyStarted.length, 1);
+  assert.equal(initiallyStarted[0].id, 'race-task');
+  assert.equal(staleWorkerSnapshot.status, 'running');
+
+  staleWorkerSnapshot.currentUS = 'US-1';
+  await stateManager.saveTask(staleWorkerSnapshot);
+
+  const laterStarted = await scheduler.schedulePendingTasks();
+  const persistedRaceTask = await stateManager.loadTask('race-task');
+  const persistedQueuedTask = await stateManager.loadTask('queued-task');
+
+  assert.equal(laterStarted.length, 0);
+  assert.deepEqual(forkCalls, ['race-task']);
+  assert.equal(persistedRaceTask.status, 'running');
+  assert.equal(persistedQueuedTask.status, 'pending');
+});
+
 test('finalizeTask releases a slot and auto-starts the next queued task', async () => {
   const runningTask = createTask({
     id: 'running-task',

@@ -188,6 +188,19 @@ export class TaskScheduler {
         logPath: currentTask.logPath,
       });
 
+      const startTime = this.now();
+      await this.stateManager.updateTask(currentTask.id, {
+        status: 'running',
+        startTime,
+        endTime: undefined,
+      });
+      currentTask = {
+        ...currentTask,
+        status: 'running',
+        startTime,
+        endTime: undefined,
+      };
+
       const workerPath = path.join(__dirname, '../worker.js');
       const child = this.forkProcessFn(workerPath, [currentTask.id], {
         detached: true,
@@ -202,9 +215,6 @@ export class TaskScheduler {
 
       await this.stateManager.updateTask(currentTask.id, {
         pid: child.pid,
-        status: 'running',
-        startTime: this.now(),
-        endTime: undefined,
       });
 
       return await this.stateManager.loadTask(currentTask.id);
