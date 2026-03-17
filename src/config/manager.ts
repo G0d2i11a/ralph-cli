@@ -13,6 +13,14 @@ export interface RalphConfig {
     stagnationTimeout: number;
     pollInterval: number;
   };
+  ingestion: {
+    ez4ielts: {
+      enabled: boolean;
+      watchDir: string;
+      pattern: string;
+      settleMs: number;
+    };
+  };
   notification: {
     enabled: boolean;
     channel: string;
@@ -22,7 +30,7 @@ export interface RalphConfig {
 
 const DEFAULT_CONFIG: RalphConfig = {
   agent: {
-    path: 'claude',
+    path: 'codex',
     timeout: 600,
     model: 'claude-opus-4-6-thinking-xchai'
   },
@@ -30,6 +38,14 @@ const DEFAULT_CONFIG: RalphConfig = {
     maxConcurrent: 3,
     stagnationTimeout: 1800,
     pollInterval: 10
+  },
+  ingestion: {
+    ez4ielts: {
+      enabled: false,
+      watchDir: '~/openclaw-workspace/docs',
+      pattern: 'ez4ielts-*.json',
+      settleMs: 2000,
+    },
   },
   notification: {
     enabled: false,

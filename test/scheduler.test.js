@@ -23,7 +23,7 @@ function createTask(overrides = {}) {
     completedUS: [],
     worktree: '',
     logPath: `/logs/${id}.log`,
-    agent: 'claude',
+    agent: 'codex',
     repoPath: '/repo',
     loopCount: 0,
     consecutiveNoProgress: 0,

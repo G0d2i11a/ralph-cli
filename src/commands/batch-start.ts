@@ -1,5 +1,6 @@
 import { resolve } from 'path';
-import { startCommand } from './start';
+import { enqueueTaskFromPrd } from '../core/task-intake';
+import { DEFAULT_AGENT, resolveAgentType } from '../core/agent';
 
 interface BatchStartOptions {
   repo?: string;
@@ -8,38 +9,35 @@ interface BatchStartOptions {
 
 export async function batchStartCommand(prdPaths: string[], options: BatchStartOptions) {
   const repo = options.repo ? resolve(options.repo) : process.cwd();
-  const agent = options.agent || 'claude';
+  const agent = resolveAgentType(options.agent || DEFAULT_AGENT);
 
-  const results = [];
+  const results: Array<{
+    prdPath: string;
+    success: boolean;
+    taskId?: string;
+    worktree?: string;
+    logPath?: string;
+    status?: string;
+    error?: string;
+  }> = [];
 
   for (const prdPath of prdPaths) {
     try {
       const absolutePrdPath = resolve(prdPath);
-      
-      // Capture stdout to get task info
-      const originalLog = console.log;
-      let taskInfo: any = null;
-      console.log = (msg: string) => {
-        try {
-          taskInfo = JSON.parse(msg);
-        } catch {
-          originalLog(msg);
-        }
-      };
 
-      await startCommand(absolutePrdPath, { repo, agent });
-      
-      console.log = originalLog;
+      const queuedTask = await enqueueTaskFromPrd(absolutePrdPath, {
+        repoPath: repo,
+        agent,
+      });
 
-      if (taskInfo && taskInfo.taskId) {
-        results.push({
-          prdPath,
-          success: true,
-          taskId: taskInfo.taskId,
-          worktree: taskInfo.worktree,
-          logPath: taskInfo.logPath,
-        });
-      }
+      results.push({
+        prdPath,
+        success: true,
+        taskId: queuedTask.taskId,
+        worktree: queuedTask.latestTask.worktree,
+        logPath: queuedTask.latestTask.logPath,
+        status: queuedTask.latestTask.status,
+      });
     } catch (error) {
       results.push({
         prdPath,
@@ -54,7 +52,7 @@ export async function batchStartCommand(prdPaths: string[], options: BatchStartO
     total: prdPaths.length,
     successful: results.filter(r => r.success).length,
     failed: results.filter(r => !r.success).length,
-    results
+    results,
   }));
 
   if (results.some(r => !r.success)) {
