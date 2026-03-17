@@ -2,7 +2,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-**Lightweight Ralph loop**: PRD → `ralph start` → autonomous execution → done. Simple CLI tool for PRD-driven development with Claude Code or Codex.
+**Lightweight Ralph loop**: PRD → `ralph start` → autonomous execution → done. Simple CLI tool for PRD-driven development with Codex or Claude Code.
 
 Based on [Geoffrey Huntley's Ralph pattern](https://ghuntley.com/ralph/) and inspired by [ralph-mcp](https://github.com/G0d2i11a/ralph-mcp).
 
@@ -14,8 +14,8 @@ Based on [Geoffrey Huntley's Ralph pattern](https://ghuntley.com/ralph/) and ins
 # Install
 npm install -g ralph-cli
 
-# Start a task
-ralph start ./my-prd.json --agent claude
+# Start a task (defaults to Codex)
+ralph start ./my-prd.json
 
 # Check status
 ralph status
@@ -42,6 +42,7 @@ ralph list
 - **State Persistence** - Task state survives restarts
 - **Quality Gates** - Automatic type check, lint, and build before commits
 - **Batch Execution** - Start multiple PRDs at once
+- **Watch + Auto-Ingestion** - Poll the queue and auto-enqueue new ez4ielts PRDs
 - **Progress Tracking** - Monitor task status and completion
 
 ## Installation
@@ -71,18 +72,17 @@ ralph start <prd-path> [options]
 
 Options:
   --repo <path>    Repository path (defaults to current directory)
-  --agent <name>   Agent to use: claude or codex (default: claude)
-  --branch <name>  Base branch (default: main)
+  --agent <name>   Agent to use: claude or codex (default: codex)
 ```
 
 **Examples:**
 
 ```bash
-# Start with Claude Code
-ralph start ./prd-auth.json --agent claude
+# Start with the default agent (Codex)
+ralph start ./prd-auth.json
 
-# Start with Codex
-ralph start ./prd-payment.md --agent codex
+# Start with Claude Code explicitly
+ralph start ./prd-payment.md --agent claude
 
 # Specify repository
 ralph start ./prd-api.json --repo ~/Code/my-project
@@ -91,10 +91,30 @@ ralph start ./prd-api.json --repo ~/Code/my-project
 ### Batch start multiple PRDs
 
 ```bash
-ralph batch-start prds/*.json --agent claude
+ralph batch-start prds/*.json
 ```
 
 Tasks beyond the configured concurrency limit stay `pending` and start automatically as running tasks finish.
+
+### Watch pending tasks and auto-ingest new ez4ielts PRDs
+
+```bash
+# Queue safety-net only
+ralph watch
+
+# Queue safety-net + auto-ingest brand new ez4ielts PRDs
+ralph watch --auto-ingest-ez4ielts
+```
+
+When `--auto-ingest-ez4ielts` is enabled, Ralph polls `~/openclaw-workspace/docs` for new files matching `ez4ielts-*.json` and sends them through the same queue/start flow as `ralph start`.
+
+- Existing matching files are treated as backlog and skipped when the watcher starts.
+- Each new file is ingested once, even if it is modified again later.
+- Auto-ingested tasks default to Codex unless `--agent claude` is passed.
+- Auto-ingested tasks default to the watched docs directory parent as their repo (`~/openclaw-workspace`) unless `--repo` is passed.
+- New files still respect dependency checks and the configured concurrency limit.
+
+You can also enable the same mode through `~/.ralph/config.json` and then run plain `ralph watch`.
 
 ### Check task status
 
@@ -225,10 +245,11 @@ This PRD implements a secure authentication system using industry best practices
 
 1. **Parse PRD** - Ralph reads your PRD file and extracts user stories
 2. **Create Worktree** - Creates a git worktree for isolated development
-3. **Spawn Agent** - Launches Claude Code or Codex to implement each user story
+3. **Spawn Agent** - Launches Codex by default, or Claude Code when requested
 4. **Track Progress** - Maintains state in `~/.ralph/tasks/<task-id>/`
 5. **Quality Gates** - Runs type check, lint, and build before commits
-6. **Complete** - Marks task as completed when all user stories pass
+6. **Watch + Queue** - `ralph watch` can keep the queue moving and auto-ingest new ez4ielts PRDs
+7. **Complete** - Marks task as completed when all user stories pass
 
 ## State Management
 
@@ -244,7 +265,7 @@ Task state is stored in `~/.ralph/tasks/<task-id>/state.json`:
   "failedUS": [],
   "worktree": "/path/to/worktree",
   "logPath": "/path/to/log",
-  "agent": "claude",
+  "agent": "codex",
   "createdAt": "2026-03-07T10:00:00Z",
   "updatedAt": "2026-03-07T10:30:00Z"
 }
@@ -285,7 +306,7 @@ Uses GPT-5.3 Codex via LiteLLM proxy.
 
 **Command:**
 ```bash
-ralph start ./prd.json --agent codex
+ralph start ./prd.json
 ```
 
 ## Configuration
@@ -295,7 +316,7 @@ Ralph CLI stores configuration in `~/.ralph/config.json`:
 ```json
 {
   "agent": {
-    "path": "claude",
+    "path": "codex",
     "timeout": 600,
     "model": "claude-opus-4-6-thinking-xchai"
   },
@@ -303,6 +324,14 @@ Ralph CLI stores configuration in `~/.ralph/config.json`:
     "maxConcurrent": 3,
     "stagnationTimeout": 1800,
     "pollInterval": 10
+  },
+  "ingestion": {
+    "ez4ielts": {
+      "enabled": false,
+      "watchDir": "~/openclaw-workspace/docs",
+      "pattern": "ez4ielts-*.json",
+      "settleMs": 2000
+    }
   },
   "notification": {
     "enabled": false,
@@ -312,12 +341,26 @@ Ralph CLI stores configuration in `~/.ralph/config.json`:
 }
 ```
 
+`agent.path` defaults to `codex` in the generated config. New tasks also default to Codex unless `--agent claude` is passed. `agent.model` is only used for Claude runs.
+
 Set concurrency to `2` by changing `runner.maxConcurrent`:
 
 ```json
 {
   "runner": {
     "maxConcurrent": 2
+  }
+}
+```
+
+Enable ez4ielts auto-ingestion by changing `ingestion.ez4ielts.enabled` to `true` and then running `ralph watch`:
+
+```json
+{
+  "ingestion": {
+    "ez4ielts": {
+      "enabled": true
+    }
   }
 }
 ```
@@ -351,6 +394,8 @@ src/
 │   ├── state.ts       # State management
 │   ├── worktree.ts    # Git worktree operations
 │   ├── agent.ts       # Agent execution
+│   ├── task-intake.ts # Shared PRD queueing logic
+│   ├── prd-auto-ingest.ts # ez4ielts PRD auto-ingestion
 │   └── merge.ts       # Merge operations
 ├── commands/
 │   ├── start.ts       # Start command

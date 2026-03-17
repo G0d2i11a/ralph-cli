@@ -102,4 +102,11 @@ export class StateManager {
       }
     }) || null;
   }
+
+  async getTaskByPrdPath(prdPath: string): Promise<Task | null> {
+    const resolvedPrdPath = path.resolve(prdPath);
+    const tasks = await this.listTasks();
+
+    return tasks.find((task) => path.resolve(task.prdPath) === resolvedPrdPath) || null;
+  }
 }

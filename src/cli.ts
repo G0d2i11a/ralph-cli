@@ -13,6 +13,8 @@ import { retryCommand } from './commands/retry';
 import { resetStagnationCommand } from './commands/reset-stagnation';
 import { completionCommand } from './commands/completion';
 import { watch } from './commands/watch';
+import { DEFAULT_AGENT } from './core/agent';
+import { DEFAULT_EZ4IELTS_WATCH_DIR } from './core/prd-auto-ingest';
 
 const program = new Command();
 
@@ -25,12 +27,12 @@ program
   .command('start <prd-path>')
   .description('Start a new task from a PRD file')
   .option('--repo <path>', 'Repository path (defaults to current directory)')
-  .option('--agent <name>', 'Agent to use (claude|codex)', 'claude')
+  .option('--agent <name>', 'Agent to use (claude|codex)', DEFAULT_AGENT)
   .addHelpText('after', `
 Examples:
   $ ralph start prd.md
   $ ralph start prd.md --repo ~/Code/myproject
-  $ ralph start prd.modex`)
+  $ ralph start prd.json --agent claude`)
   .action(startCommand);
 
 program
@@ -92,7 +94,7 @@ program
   .command('batch-start <prd-paths...>')
   .description('Start multiple tasks from PRD files')
   .option('--repo <path>', 'Repository path (defaults to current directory)')
-  .option('--agent <name>', 'Agent to use (claude|codex)', 'claude')
+  .option('--agent <name>', 'Agent to use (claude|codex)', DEFAULT_AGENT)
   .addHelpText('after', `
 Examples:
   $ ralph batch-start prd1.md prd2.md prd3.md
@@ -129,23 +131,39 @@ Examples:
 
 program
   .command('watch')
-  .description('Poll pending tasks and start any that are dependency-ready and within concurrency limits')
+  .description('Poll pending tasks and optionally auto-ingest new ez4ielts PRDs into the queue')
   .option('--interval <ms>', 'Polling interval in milliseconds', '30000')
+  .option('--repo <path>', 'Repository path for auto-ingested tasks (defaults to the watched docs directory parent)')
+  .option('--agent <name>', 'Agent to use for auto-ingested tasks (claude|codex)', DEFAULT_AGENT)
+  .option('--auto-ingest-ez4ielts', 'Auto-enqueue new ez4ielts-*.json files discovered by the watcher')
+  .option('--ez4ielts-dir <path>', 'Directory to scan for ez4ielts-*.json files', DEFAULT_EZ4IELTS_WATCH_DIR)
   .addHelpText('after', `
 Examples:
   $ ralph watch
   $ ralph watch --interval 10000
+  $ ralph watch --auto-ingest-ez4ielts
+  $ ralph watch --auto-ingest-ez4ielts --repo ~/openclaw-workspace --ez4ielts-dir ${DEFAULT_EZ4IELTS_WATCH_DIR}
   
 Description:
   Starts a background watcher that reconciles the pending queue.
   When a task's dependencies are satisfied and a concurrency slot is available,
   it automatically starts the task.
+
+  With --auto-ingest-ez4ielts enabled, Ralph also watches for brand new
+  ez4ielts-*.json PRDs, skips the existing backlog on startup, and queues each
+  new PRD only once.
   
   Ralph now auto-starts queued tasks when running tasks finish, fail, or stop.
   This watcher remains useful as a polling safety net for pending tasks.
   
   Press Ctrl+C to stop the watcher.`)
-  .action((options) => watch({ interval: parseInt(options.interval) }));
+  .action((options) => watch({
+    interval: parseInt(options.interval, 10),
+    repo: options.repo,
+    agent: options.agent,
+    autoIngestEz4ielts: options.autoIngestEz4ielts,
+    ez4ieltsDir: options.ez4ieltsDir,
+  }));
 
 program
   .command('completion <shell>')

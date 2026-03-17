@@ -6,6 +6,24 @@ import { UserStory } from '../types/prd';
 
 export type AgentType = 'claude' | 'codex';
 
+export const DEFAULT_AGENT: AgentType = 'codex';
+
+export function isAgentType(value: string): value is AgentType {
+  return value === 'claude' || value === 'codex';
+}
+
+export function resolveAgentType(value?: string): AgentType {
+  if (!value) {
+    return DEFAULT_AGENT;
+  }
+
+  if (!isAgentType(value)) {
+    throw new Error(`Unsupported agent \"${value}\". Expected \"claude\" or \"codex\".`);
+  }
+
+  return value;
+}
+
 export class AgentRunner {
   private process?: ChildProcess;
   private logStream?: fs.WriteStream;

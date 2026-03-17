@@ -1,63 +1,120 @@
+import * as path from 'path';
+import { ConfigManager } from '../config/manager';
 import { StateManager } from '../core/state';
-import { WorktreeManager } from '../core/worktree';
-import { schedulePendingTasks } from './scheduler';
+import { DEFAULT_AGENT, resolveAgentType } from './agent';
+import {
+  DEFAULT_EZ4IELTS_PATTERN,
+  DEFAULT_EZ4IELTS_SETTLE_MS,
+  DEFAULT_EZ4IELTS_WATCH_DIR,
+  PrdAutoIngestor,
+} from './prd-auto-ingest';
+import { TaskScheduler } from './scheduler';
+
+export interface WatchCommandOptions {
+  interval?: number;
+  repo?: string;
+  agent?: string;
+  autoIngestEz4ielts?: boolean;
+  ez4ieltsDir?: string;
+}
+
+interface DependencyWatcherDeps {
+  stateManager?: StateManager;
+  scheduler?: TaskScheduler;
+  configManager?: Pick<ConfigManager, 'get'>;
+  autoIngestor?: Pick<PrdAutoIngestor, 'initialize' | 'scan'>;
+  sleep?: (ms: number) => Promise<void>;
+  logger?: Pick<typeof console, 'log' | 'error'>;
+}
 
 export class DependencyWatcher {
-  private stateManager: StateManager;
-  private worktreeManager: WorktreeManager;
-  private pollInterval: number;
-  private isRunning: boolean = false;
+  private readonly scheduler: TaskScheduler;
+  private readonly pollInterval: number;
+  private readonly sleep: (ms: number) => Promise<void>;
+  private readonly logger: Pick<typeof console, 'log' | 'error'>;
+  private readonly autoIngestor?: Pick<PrdAutoIngestor, 'initialize' | 'scan'>;
+  private isRunning = false;
 
-  constructor(pollInterval: number = 30000) { // Default: 30 seconds
-    this.stateManager = new StateManager();
-    this.worktreeManager = new WorktreeManager();
-    this.pollInterval = pollInterval;
+  constructor(
+    options: WatchCommandOptions = {},
+    deps: DependencyWatcherDeps = {}
+  ) {
+    const stateManager = deps.stateManager ?? new StateManager();
+    const configManager = deps.configManager ?? new ConfigManager();
+
+    this.scheduler = deps.scheduler ?? new TaskScheduler({ stateManager });
+    this.pollInterval = options.interval || 30000;
+    this.sleep = deps.sleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
+    this.logger = deps.logger ?? console;
+
+    const autoIngestEnabled = options.autoIngestEz4ielts
+      ?? Boolean(configManager.get('ingestion.ez4ielts.enabled'));
+
+    if (deps.autoIngestor) {
+      this.autoIngestor = deps.autoIngestor;
+      return;
+    }
+
+    if (autoIngestEnabled) {
+      const settleMs = Number(configManager.get('ingestion.ez4ielts.settleMs'));
+      const configuredPattern = configManager.get('ingestion.ez4ielts.pattern');
+      const configuredWatchDir = configManager.get('ingestion.ez4ielts.watchDir');
+      const watchDir = options.ez4ieltsDir || configuredWatchDir || DEFAULT_EZ4IELTS_WATCH_DIR;
+      const repoPath = options.repo || path.dirname(path.resolve(watchDir));
+
+      this.autoIngestor = new PrdAutoIngestor({
+        repoPath,
+        agent: resolveAgentType(options.agent || DEFAULT_AGENT),
+        watchDir,
+        pattern: typeof configuredPattern === 'string' ? configuredPattern : DEFAULT_EZ4IELTS_PATTERN,
+        settleMs: Number.isFinite(settleMs) && settleMs >= 0 ? settleMs : DEFAULT_EZ4IELTS_SETTLE_MS,
+        logger: (message) => this.logger.log(message),
+      }, {
+        stateManager,
+        scheduler: this.scheduler,
+      });
+    }
   }
 
   async start(): Promise<void> {
     if (this.isRunning) {
-      console.log('Dependency watcher is already running');
+      this.logger.log('Dependency watcher is already running');
       return;
     }
 
     this.isRunning = true;
-    console.log(`Dependency watcher started (polling every ${this.pollInterval / 1000}s)`);
+    await this.autoIngestor?.initialize();
+    this.logger.log(`Dependency watcher started (polling every ${this.pollInterval / 1000}s)`);
 
     while (this.isRunning) {
       try {
+        await this.autoIngestor?.scan();
         await this.checkPendingTasks();
       } catch (error) {
-        console.error('Error checking pending tasks:', error);
+        this.logger.error('Error checking pending tasks:', error);
       }
 
-      // Wait for next poll
-      await new Promise(resolve => setTimeout(resolve, this.pollInterval));
+      await this.sleep(this.pollInterval);
     }
   }
 
   stop(): void {
     this.isRunning = false;
-    console.log('Dependency watcher stopped');
+    this.logger.log('Dependency watcher stopped');
   }
 
   private async checkPendingTasks(): Promise<void> {
-    const startedTasks = await schedulePendingTasks({
-      stateManager: this.stateManager,
-      worktreeManager: this.worktreeManager,
-    });
+    const startedTasks = await this.scheduler.schedulePendingTasks();
 
     for (const task of startedTasks) {
-      console.log(`Task ${task.id} started (PID: ${task.pid})`);
+      this.logger.log(`Task ${task.id} started (PID: ${task.pid})`);
     }
   }
 }
 
-// CLI command handler
-export async function watchCommand(options: { interval?: number }): Promise<void> {
-  const interval = options.interval || 30000;
-  const watcher = new DependencyWatcher(interval);
+export async function watchCommand(options: WatchCommandOptions): Promise<void> {
+  const watcher = new DependencyWatcher(options);
 
-  // Handle graceful shutdown
   process.on('SIGINT', () => {
     console.log('\nReceived SIGINT, stopping watcher...');
     watcher.stop();

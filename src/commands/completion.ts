@@ -1,7 +1,3 @@
-import * as fs from 'fs';
-import * as path from 'path';
-import * as os from 'os';
-
 export async function completionCommand(shell: string): Promise<void> {
   if (shell !== 'bash' && shell !== 'zsh') {
     console.error('Error: Shell must be either "bash" or "zsh"');
@@ -19,26 +15,23 @@ _ralph_completion() {
   local cur prev commands
   cur="\${COMP_WORDS[COMP_CWORD]}"
   prev="\${COMP_WORDS[COMP_CWORD-1]}"
-  commands="start status list stop merge update retry logs batch-start config runner stats completion"
+  commands="start batch-start status list stop merge update retry reset-stagnation watch stats completion"
   
   case "\${prev}" in
     ralph)
       COMPREPLY=( $(compgen -W "\${commands}" -- \${cur}) )
       return 0
       ;;
-    start)
-      # Complete PRD file paths
-      COMPREPLY=( $(compgen -f -X '!*.md' -- \${cur}) )
+    start|batch-start)
+      COMPREPLY=( $(compgen -f -X '!*.@(md|json)' -- \${cur}) )
       return 0
       ;;
-    status|stop|merge|logs|stats)
-      # Complete task IDs from state
+    status|stop|merge|stats|reset-stagnation)
       local task_ids=$(ralph list 2>/dev/null | grep -oE 'task-[0-9]+-[a-z0-9]+' | sort -u)
       COMPREPLY=( $(compgen -W "\${task_ids}" -- \${cur}) )
       return 0
       ;;
-    --repo)
-      # Complete directory paths
+    --repo|--ez4ielts-dir)
       COMPREPLY=( $(compgen -d -- \${cur}) )
       return 0
       ;;
@@ -60,10 +53,9 @@ _ralph_completion() {
       ;;
   esac
 
-  # Complete options
   case "\${cur}" in
     -*)
-      local opts="--repo --agent --status --auto --strategy --target --follow --lines --format --all --help"
+      local opts="--repo --agent --status --auto --strategy --target --format --all --interval --auto-ingest-ez4ielts --ez4ielts-dir --help"
       COMPREPLY=( $(compgen -W "\${opts}" -- \${cur}) )
       return 0
       ;;
@@ -82,11 +74,15 @@ _ralph() {
   local -a commands
   commands=(
     'start:Start a new task from a PRD file'
+    'batch-start:Start multiple tasks from PRD files'
     'status:Show status of a task or all running tasks'
     'list:List all tasks'
     'stop:Stop a running task'
     'merge:Merge a completed task'
-    'logs:View task execution logs'
+    'update:Update a task or user story status'
+    'retry:Retry a failed or stopped task'
+    'reset-stagnation:Reset stagnation counters for a task'
+    'watch:Poll the queue and optionally auto-ingest new PRDs'
     'stats:Show performance statistics for a task'
     'completion:Generate shell completion script'
   )
@@ -106,24 +102,36 @@ _ralph() {
       case $words[1] in
         start)
           _arguments \\
-            '1:PRD file:_files -g "*.md"' \\
+            '1:PRD file:_files -g "*.md|*.json"' \\
             '--repo[Repository path]:directory:_directories' \\
             '--agent[Agent to use]:agent:(claude codex)'
           ;;
-        status|stop|merge|logs|stats)
+        batch-start)
+          _arguments \\
+            '*:PRD file:_files -g "*.md|*.json"' \\
+            '--repo[Repository path]:directory:_directories' \\
+            '--agent[Agent to use]:agent:(claude codex)'
+          ;;
+        status|stop|merge|stats|reset-stagnation)
           _arguments \\
             "1:task ID:(\${task_ids})" \\
             '--auto[Auto-resolve conflicts]' \\
             '--strategy[Conflict resolution strategy]:strategy:(ours theirs manual)' \\
             '--target[Target branch]:branch:' \\
-            '--follow[Follow log output]' \\
-            '--lines[Number of lines]:lines:' \\
             '--format[Output format]:format:(json table summary)' \\
             '--all[Show stats for all tasks]'
           ;;
         list)
           _arguments \\
             '--status[Filter by status]:status:(pending running completed failed stagnant)'
+          ;;
+        watch)
+          _arguments \\
+            '--interval[Polling interval in milliseconds]:interval:' \\
+            '--repo[Repository path for auto-ingested tasks]:directory:_directories' \\
+            '--agent[Agent to use for auto-ingested tasks]:agent:(claude codex)' \\
+            '--auto-ingest-ez4ielts[Auto-enqueue new ez4ielts PRDs]' \\
+            '--ez4ielts-dir[Directory to scan for ez4ielts PRDs]:directory:_directories'
           ;;
         completion)
           _arguments \\
