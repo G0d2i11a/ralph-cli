@@ -85,7 +85,7 @@ async function runWorker(taskId: string) {
       
       if (!result.success) {
         task.consecutiveErrors++;
-        task.lastError = result.output.slice(-500); // Last 5
+        task.lastError = result.output.slice(-500); // Last 500 chars
       } else {
         task.consecutiveErrors = 0;
         task.lastError = undefined;
@@ -106,16 +106,19 @@ async function runWorker(taskId: string) {
         await finalizeTask(task, 'failed', { stateManager });
         process.exit(1);
       }
-      
+
       // Mark as completed
       task.completedUS.push(us.id);
       await stateManager.saveTask(task);
     }
-    
-    // All done
-    await finalizeTask(task, 'completed', { stateManager });
-    
-    console.log(`Task ${taskId} completed successfully`);
+
+    // Implementation phase is done; leave commit/merge to the restricted finalizer.
+    task.status = 'ready_to_finalize';
+    task.currentUS = undefined;
+    task.pid = undefined;
+    await stateManager.saveTask(task);
+
+    console.log(`Task ${taskId} implementation complete; awaiting finalizer`);
     
   } catch (error) {
     console.error(`[Worker] Worker error: ${error}`);

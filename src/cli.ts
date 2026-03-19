@@ -7,6 +7,7 @@ import { statusCommand } from './commands/status';
 import { listCommand } from './commands/list';
 import { stopCommand } from './commands/stop';
 import { mergeCommand } from './commands/merge';
+import { finalizeCommand } from './commands/finalize';
 import { statsCommand } from './commands/stats';
 import { updateCommand } from './commands/update';
 import { retryCommand } from './commands/retry';
@@ -31,7 +32,7 @@ program
   .addHelpText('after', `
 Examples:
   $ ralph start prd.md
-  $ ralph start prd.md --repo ~/Code/myproject
+  $ ralph start prd.md --repo ~/Project/myproject
   $ ralph start prd.json --agent claude`)
   .action(startCommand);
 
@@ -49,7 +50,7 @@ Examples:
 program
   .command('list')
   .description('List all tasks')
-  .option('--status <status>', 'Filter by status (pending|running|completed|failed|stagnant)')
+  .option('--status <status>', 'Filter by status (pending|running|ready_to_finalize|finalizing|completed|failed|failed_finalize|stagnant)')
   .addHelpText('after', `
 Examples:
   $ ralph list
@@ -77,6 +78,14 @@ Examples:
   $ ralph merge task-1772544497775-wdat8zyr5 --auto
   $ ralph merge task-1772544497775-wdat8zyr5 --strategy ours --target develop`)
   .action(mergeCommand);
+
+program
+  .command('finalize <task-id>')
+  .description('Commit task changes using the restricted finisher flow')
+  .addHelpText('after', `
+Examples:
+  $ ralph finalize task-1772544497775-wdat8zyr5`)
+  .action(finalizeCommand);
 
 program
   .command('stats <task-id>')
@@ -134,7 +143,7 @@ program
   .description('Poll pending tasks and optionally auto-ingest new ez4ielts PRDs into the queue')
   .option('--interval <ms>', 'Polling interval in milliseconds', '30000')
   .option('--repo <path>', 'Repository path for auto-ingested tasks (defaults to the watched docs directory parent)')
-  .option('--agent <name>', 'Agent to use for auto-ingested tasks (claude|codex)', DEFAULT_AGENT)
+  .option('--agent <name>', 'Agent to use (claude|codex)', DEFAULT_AGENT)
   .option('--auto-ingest-ez4ielts', 'Auto-enqueue new ez4ielts-*.json files discovered by the watcher')
   .option('--ez4ielts-dir <path>', 'Directory to scan for ez4ielts-*.json files', DEFAULT_EZ4IELTS_WATCH_DIR)
   .addHelpText('after', `
@@ -142,7 +151,7 @@ Examples:
   $ ralph watch
   $ ralph watch --interval 10000
   $ ralph watch --auto-ingest-ez4ielts
-  $ ralph watch --auto-ingest-ez4ielts --repo ~/openclaw-workspace --ez4ielts-dir ${DEFAULT_EZ4IELTS_WATCH_DIR}
+  $ ralph watch --auto-ingest-ez4ielts --repo ~/Project/ez4ielts --ez4ielts-dir ${DEFAULT_EZ4IELTS_WATCH_DIR}
   
 Description:
   Starts a background watcher that reconciles the pending queue.
@@ -153,7 +162,8 @@ Description:
   ez4ielts-*.json PRDs, skips the existing backlog on startup, and queues each
   new PRD only once.
   
-  Ralph now auto-starts queued tasks when running tasks finish, fail, or stop.
+  Ralph now auto-starts queued tasks when running tasks finish, fail, stop,
+  or transition into ready_to_finalize and complete via the restricted finalizer.
   This watcher remains useful as a polling safety net for pending tasks.
   
   Press Ctrl+C to stop the watcher.`)

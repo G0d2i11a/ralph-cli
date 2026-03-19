@@ -15,7 +15,7 @@ const LOCK_RETRY_MS = 50;
 const LOCK_TIMEOUT_MS = 30000;
 const LOCK_STALE_MS = 300000;
 
-export type TerminalTaskStatus = Exclude<TaskStatus, 'pending' | 'running'>;
+export type TerminalTaskStatus = Exclude<TaskStatus, 'pending' | 'running' | 'ready_to_finalize' | 'finalizing'>;
 
 type DependencyResult = { satisfied: boolean; pending: string[] };
 type DependencyChecker = (

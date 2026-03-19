@@ -1,6 +1,7 @@
 import * as path from 'path';
 import { ConfigManager } from '../config/manager';
 import { StateManager } from '../core/state';
+import { finalizeTaskOutput } from './finalizer';
 import { DEFAULT_AGENT, resolveAgentType } from './agent';
 import {
   DEFAULT_EZ4IELTS_PATTERN,
@@ -25,6 +26,7 @@ interface DependencyWatcherDeps {
   autoIngestor?: Pick<PrdAutoIngestor, 'initialize' | 'scan'>;
   sleep?: (ms: number) => Promise<void>;
   logger?: Pick<typeof console, 'log' | 'error'>;
+  finalizer?: typeof finalizeTaskOutput;
 }
 
 export class DependencyWatcher {
@@ -33,6 +35,8 @@ export class DependencyWatcher {
   private readonly sleep: (ms: number) => Promise<void>;
   private readonly logger: Pick<typeof console, 'log' | 'error'>;
   private readonly autoIngestor?: Pick<PrdAutoIngestor, 'initialize' | 'scan'>;
+  private readonly stateManager: StateManager;
+  private readonly finalizer: typeof finalizeTaskOutput;
   private isRunning = false;
 
   constructor(
@@ -42,6 +46,8 @@ export class DependencyWatcher {
     const stateManager = deps.stateManager ?? new StateManager();
     const configManager = deps.configManager ?? new ConfigManager();
 
+    this.stateManager = stateManager;
+    this.finalizer = deps.finalizer ?? finalizeTaskOutput;
     this.scheduler = deps.scheduler ?? new TaskScheduler({ stateManager });
     this.pollInterval = options.interval || 30000;
     this.sleep = deps.sleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
@@ -89,6 +95,7 @@ export class DependencyWatcher {
     while (this.isRunning) {
       try {
         await this.autoIngestor?.scan();
+        await this.finalizeReadyTasks();
         await this.checkPendingTasks();
       } catch (error) {
         this.logger.error('Error checking pending tasks:', error);
@@ -103,7 +110,44 @@ export class DependencyWatcher {
     this.logger.log('Dependency watcher stopped');
   }
 
-  private async checkPendingTasks(): Promise<void> {
+  async finalizeReadyTasks(): Promise<void> {
+    const readyTasks = (await this.stateManager.listTasks('ready_to_finalize'))
+      .slice()
+      .sort((a, b) => a.startTime - b.startTime);
+
+    for (const task of readyTasks) {
+      try {
+        await this.stateManager.updateTask(task.id, {
+          status: 'finalizing',
+          pid: undefined,
+          currentUS: undefined,
+          endTime: undefined,
+        });
+
+        const result = this.finalizer(task);
+
+        await this.stateManager.updateTask(task.id, {
+          status: 'completed',
+          endTime: Date.now(),
+          finalizerCommitMessage: result.commitMessage,
+          finalizerCommittedAt: result.committed ? Date.now() : undefined,
+        });
+
+        this.logger.log(`Task ${task.id} finalized (${result.message})`);
+      } catch (error) {
+        await this.stateManager.updateTask(task.id, {
+          status: 'failed_finalize',
+          endTime: Date.now(),
+          lastError: error instanceof Error ? error.message : String(error),
+          pid: undefined,
+          currentUS: undefined,
+        });
+        this.logger.error(`Failed to finalize task ${task.id}:`, error);
+      }
+    }
+  }
+
+  async checkPendingTasks(): Promise<void> {
     const startedTasks = await this.scheduler.schedulePendingTasks();
 
     for (const task of startedTasks) {
