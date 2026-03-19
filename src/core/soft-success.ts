@@ -1,3 +1,5 @@
+import * as fs from 'fs';
+
 export interface ProgressLike {
   hasProgress: boolean;
   filesChanged: number;
@@ -89,4 +91,23 @@ export function shouldTreatNonZeroExitAsSuccess(input: {
     reason: `Insufficient completion signals: ${signals.matchedSignals.join(', ') || 'none'}`,
     signals,
   };
+}
+
+export function evaluateFailedTaskForFinalizeRecovery(input: {
+  logPath: string;
+  completedUS: string[];
+  lastFilesChanged?: number;
+}): SoftSuccessDecision {
+  const output = fs.existsSync(input.logPath)
+    ? fs.readFileSync(input.logPath, 'utf-8')
+    : '';
+
+  return shouldTreatNonZeroExitAsSuccess({
+    output,
+    progress: {
+      hasProgress: input.completedUS.length > 0 || (input.lastFilesChanged ?? 0) > 0,
+      filesChanged: input.lastFilesChanged ?? 0,
+      newCommits: 0,
+    },
+  });
 }
