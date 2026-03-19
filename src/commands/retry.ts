@@ -34,6 +34,7 @@ export async function retryCommand(taskId: string) {
     task.endTime = undefined;
     task.pid = undefined;
     task.currentUS = undefined;
+    // sessionId is preserved for continuation
 
     await stateManager.saveTask(task);
     await scheduler.schedulePendingTasks();

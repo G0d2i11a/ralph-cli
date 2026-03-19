@@ -42,7 +42,7 @@ const DEFAULT_CONFIG: RalphConfig = {
   ingestion: {
     ez4ielts: {
       enabled: false,
-      watchDir: '~/openclaw-workspace/docs',
+      watchDir: process.env.RALPH_EZ4IELTS_WATCH_DIR || '~/Workspace/openclaw/docs',
       pattern: 'ez4ielts-*.json',
       settleMs: 2000,
     },

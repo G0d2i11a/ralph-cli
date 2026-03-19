@@ -60,8 +60,15 @@ async function runWorker(taskId: string) {
         us,
         task.worktree,
         task.agent as AgentType,
-        task.logPath
+        task.logPath,
+        task.sessionId
       );
+
+      // Save sessionId if returned
+      if (result.sessionId) {
+        task.sessionId = result.sessionId;
+        await stateManager.saveTask(task);
+      }
       
       // Detect progress using multiple signals
       const progressDetected = detectProgress(

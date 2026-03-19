@@ -33,10 +33,11 @@ export class AgentRunner {
     us: UserStory,
     worktreePath: string,
     agent: AgentType,
-    logPath: string
-  ): Promise<{ success: boolean; output: string }> {
+    logPath: string,
+    sessionId?: string
+  ): Promise<{ success: boolean; output: string; sessionId?: string }> {
     const prompt = this.generatePrompt(us);
-    return this.execAgent(agent, prompt, worktreePath, logPath);
+    return this.execAgent(agent, prompt, worktreePath, logPath, sessionId);
   }
 
   private generatePrompt(us: UserStory): string {
@@ -57,24 +58,29 @@ Do not commit your changes. Instead, leave the worktree ready for a separate fin
     agent: AgentType,
     prompt: string,
     worktreePath: string,
-    logPath: string
-  ): Promise<{ success: boolean; output: string }> {
+    logPath: string,
+    sessionId?: string
+  ): Promise<{ success: boolean; output: string; sessionId?: string }> {
     return new Promise((resolve, reject) => {
       let command: string;
       let args: string[];
 
       if (agent === 'claude') {
-        const model = this.config.get('agent.model') || 'claude-opus-4-6-thinking-xchai';
-        command = 'claude';
+        const model = this.config.get('agent.model') || 'claude-opus-4-6';
+        command = 'node';
         args = [
-          '-p',
-          prompt,  // This will be passed as a single argument
-          '--model',
-          model,
-          '--dangerously-skip-permissions',
-          '--permission-mode',
-          'bypassPermissions'
+          '~/Workspace/openclaw/sdk-runners/dist/cli.js',
+          'claude',
+          '--prompt', prompt,
+          '--cwd', worktreePath,
+          '--model', model,
+          '--log', logPath
         ];
+
+        // Add session continuation if available
+        if (sessionId) {
+          args.push('--resume', sessionId);
+        }
       } else {
         command = 'codex';
         args = ['exec', prompt, '--full-auto'];
@@ -114,10 +120,25 @@ Do not commit your changes. Instead, leave the worktree ready for a separate fin
       });
 
       let output = '';
+      let capturedSessionId: string | undefined;
 
       this.process.stdout?.on('data', (data) => {
         const text = data.toString();
         output += text;
+
+        // Parse JSON events line by line to capture sessionId
+        for (const line of text.split('\n')) {
+          if (!line.trim()) continue;
+          try {
+            const event = JSON.parse(line);
+            if (event.kind === 'final' && event.payload?.sessionId) {
+              capturedSessionId = event.payload.sessionId;
+            }
+          } catch {
+            // Not JSON, just log as text
+          }
+        }
+
         console.log(`[Agent] stdout: ${text}`);
         this.logStream?.write(text);
       });
@@ -135,7 +156,8 @@ Do not commit your changes. Instead, leave the worktree ready for a separate fin
         this.logStream?.end();
         resolve({
           success: code === 0,
-          output
+          output,
+          sessionId: capturedSessionId
         });
       });
 

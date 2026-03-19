@@ -106,12 +106,12 @@ ralph watch
 ralph watch --auto-ingest-ez4ielts
 ```
 
-When `--auto-ingest-ez4ielts` is enabled, Ralph polls `~/openclaw-workspace/docs` for new files matching `ez4ielts-*.json` and sends them through the same queue/start flow as `ralph start`.
+When `--auto-ingest-ez4ielts` is enabled, Ralph polls the configured ez4ielts PRD directory (set `RALPH_EZ4IELTS_WATCH_DIR` or configure `ingestion.ez4ielts.watchDir` in `~/.ralph/config.json`) for new files matching `ez4ielts-*.json` and sends them through the same queue/start flow as `ralph start`.
 
 - Existing matching files are treated as backlog and skipped when the watcher starts.
 - Each new file is ingested once, even if it is modified again later.
 - Auto-ingested tasks default to Codex unless `--agent claude` is passed.
-- Auto-ingested tasks default to the watched docs directory parent as their repo (`~/openclaw-workspace`) unless `--repo` is passed.
+- Auto-ingested tasks default to the watched docs directory parent as their repo unless `--repo` is passed. For your current setup, pass `--repo ~/Project/ez4ielts` so execution happens in the project repo rather than the docs workspace.
 - New files still respect dependency checks and the configured concurrency limit.
 
 You can also enable the same mode through `~/.ralph/config.json` and then run plain `ralph watch`.
@@ -328,7 +328,8 @@ Ralph CLI stores configuration in `~/.ralph/config.json`:
   "ingestion": {
     "ez4ielts": {
       "enabled": false,
-      "watchDir": "~/openclaw-workspace/docs",
+      "watchDir": "/absolute/path/to/your/ez4ielts-prds",
+      // Or set RALPH_EZ4IELTS_WATCH_DIR to override this per machine.
       "pattern": "ez4ielts-*.json",
       "settleMs": 2000
     }

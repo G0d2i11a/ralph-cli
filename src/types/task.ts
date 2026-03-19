@@ -13,6 +13,7 @@ export interface Task {
   pid?: number;
   agent: string;
   repoPath: string;
+  sessionId?: string;
   // Stagnation detection
   loopCount: number;
   consecutiveNoProgress: number;

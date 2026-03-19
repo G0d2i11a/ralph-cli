@@ -6,7 +6,7 @@ import { StateManager } from './state';
 import { enqueueTaskFromPrd } from './task-intake';
 import { parsePRD } from '../utils/helpers';
 
-export const DEFAULT_EZ4IELTS_WATCH_DIR = '~/openclaw-workspace/docs';
+export const DEFAULT_EZ4IELTS_WATCH_DIR = process.env.RALPH_EZ4IELTS_WATCH_DIR || '~/Workspace/openclaw/docs';
 export const DEFAULT_EZ4IELTS_PATTERN = 'ez4ielts-*.json';
 export const DEFAULT_EZ4IELTS_SETTLE_MS = 2000;
 
