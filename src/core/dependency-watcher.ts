@@ -2,6 +2,7 @@ import * as path from 'path';
 import { ConfigManager } from '../config/manager';
 import { StateManager } from '../core/state';
 import { finalizeTaskOutput } from './finalizer';
+import { evaluateFailedTaskForFinalizeRecovery } from './soft-success';
 import { DEFAULT_AGENT, resolveAgentType } from './agent';
 import {
   DEFAULT_EZ4IELTS_PATTERN,
@@ -10,6 +11,7 @@ import {
   PrdAutoIngestor,
 } from './prd-auto-ingest';
 import { TaskScheduler } from './scheduler';
+import { Task } from '../types/task';
 
 export interface WatchCommandOptions {
   interval?: number;
@@ -95,6 +97,7 @@ export class DependencyWatcher {
     while (this.isRunning) {
       try {
         await this.autoIngestor?.scan();
+        await this.recoverSoftFailedTasks();
         await this.finalizeReadyTasks();
         await this.checkPendingTasks();
       } catch (error) {
@@ -110,10 +113,36 @@ export class DependencyWatcher {
     this.logger.log('Dependency watcher stopped');
   }
 
+  async recoverSoftFailedTasks(): Promise<void> {
+    const failedTasks = (await this.stateManager.listTasks('failed'))
+      .slice()
+      .sort((a: Task, b: Task) => a.startTime - b.startTime);
+
+    for (const task of failedTasks) {
+      const decision = evaluateFailedTaskForFinalizeRecovery({
+        logPath: task.logPath,
+        completedUS: task.completedUS,
+        lastFilesChanged: task.lastFilesChanged,
+      });
+
+      if (!decision.shouldTreatAsSuccess) {
+        continue;
+      }
+
+      await this.stateManager.updateTask(task.id, {
+        status: 'ready_to_finalize',
+        currentUS: undefined,
+        pid: undefined,
+        endTime: undefined,
+      });
+      this.logger.log(`Task ${task.id} recovered into ready_to_finalize (${decision.reason})`);
+    }
+  }
+
   async finalizeReadyTasks(): Promise<void> {
     const readyTasks = (await this.stateManager.listTasks('ready_to_finalize'))
       .slice()
-      .sort((a, b) => a.startTime - b.startTime);
+      .sort((a: Task, b: Task) => a.startTime - b.startTime);
 
     for (const task of readyTasks) {
       try {
