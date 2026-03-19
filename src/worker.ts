@@ -2,6 +2,7 @@ import { StateManager } from './core/state';
 import { AgentRunner, AgentType } from './core/agent';
 import { bootstrapWorktreeDeps } from './core/bootstrap';
 import { finalizeTask } from './core/scheduler';
+import { shouldTreatNonZeroExitAsSuccess } from './core/soft-success';
 import { parsePRD, detectStagnation } from './utils/helpers';
 import { execSync } from 'child_process';
 import * as fs from 'fs';
@@ -102,9 +103,21 @@ async function runWorker(taskId: string) {
       }
       
       if (!result.success) {
-        console.error(`Failed to complete User Story: ${us.id}`);
-        await finalizeTask(task, 'failed', { stateManager });
-        process.exit(1);
+        const softSuccess = shouldTreatNonZeroExitAsSuccess({
+          output: result.output,
+          progress: progressDetected,
+        });
+
+        if (softSuccess.shouldTreatAsSuccess) {
+          console.log(`[Worker] Treating non-zero exit as soft success: ${softSuccess.reason}`);
+          task.consecutiveErrors = 0;
+          task.lastError = undefined;
+          await stateManager.saveTask(task);
+        } else {
+          console.error(`Failed to complete User Story: ${us.id}`);
+          await finalizeTask(task, 'failed', { stateManager });
+          process.exit(1);
+        }
       }
 
       // Mark as completed
@@ -253,7 +266,7 @@ function getChangedFilesCount(worktreePath: string): number {
       cwd: worktreePath,
       encoding: 'utf-8'
     });
-    return output.trim().split('\n').filter(line => line.length > 0).length;
+    return output.trim().split('\n').filter((line: string) => line.length > 0).length;
   } catch {
     return 0;
   }
