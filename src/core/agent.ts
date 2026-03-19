@@ -49,7 +49,7 @@ ${us.description}
 ${us.acceptanceCriteria.map((ac, i) => `${i + 1}. ${ac}`).join('\n')}
 
 Please implement this user story. Make sure all acceptance criteria are met.
-Commit your changes with a clear commit message.
+Do not commit your changes. Instead, leave the worktree ready for a separate finisher step and include a suggested commit message in your final summary.
 `.trim();
   }
 

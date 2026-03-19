@@ -1,4 +1,4 @@
-export type TaskStatus = 'pending' | 'running' | 'completed' | 'failed' | 'stagnant';
+export type TaskStatus = 'pending' | 'running' | 'ready_to_finalize' | 'finalizing' | 'completed' | 'failed' | 'failed_finalize' | 'stagnant';
 
 export interface Task {
   id: string;
@@ -20,4 +20,6 @@ export interface Task {
   lastProgressTime: number;
   lastError?: string;
   lastFilesChanged: number;
+  finalizerCommitMessage?: string;
+  finalizerCommittedAt?: number;
 }
