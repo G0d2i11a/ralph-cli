@@ -16,6 +16,7 @@ function withTempHome(testFn) {
       process.env.HOME = previousHome;
       fs.rmSync(homeDir, { recursive: true, force: true });
       delete require.cache[require.resolve('../dist/config/manager.js')];
+      delete require.cache[require.resolve('../dist/core/agent.js')];
     }
   };
 }
@@ -55,14 +56,14 @@ test('ConfigManager defaults agent.backend to cli', withTempHome(async () => {
   assert.equal(resolveConfiguredBackend(manager), 'cli');
 }));
 
-test('resolveConfiguredBackend preserves legacy sdk-runner configs', withTempHome(async (homeDir) => {
+test('resolveConfiguredBackend maps legacy sdk-runner configs to agent-runners', withTempHome(async (homeDir) => {
   const configDir = path.join(homeDir, '.ralph');
   fs.mkdirSync(configDir, { recursive: true });
   fs.writeFileSync(
     path.join(configDir, 'config.json'),
     JSON.stringify({
       agent: {
-        sdkRunnerPath: '/tmp/sdk-runners/dist/cli.js',
+        sdkRunnerPath: '/tmp/agent-runners/dist/cli.js',
       },
     }, null, 2),
   );
@@ -73,5 +74,43 @@ test('resolveConfiguredBackend preserves legacy sdk-runner configs', withTempHom
 
   assert.equal(manager.get('agent.backend'), 'cli');
   assert.equal(manager.has('agent.backend'), false);
-  assert.equal(resolveConfiguredBackend(manager), 'sdk-runner');
+  assert.equal(resolveConfiguredBackend(manager), 'agent-runners');
+}));
+
+test('resolveConfiguredBackend still accepts legacy sdk-runner env hints', withTempHome(async (homeDir) => {
+  const configDir = path.join(homeDir, '.ralph');
+  const previousAgentRunnersCli = process.env.RALPH_AGENT_RUNNERS_CLI;
+  const previousSdkRunnerCli = process.env.RALPH_SDK_RUNNER_CLI;
+
+  fs.mkdirSync(configDir, { recursive: true });
+  fs.writeFileSync(
+    path.join(configDir, 'config.json'),
+    JSON.stringify({
+      agent: {},
+    }, null, 2),
+  );
+
+  try {
+    delete process.env.RALPH_AGENT_RUNNERS_CLI;
+    process.env.RALPH_SDK_RUNNER_CLI = '/tmp/agent-runners/dist/cli.js';
+
+    const { ConfigManager } = require('../dist/config/manager.js');
+    const { resolveConfiguredBackend } = require('../dist/core/agent.js');
+    const manager = new ConfigManager();
+
+    assert.equal(manager.has('agent.backend'), false);
+    assert.equal(resolveConfiguredBackend(manager), 'agent-runners');
+  } finally {
+    if (previousAgentRunnersCli === undefined) {
+      delete process.env.RALPH_AGENT_RUNNERS_CLI;
+    } else {
+      process.env.RALPH_AGENT_RUNNERS_CLI = previousAgentRunnersCli;
+    }
+
+    if (previousSdkRunnerCli === undefined) {
+      delete process.env.RALPH_SDK_RUNNER_CLI;
+    } else {
+      process.env.RALPH_SDK_RUNNER_CLI = previousSdkRunnerCli;
+    }
+  }
 }));

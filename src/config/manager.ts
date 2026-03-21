@@ -6,6 +6,7 @@ export interface RalphConfig {
   agent: {
     backend: string;
     path: string;
+    agentRunnersPath: string;
     sdkRunnerPath: string;
     timeout: number;
     model: string;
@@ -29,6 +30,7 @@ const DEFAULT_CONFIG: RalphConfig = {
   agent: {
     backend: 'cli',
     path: 'codex',
+    agentRunnersPath: process.env.RALPH_AGENT_RUNNERS_CLI || process.env.RALPH_SDK_RUNNER_CLI || '',
     sdkRunnerPath: process.env.RALPH_SDK_RUNNER_CLI || '',
     timeout: 600,
     model: 'claude-opus-4-6-thinking-xchai'

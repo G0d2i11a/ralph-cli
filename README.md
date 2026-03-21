@@ -40,7 +40,7 @@ ralph list
 
 - **Simple CLI Interface** - Start, stop, and monitor tasks from command line
 - **Git Worktree Isolation** - Each task runs in its own worktree, zero conflicts
-- **Provider + Backend Support** - Keep `claude|codex` provider semantics and choose `cli` or `sdk-runner`
+- **Provider + Backend Support** - Keep `claude|codex` provider semantics and choose `cli` or `agent-runners`
 - **State Persistence** - Task state survives restarts
 - **Quality Gates** - Runs available `typecheck`, `lint`, and `build` scripts before the final commit
 - **Batch Execution** - Start multiple PRDs at once
@@ -69,7 +69,7 @@ ralph start <prd-path> [options]
 Options:
   --repo <path>    Repository path (defaults to current directory)
   --agent <name>   Agent to use: claude or codex (default: codex)
-  --backend <name> Backend to use: cli or sdk-runner (default: cli)
+  --backend <name> Backend to use: cli or agent-runners (default: cli)
 ```
 
 **Examples:**
@@ -81,8 +81,8 @@ ralph start ./prd-auth.json
 # Start with Claude Code explicitly
 ralph start ./prd-payment.md --agent claude
 
-# Keep using the legacy sdk-runner backend
-ralph start ./prd-auth.json --backend sdk-runner
+# Use the unified agent-runners backend
+ralph start ./prd-auth.json --backend agent-runners
 
 # Specify repository
 ralph start ./prd-api.json --repo ~/Code/my-project
@@ -111,7 +111,7 @@ When `--auto-ingest-ez4ielts` is enabled, Ralph polls the configured ez4ielts PR
 - Existing matching files are treated as backlog and skipped when the watcher starts.
 - Each new file is ingested once, even if it is modified again later.
 - Auto-ingested tasks default to Codex unless `--agent claude` is passed.
-- Auto-ingested tasks default to the `cli` backend unless `--backend sdk-runner` is passed.
+- Auto-ingested tasks default to the `cli` backend unless `--backend agent-runners` is passed.
 - Auto-ingested tasks default to the watched docs directory parent as their repo unless `--repo` is passed.
 - Auto-ingest requires an explicit watch directory via `--ez4ielts-dir`, `RALPH_EZ4IELTS_WATCH_DIR`, or `ingestion.ez4ielts.watchDir`.
 - New files still respect dependency checks and the configured concurrency limit.
@@ -294,14 +294,14 @@ ralph start ./prd.json
 ralph start ./prd.json --agent claude
 ```
 
-### sdk-runner backend
+### agent-runners backend
 
-Uses the legacy unified sdk-runner path and preserves Claude session IDs / Codex thread IDs across user stories.
+Uses the unified agent-runners path and preserves Claude session IDs / Codex thread IDs across user stories.
 
 **Command:**
 ```bash
-ralph start ./prd.json --backend sdk-runner
-ralph start ./prd.json --agent claude --backend sdk-runner
+ralph start ./prd.json --backend agent-runners
+ralph start ./prd.json --agent claude --backend agent-runners
 ```
 
 ### Claude Code
@@ -310,7 +310,8 @@ Provider semantics stay the same on both backends: `--agent claude` means Claude
 
 **Requirements:**
 - Claude Code CLI installed (`npm install -g @anthropic/claude-code`)
-- For `sdk-runner`, `agent.sdkRunnerPath` or `RALPH_SDK_RUNNER_CLI` points at the sdk-runner CLI
+- For `agent-runners`, `agent.agentRunnersPath` or `RALPH_AGENT_RUNNERS_CLI` points at the agent-runners CLI
+- Legacy `agent.sdkRunnerPath` and `RALPH_SDK_RUNNER_CLI` are still accepted
 - If you route Claude traffic through LiteLLM or another proxy, set the corresponding env vars before starting Ralph
 
 **Command:**
@@ -324,7 +325,8 @@ Provider semantics stay the same on both backends: `--agent codex` means Codex.
 
 **Requirements:**
 - Codex CLI installed
-- For `sdk-runner`, `agent.sdkRunnerPath` or `RALPH_SDK_RUNNER_CLI` points at the sdk-runner CLI
+- For `agent-runners`, `agent.agentRunnersPath` or `RALPH_AGENT_RUNNERS_CLI` points at the agent-runners CLI
+- Legacy `agent.sdkRunnerPath` and `RALPH_SDK_RUNNER_CLI` are still accepted
 - If you route OpenAI-compatible traffic through LiteLLM or another proxy, set the corresponding env vars before starting Ralph
 
 **Command:**
@@ -341,7 +343,8 @@ Ralph CLI stores configuration in `~/.ralph/config.json`:
   "agent": {
     "backend": "cli",
     "path": "codex",
-    "sdkRunnerPath": "/absolute/path/to/sdk-runners/dist/cli.js",
+    "agentRunnersPath": "/absolute/path/to/agent-runners/dist/cli.js",
+    "sdkRunnerPath": "",
     "timeout": 600,
     "model": "claude-opus-4-6-thinking-xchai"
   },
@@ -362,9 +365,11 @@ Ralph CLI stores configuration in `~/.ralph/config.json`:
 }
 ```
 
-`agent.backend` defaults to `cli` in new configs. New tasks also default to Codex unless `--agent claude` is passed. `agent.sdkRunnerPath` (or `RALPH_SDK_RUNNER_CLI`) points at the unified sdk-runner CLI when you choose the `sdk-runner` backend, `agent.timeout` is measured in seconds, and `agent.model` is only used for Claude runs. `agent.path` is kept for Codex CLI path compatibility.
+`agent.backend` defaults to `cli` in new configs. New tasks also default to Codex unless `--agent claude` is passed. `agent.agentRunnersPath` (or `RALPH_AGENT_RUNNERS_CLI`) points at the unified agent-runners CLI when you choose the `agent-runners` backend, `agent.timeout` is measured in seconds, and `agent.model` is only used for Claude runs. `agent.path` is kept for Codex CLI path compatibility.
 
-If you already have an older config that points at `agent.sdkRunnerPath` (or exports `RALPH_SDK_RUNNER_CLI`) but does not set `agent.backend`, Ralph continues to resolve that setup as `sdk-runner` until you explicitly set `agent.backend`.
+Legacy `agent.sdkRunnerPath` and `RALPH_SDK_RUNNER_CLI` are still accepted for compatibility.
+
+If you already have an older config that points at `agent.sdkRunnerPath` (or exports `RALPH_SDK_RUNNER_CLI`) but does not set `agent.backend`, Ralph continues to resolve that setup as `agent-runners` until you explicitly set `agent.backend`.
 
 Built-in notification delivery is not wired up yet, so the generated config intentionally omits any `notification` block.
 
@@ -479,13 +484,13 @@ which claude
 which codex
 ```
 
-### SDK runner / proxy connection error
+### Agent runners / proxy connection error
 
 Check the following:
 
 ```bash
-# sdk-runner path
-echo $RALPH_SDK_RUNNER_CLI
+# agent-runners path
+echo $RALPH_AGENT_RUNNERS_CLI
 
 # Optional proxy variables if you use LiteLLM or another gateway
 echo $ANTHROPIC_BASE_URL

@@ -18,7 +18,7 @@ ralph list
 ## 常用命令
 
 ```bash
-ralph start <prd-path> [--repo <path>] [--agent codex|claude] [--backend cli|sdk-runner]
+ralph start <prd-path> [--repo <path>] [--agent codex|claude] [--backend cli|agent-runners]
 ralph batch-start prds/*.json
 ralph watch --auto-ingest-ez4ielts
 ralph status <task-id> --detailed
@@ -41,8 +41,8 @@ ralph finalize <task-id>
 - Ralph 会把任务状态保存在 `~/.ralph/tasks/<task-id>/`
 - Ralph 会为每个任务维护一个标准化的 `prd.json` 快照，供 `status --detailed`、`update`、`stats` 使用
 - 在最终提交前，如果项目里存在 `typecheck`、`lint`、`build` 脚本，Ralph 会自动运行这些质量门禁
-- 默认 backend 是 `cli`；如需旧的统一 runner，请传 `--backend sdk-runner` 或配置 `agent.backend`
-- 如果本机的 sdk-runner 不在默认位置，请设置 `RALPH_SDK_RUNNER_CLI` 或 `agent.sdkRunnerPath`
+- 默认 backend 是 `cli`；如需统一 runner，请传 `--backend agent-runners` 或配置 `agent.backend`。兼容场景下仍可继续传 `sdk-runner`
+- 如果本机的 `agent-runners` 不在默认位置，请设置 `RALPH_AGENT_RUNNERS_CLI` 或 `agent.agentRunnersPath`；旧的 `RALPH_SDK_RUNNER_CLI` / `agent.sdkRunnerPath` 也仍然可用
 - 启用 auto-ingest 时，需要显式提供 `--ez4ielts-dir`、`RALPH_EZ4IELTS_WATCH_DIR` 或 `ingestion.ez4ielts.watchDir`
 - `runner.pollInterval` 在配置文件里按秒读取；CLI 的 `--interval` 仍然使用毫秒
 - `runner.stagnationTimeout` 现在按秒生效，用于把长时间没有进展的 worker 标记为 stagnant

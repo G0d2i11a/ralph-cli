@@ -76,7 +76,7 @@ test('watch CLI falls back to configured poll interval when --interval is omitte
   }
 });
 
-test('watch CLI help advertises the backend option', async () => {
+test('watch CLI help advertises the backend option and agent-runners backend', async () => {
   const output = await new Promise((resolve, reject) => {
     const chunks = [];
     const child = spawn('node', ['dist/cli.js', 'watch', '--help'], {
@@ -99,4 +99,5 @@ test('watch CLI help advertises the backend option', async () => {
   });
 
   assert.match(output, /--backend <name>/);
+  assert.match(output, /agent-runners/);
 });

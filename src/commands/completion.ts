@@ -36,7 +36,7 @@ _ralph_completion() {
       return 0
       ;;
     --backend)
-      COMPREPLY=( $(compgen -W "cli sdk-runner" -- \${cur}) )
+      COMPREPLY=( $(compgen -W "cli agent-runners" -- \${cur}) )
       return 0
       ;;
     --agent)
@@ -110,14 +110,14 @@ _ralph() {
             '1:PRD file:_files -g "*.md|*.json"' \\
             '--repo[Repository path]:directory:_directories' \\
             '--agent[Agent to use]:agent:(claude codex)' \\
-            '--backend[Backend to use]:backend:(cli sdk-runner)'
+            '--backend[Backend to use]:backend:(cli agent-runners)'
           ;;
         batch-start)
           _arguments \\
             '*:PRD file:_files -g "*.md|*.json"' \\
             '--repo[Repository path]:directory:_directories' \\
             '--agent[Agent to use]:agent:(claude codex)' \\
-            '--backend[Backend to use]:backend:(cli sdk-runner)'
+            '--backend[Backend to use]:backend:(cli agent-runners)'
           ;;
         status)
           _arguments \\
@@ -149,7 +149,7 @@ _ralph() {
             '--interval[Polling interval in milliseconds]:interval:' \\
             '--repo[Repository path for auto-ingested tasks]:directory:_directories' \\
             '--agent[Agent to use for auto-ingested tasks]:agent:(claude codex)' \\
-            '--backend[Backend to use for auto-ingested tasks]:backend:(cli sdk-runner)' \\
+            '--backend[Backend to use for auto-ingested tasks]:backend:(cli agent-runners)' \\
             '--auto-ingest-ez4ielts[Auto-enqueue new ez4ielts PRDs]' \\
             '--ez4ielts-dir[Directory to scan for ez4ielts PRDs]:directory:_directories'
           ;;

@@ -6,11 +6,11 @@ const path = require('node:path');
 const { EventEmitter } = require('node:events');
 const childProcess = require('node:child_process');
 
-function createSdkRunnerFixture(rootDir) {
-  const sdkRunnerPath = path.join(rootDir, 'sdk-runners', 'dist', 'cli.js');
-  fs.mkdirSync(path.dirname(sdkRunnerPath), { recursive: true });
-  fs.writeFileSync(sdkRunnerPath, '#!/usr/bin/env node\n');
-  return sdkRunnerPath;
+function createAgentRunnersFixture(rootDir) {
+  const agentRunnersPath = path.join(rootDir, 'agent-runners', 'dist', 'cli.js');
+  fs.mkdirSync(path.dirname(agentRunnersPath), { recursive: true });
+  fs.writeFileSync(agentRunnersPath, '#!/usr/bin/env node\n');
+  return agentRunnersPath;
 }
 
 function createMockChild({ exitCode = 0, stdoutLines = [], closeOnKill = true } = {}) {
@@ -56,18 +56,40 @@ async function cleanupPath(targetPath) {
   }
 }
 
+function captureRunnerEnv() {
+  return {
+    agentRunnersCli: process.env.RALPH_AGENT_RUNNERS_CLI,
+    sdkRunnerCli: process.env.RALPH_SDK_RUNNER_CLI,
+  };
+}
+
+function restoreRunnerEnv(previous) {
+  if (previous.agentRunnersCli === undefined) {
+    delete process.env.RALPH_AGENT_RUNNERS_CLI;
+  } else {
+    process.env.RALPH_AGENT_RUNNERS_CLI = previous.agentRunnersCli;
+  }
+
+  if (previous.sdkRunnerCli === undefined) {
+    delete process.env.RALPH_SDK_RUNNER_CLI;
+  } else {
+    process.env.RALPH_SDK_RUNNER_CLI = previous.sdkRunnerCli;
+  }
+}
+
 test('AgentRunner defaults Codex to the direct CLI backend', async () => {
   const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-agent-codex-'));
   const worktreePath = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-agent-worktree-'));
   const logPath = path.join(tempRoot, 'agent.log');
   const previousHome = process.env.HOME;
-  const previousRunnerPath = process.env.RALPH_SDK_RUNNER_CLI;
+  const previousRunnerEnv = captureRunnerEnv();
   const originalSpawn = childProcess.spawn;
 
   let captured;
 
   try {
     process.env.HOME = tempRoot;
+    delete process.env.RALPH_AGENT_RUNNERS_CLI;
     delete process.env.RALPH_SDK_RUNNER_CLI;
     childProcess.spawn = (command, args, options) => {
       captured = { command, args, options };
@@ -103,29 +125,26 @@ test('AgentRunner defaults Codex to the direct CLI backend', async () => {
   } finally {
     childProcess.spawn = originalSpawn;
     process.env.HOME = previousHome;
-    if (previousRunnerPath === undefined) {
-      delete process.env.RALPH_SDK_RUNNER_CLI;
-    } else {
-      process.env.RALPH_SDK_RUNNER_CLI = previousRunnerPath;
-    }
+    restoreRunnerEnv(previousRunnerEnv);
     await cleanupPath(tempRoot);
     await cleanupPath(worktreePath);
     delete require.cache[require.resolve('../dist/core/agent.js')];
   }
 });
 
-test('AgentRunner persists and resumes Codex thread ids via sdk-runners CLI', async () => {
+test('AgentRunner persists and resumes Codex thread ids via agent-runners CLI', async () => {
   const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-agent-codex-thread-'));
   const worktreePath = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-agent-worktree-'));
   const logPath = path.join(tempRoot, 'agent.log');
   const previousHome = process.env.HOME;
-  const previousRunnerPath = process.env.RALPH_SDK_RUNNER_CLI;
+  const previousRunnerEnv = captureRunnerEnv();
   const originalSpawn = childProcess.spawn;
   const capturedCalls = [];
 
   try {
     process.env.HOME = tempRoot;
-    process.env.RALPH_SDK_RUNNER_CLI = createSdkRunnerFixture(tempRoot);
+    process.env.RALPH_AGENT_RUNNERS_CLI = createAgentRunnersFixture(tempRoot);
+    delete process.env.RALPH_SDK_RUNNER_CLI;
     childProcess.spawn = (command, args, options) => {
       capturedCalls.push({ command, args, options });
       return createMockChild({
@@ -146,7 +165,7 @@ test('AgentRunner persists and resumes Codex thread ids via sdk-runners CLI', as
       worktreePath,
       'codex',
       logPath,
-      'sdk-runner',
+      'agent-runners',
     );
 
     const second = await runner.runUserStory(
@@ -159,7 +178,7 @@ test('AgentRunner persists and resumes Codex thread ids via sdk-runners CLI', as
       worktreePath,
       'codex',
       logPath,
-      'sdk-runner',
+      'agent-runners',
       { threadId: first.threadId },
     );
 
@@ -168,45 +187,42 @@ test('AgentRunner persists and resumes Codex thread ids via sdk-runners CLI', as
     assert.equal(second.success, true);
     assert.equal(second.threadId, 'codex-thread-1');
     assert.equal(capturedCalls.length, 2);
-    assert.deepEqual(capturedCalls[0].args.slice(0, 2), [process.env.RALPH_SDK_RUNNER_CLI, 'codex']);
+    assert.deepEqual(capturedCalls[0].args.slice(0, 2), [process.env.RALPH_AGENT_RUNNERS_CLI, 'codex']);
     assert.ok(!capturedCalls[0].args.includes('--resume-thread'));
-    assert.deepEqual(capturedCalls[1].args.slice(0, 2), [process.env.RALPH_SDK_RUNNER_CLI, 'codex']);
+    assert.deepEqual(capturedCalls[1].args.slice(0, 2), [process.env.RALPH_AGENT_RUNNERS_CLI, 'codex']);
     assert.ok(capturedCalls[1].args.includes('--resume-thread'));
     assert.ok(capturedCalls[1].args.includes('codex-thread-1'));
   } finally {
     childProcess.spawn = originalSpawn;
     process.env.HOME = previousHome;
-    if (previousRunnerPath === undefined) {
-      delete process.env.RALPH_SDK_RUNNER_CLI;
-    } else {
-      process.env.RALPH_SDK_RUNNER_CLI = previousRunnerPath;
-    }
+    restoreRunnerEnv(previousRunnerEnv);
     await cleanupPath(tempRoot);
     await cleanupPath(worktreePath);
     delete require.cache[require.resolve('../dist/core/agent.js')];
   }
 });
 
-test('AgentRunner preserves Claude sdk-runner model and resume args', async () => {
+test('AgentRunner preserves Claude agent-runners model and resume args', async () => {
   const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-agent-claude-'));
   const worktreePath = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-agent-worktree-'));
   const logPath = path.join(tempRoot, 'agent.log');
   const previousHome = process.env.HOME;
-  const previousRunnerPath = process.env.RALPH_SDK_RUNNER_CLI;
+  const previousRunnerEnv = captureRunnerEnv();
   const originalSpawn = childProcess.spawn;
 
   let captured;
 
   try {
     process.env.HOME = tempRoot;
-    process.env.RALPH_SDK_RUNNER_CLI = createSdkRunnerFixture(tempRoot);
+    process.env.RALPH_AGENT_RUNNERS_CLI = createAgentRunnersFixture(tempRoot);
+    delete process.env.RALPH_SDK_RUNNER_CLI;
     fs.mkdirSync(path.join(tempRoot, '.ralph'), { recursive: true });
     fs.writeFileSync(
       path.join(tempRoot, '.ralph', 'config.json'),
       JSON.stringify({
         agent: {
           path: 'codex',
-          sdkRunnerPath: process.env.RALPH_SDK_RUNNER_CLI,
+          agentRunnersPath: process.env.RALPH_AGENT_RUNNERS_CLI,
           timeout: 600,
           model: 'claude-test-model',
         },
@@ -233,14 +249,14 @@ test('AgentRunner preserves Claude sdk-runner model and resume args', async () =
       worktreePath,
       'claude',
       logPath,
-      'sdk-runner',
+      'agent-runners',
       { sessionId: 'resume-session-123' },
     );
 
     assert.equal(result.success, true);
     assert.equal(result.sessionId, 'claude-session-1');
     assert.equal(captured.command, 'node');
-    assert.deepEqual(captured.args.slice(0, 2), [process.env.RALPH_SDK_RUNNER_CLI, 'claude']);
+    assert.deepEqual(captured.args.slice(0, 2), [process.env.RALPH_AGENT_RUNNERS_CLI, 'claude']);
     assert.ok(captured.args.includes('--model'));
     assert.ok(captured.args.includes('claude-test-model'));
     assert.ok(captured.args.includes('--resume'));
@@ -248,11 +264,7 @@ test('AgentRunner preserves Claude sdk-runner model and resume args', async () =
   } finally {
     childProcess.spawn = originalSpawn;
     process.env.HOME = previousHome;
-    if (previousRunnerPath === undefined) {
-      delete process.env.RALPH_SDK_RUNNER_CLI;
-    } else {
-      process.env.RALPH_SDK_RUNNER_CLI = previousRunnerPath;
-    }
+    restoreRunnerEnv(previousRunnerEnv);
     await cleanupPath(tempRoot);
     await cleanupPath(worktreePath);
     delete require.cache[require.resolve('../dist/core/agent.js')];
@@ -264,20 +276,21 @@ test('AgentRunner enforces configured timeout', async () => {
   const worktreePath = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-agent-worktree-'));
   const logPath = path.join(tempRoot, 'agent.log');
   const previousHome = process.env.HOME;
-  const previousRunnerPath = process.env.RALPH_SDK_RUNNER_CLI;
+  const previousRunnerEnv = captureRunnerEnv();
   const originalSpawn = childProcess.spawn;
 
   let child;
 
   try {
     process.env.HOME = tempRoot;
-    process.env.RALPH_SDK_RUNNER_CLI = createSdkRunnerFixture(tempRoot);
+    process.env.RALPH_AGENT_RUNNERS_CLI = createAgentRunnersFixture(tempRoot);
+    delete process.env.RALPH_SDK_RUNNER_CLI;
     fs.mkdirSync(path.join(tempRoot, '.ralph'), { recursive: true });
     fs.writeFileSync(
       path.join(tempRoot, '.ralph', 'config.json'),
       JSON.stringify({
         agent: {
-          sdkRunnerPath: process.env.RALPH_SDK_RUNNER_CLI,
+          agentRunnersPath: process.env.RALPH_AGENT_RUNNERS_CLI,
           timeout: 0.01,
         },
       }),
@@ -301,7 +314,7 @@ test('AgentRunner enforces configured timeout', async () => {
       worktreePath,
       'codex',
       logPath,
-      'sdk-runner',
+      'agent-runners',
     );
 
     assert.equal(result.success, false);
@@ -310,11 +323,7 @@ test('AgentRunner enforces configured timeout', async () => {
   } finally {
     childProcess.spawn = originalSpawn;
     process.env.HOME = previousHome;
-    if (previousRunnerPath === undefined) {
-      delete process.env.RALPH_SDK_RUNNER_CLI;
-    } else {
-      process.env.RALPH_SDK_RUNNER_CLI = previousRunnerPath;
-    }
+    restoreRunnerEnv(previousRunnerEnv);
     await cleanupPath(tempRoot);
     await cleanupPath(worktreePath);
     delete require.cache[require.resolve('../dist/core/agent.js')];

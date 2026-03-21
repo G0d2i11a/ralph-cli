@@ -5,11 +5,16 @@ import { ConfigManager } from '../config/manager';
 import { UserStory } from '../types/prd';
 
 export type AgentType = 'claude' | 'codex';
-export type AgentBackend = 'cli' | 'sdk-runner';
+export type AgentBackend = 'cli' | 'agent-runners';
+
+export type AcceptedAgentBackend = AgentBackend | 'sdk-runner';
 
 export const DEFAULT_AGENT: AgentType = 'codex';
 export const DEFAULT_BACKEND: AgentBackend = 'cli';
-const LEGACY_SDK_RUNNER_CLI = '~/Workspace/openclaw/sdk-runners/dist/cli.js';
+const DEFAULT_AGENT_RUNNERS_CLI = '~/Workspace/openclaw/agent-runners/dist/cli.js';
+const LEGACY_SDK_RUNNERS_CLI = '~/Workspace/openclaw/sdk-runners/dist/cli.js';
+const AGENT_RUNNERS_ENV = 'RALPH_AGENT_RUNNERS_CLI';
+const LEGACY_SDK_RUNNER_ENV = 'RALPH_SDK_RUNNER_CLI';
 const FORCE_KILL_GRACE_MS = 5000;
 
 type AgentConfig = Pick<ConfigManager, 'get'> & Partial<Pick<ConfigManager, 'has'>>;
@@ -30,8 +35,8 @@ export function resolveAgentType(value?: string): AgentType {
   return value;
 }
 
-export function isAgentBackend(value: string): value is AgentBackend {
-  return value === 'cli' || value === 'sdk-runner';
+export function isAgentBackend(value: string): value is AcceptedAgentBackend {
+  return value === 'cli' || value === 'agent-runners' || value === 'sdk-runner';
 }
 
 export function resolveAgentBackend(value?: string): AgentBackend {
@@ -40,10 +45,10 @@ export function resolveAgentBackend(value?: string): AgentBackend {
   }
 
   if (!isAgentBackend(value)) {
-    throw new Error(`Unsupported backend "${value}". Expected "cli" or "sdk-runner".`);
+    throw new Error(`Unsupported backend "${value}". Expected "cli" or "agent-runners" (legacy alias: "sdk-runner").`);
   }
 
-  return value;
+  return value === 'sdk-runner' ? 'agent-runners' : value;
 }
 
 function looksLikePath(value: string): boolean {
@@ -69,22 +74,26 @@ export function resolveConfiguredBackend(config: AgentConfig): AgentBackend {
     return resolveAgentBackend(configuredBackend.trim());
   }
 
+  const configuredAgentRunnersPath = config.get('agent.agentRunnersPath');
   const configRunnerPath = config.get('agent.sdkRunnerPath');
   const legacyAgentPath = config.get('agent.path');
   const hasLegacySdkRunner = Boolean(
-    process.env.RALPH_SDK_RUNNER_CLI?.trim()
+    process.env[AGENT_RUNNERS_ENV]?.trim()
+    || process.env[LEGACY_SDK_RUNNER_ENV]?.trim()
+    || (typeof configuredAgentRunnersPath === 'string' && configuredAgentRunnersPath.trim())
     || (typeof configRunnerPath === 'string' && configRunnerPath.trim())
     || (typeof legacyAgentPath === 'string' && looksLikePath(legacyAgentPath))
   );
 
   if (!hasExplicitBackend && hasLegacySdkRunner) {
-    return 'sdk-runner';
+    return 'agent-runners';
   }
 
   return resolveAgentBackend(typeof configuredBackend === 'string' ? configuredBackend : undefined);
 }
 
-function resolveSdkRunnerCli(config: Pick<ConfigManager, 'get'>): string {
+function resolveAgentRunnersCli(config: Pick<ConfigManager, 'get'>): string {
+  const configuredAgentRunnersPath = config.get('agent.agentRunnersPath');
   const configRunnerPath = config.get('agent.sdkRunnerPath');
   const legacyAgentPath = config.get('agent.path');
   const legacyCompatiblePath = typeof legacyAgentPath === 'string' && looksLikePath(legacyAgentPath)
@@ -92,10 +101,13 @@ function resolveSdkRunnerCli(config: Pick<ConfigManager, 'get'>): string {
     : undefined;
 
   const candidates = [
-    process.env.RALPH_SDK_RUNNER_CLI,
+    process.env[AGENT_RUNNERS_ENV],
+    typeof configuredAgentRunnersPath === 'string' ? configuredAgentRunnersPath : undefined,
+    process.env[LEGACY_SDK_RUNNER_ENV],
     typeof configRunnerPath === 'string' ? configRunnerPath : undefined,
     legacyCompatiblePath,
-    LEGACY_SDK_RUNNER_CLI,
+    DEFAULT_AGENT_RUNNERS_CLI,
+    LEGACY_SDK_RUNNERS_CLI,
   ];
 
   for (const candidate of candidates) {
@@ -105,7 +117,7 @@ function resolveSdkRunnerCli(config: Pick<ConfigManager, 'get'>): string {
     }
   }
 
-  throw new Error('Unable to find sdk-runners CLI. Set `RALPH_SDK_RUNNER_CLI` or `agent.sdkRunnerPath` in `~/.ralph/config.json`.');
+  throw new Error('Unable to find agent-runners CLI. Set `RALPH_AGENT_RUNNERS_CLI` or `agent.agentRunnersPath` in `~/.ralph/config.json`. Legacy `RALPH_SDK_RUNNER_CLI` and `agent.sdkRunnerPath` are also supported.');
 }
 
 function resolveAgentTimeoutMs(config: Pick<ConfigManager, 'get'>): number {
@@ -189,10 +201,10 @@ Do not commit your changes. Instead, leave the worktree ready for a separate fin
       let command: string;
       let args: string[];
 
-      if (backend === 'sdk-runner') {
-        let sdkRunnerCli: string;
+      if (backend === 'agent-runners') {
+        let agentRunnersCli: string;
         try {
-          sdkRunnerCli = resolveSdkRunnerCli(this.config);
+          agentRunnersCli = resolveAgentRunnersCli(this.config);
         } catch (error) {
           reject(error);
           return;
@@ -200,7 +212,7 @@ Do not commit your changes. Instead, leave the worktree ready for a separate fin
 
         command = 'node';
         args = [
-          sdkRunnerCli,
+          agentRunnersCli,
           agent,
           '--prompt', prompt,
           '--cwd', worktreePath,
@@ -365,7 +377,7 @@ Do not commit your changes. Instead, leave the worktree ready for a separate fin
       this.process.on('error', (error) => {
         clearTimers();
         const processError = backend === 'cli' && (error as NodeJS.ErrnoException).code === 'ENOENT'
-          ? new Error(`${error.message}. Install the ${agent} CLI or re-run with --backend sdk-runner.`)
+          ? new Error(`${error.message}. Install the ${agent} CLI or re-run with --backend agent-runners.`)
           : error;
         console.error(`[Agent] Process error: ${processError.message}`);
         this.logStream?.write(`\nERROR: ${processError.message}\n`);

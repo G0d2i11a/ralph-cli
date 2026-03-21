@@ -128,7 +128,7 @@ test('PrdAutoIngestor skips backlog, ingests new files once, and ignores later m
     assert.equal(firstResults[0].action, 'ingested');
     assert.equal(tasksAfterFirstIngest.length, 1);
     assert.equal(path.basename(tasksAfterFirstIngest[0].prdPath), 'ez4ielts-new.json');
-    assert.equal(tasksAfterFirstIngest[0].backend, 'sdk-runner');
+    assert.equal(tasksAfterFirstIngest[0].backend, 'agent-runners');
     assert.equal(scheduler.scheduleCalls, 1);
 
     signatures.set(newPrd, 'new-v2');
