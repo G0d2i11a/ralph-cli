@@ -5,6 +5,7 @@ import { DEFAULT_AGENT, resolveAgentType } from '../core/agent';
 interface BatchStartOptions {
   repo?: string;
   agent?: string;
+  backend?: string;
 }
 
 export async function batchStartCommand(prdPaths: string[], options: BatchStartOptions) {
@@ -18,6 +19,9 @@ export async function batchStartCommand(prdPaths: string[], options: BatchStartO
     worktree?: string;
     logPath?: string;
     status?: string;
+    backend?: string;
+    sessionId?: string;
+    threadId?: string;
     error?: string;
   }> = [];
 
@@ -28,6 +32,7 @@ export async function batchStartCommand(prdPaths: string[], options: BatchStartO
       const queuedTask = await enqueueTaskFromPrd(absolutePrdPath, {
         repoPath: repo,
         agent,
+        backend: options.backend,
       });
 
       results.push({
@@ -37,6 +42,9 @@ export async function batchStartCommand(prdPaths: string[], options: BatchStartO
         worktree: queuedTask.latestTask.worktree,
         logPath: queuedTask.latestTask.logPath,
         status: queuedTask.latestTask.status,
+        backend: queuedTask.latestTask.backend,
+        sessionId: queuedTask.latestTask.sessionId,
+        threadId: queuedTask.latestTask.threadId,
       });
     } catch (error) {
       results.push({

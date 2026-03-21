@@ -13,6 +13,7 @@ export async function listCommand(options: { status?: string }): Promise<void> {
       id: task.id,
       status: task.status,
       agent: task.agent,
+      backend: task.backend,
       prdPath: task.prdPath,
       startTime: new Date(task.startTime).toISOString(),
       duration: task.endTime 

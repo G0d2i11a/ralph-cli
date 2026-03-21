@@ -3,11 +3,10 @@ import { ConfigManager } from '../config/manager';
 import { StateManager } from '../core/state';
 import { finalizeTaskOutput } from './finalizer';
 import { evaluateFailedTaskForFinalizeRecovery } from './soft-success';
-import { DEFAULT_AGENT, resolveAgentType } from './agent';
+import { DEFAULT_AGENT, resolveAgentBackend, resolveAgentType, resolveConfiguredBackend } from './agent';
 import {
   DEFAULT_EZ4IELTS_PATTERN,
   DEFAULT_EZ4IELTS_SETTLE_MS,
-  DEFAULT_EZ4IELTS_WATCH_DIR,
   PrdAutoIngestor,
 } from './prd-auto-ingest';
 import { TaskScheduler } from './scheduler';
@@ -17,6 +16,7 @@ export interface WatchCommandOptions {
   interval?: number;
   repo?: string;
   agent?: string;
+  backend?: string;
   autoIngestEz4ielts?: boolean;
   ez4ieltsDir?: string;
 }
@@ -29,6 +29,16 @@ interface DependencyWatcherDeps {
   sleep?: (ms: number) => Promise<void>;
   logger?: Pick<typeof console, 'log' | 'error'>;
   finalizer?: typeof finalizeTaskOutput;
+}
+
+function resolveConfiguredPollIntervalMs(value: unknown): number {
+  const numericValue = Number(value);
+
+  if (!Number.isFinite(numericValue) || numericValue <= 0) {
+    return 30000;
+  }
+
+  return numericValue >= 1000 ? numericValue : numericValue * 1000;
 }
 
 export class DependencyWatcher {
@@ -51,7 +61,9 @@ export class DependencyWatcher {
     this.stateManager = stateManager;
     this.finalizer = deps.finalizer ?? finalizeTaskOutput;
     this.scheduler = deps.scheduler ?? new TaskScheduler({ stateManager });
-    this.pollInterval = options.interval || 30000;
+    this.pollInterval = Number.isFinite(options.interval) && Number(options.interval) > 0
+      ? Number(options.interval)
+      : resolveConfiguredPollIntervalMs(configManager.get('runner.pollInterval'));
     this.sleep = deps.sleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
     this.logger = deps.logger ?? console;
 
@@ -67,12 +79,21 @@ export class DependencyWatcher {
       const settleMs = Number(configManager.get('ingestion.ez4ielts.settleMs'));
       const configuredPattern = configManager.get('ingestion.ez4ielts.pattern');
       const configuredWatchDir = configManager.get('ingestion.ez4ielts.watchDir');
-      const watchDir = options.ez4ieltsDir || configuredWatchDir || DEFAULT_EZ4IELTS_WATCH_DIR;
+      const watchDir = options.ez4ieltsDir || configuredWatchDir || process.env.RALPH_EZ4IELTS_WATCH_DIR;
+
+      if (!watchDir || !String(watchDir).trim()) {
+        throw new Error('ez4ielts auto-ingest requires a watch directory. Pass `--ez4ielts-dir` or set `ingestion.ez4ielts.watchDir` / `RALPH_EZ4IELTS_WATCH_DIR`.');
+      }
+
       const repoPath = options.repo || path.dirname(path.resolve(watchDir));
+      const backend = options.backend
+        ? resolveAgentBackend(options.backend)
+        : resolveConfiguredBackend(configManager);
 
       this.autoIngestor = new PrdAutoIngestor({
         repoPath,
         agent: resolveAgentType(options.agent || DEFAULT_AGENT),
+        backend,
         watchDir,
         pattern: typeof configuredPattern === 'string' ? configuredPattern : DEFAULT_EZ4IELTS_PATTERN,
         settleMs: Number.isFinite(settleMs) && settleMs >= 0 ? settleMs : DEFAULT_EZ4IELTS_SETTLE_MS,

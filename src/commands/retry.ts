@@ -34,7 +34,7 @@ export async function retryCommand(taskId: string) {
     task.endTime = undefined;
     task.pid = undefined;
     task.currentUS = undefined;
-    // sessionId is preserved for continuation
+    // sessionId/threadId are preserved for continuation
 
     await stateManager.saveTask(task);
     await scheduler.schedulePendingTasks();
@@ -62,7 +62,9 @@ export async function retryCommand(taskId: string) {
       concurrencyLimit: pendingState?.maxConcurrent,
       completedUS: latestTask.completedUS.length,
       worktree: latestTask.worktree,
-      logPath: latestTask.logPath
+      logPath: latestTask.logPath,
+      sessionId: latestTask.sessionId,
+      threadId: latestTask.threadId
     }));
   } catch (error) {
     console.error(JSON.stringify({

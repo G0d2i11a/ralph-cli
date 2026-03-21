@@ -12,8 +12,10 @@ export interface Task {
   logPath: string;
   pid?: number;
   agent: string;
+  backend?: string;
   repoPath: string;
   sessionId?: string;
+  threadId?: string;
   // Stagnation detection
   loopCount: number;
   consecutiveNoProgress: number;

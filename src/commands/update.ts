@@ -1,6 +1,5 @@
 import { StateManager } from '../core/state';
-import * as fs from 'fs';
-import * as path from 'path';
+import { updateTaskPRDStory } from '../utils/helpers';
 
 interface UpdateOptions {
   passes?: boolean;
@@ -23,37 +22,26 @@ export async function updateCommand(taskId: string, options: UpdateOptions) {
       process.exit(1);
     }
 
-    // Read PRD file from worktree
-    const prdPath = path.join(task.worktree, 'prd.json');
-    if (!fs.existsSync(prdPath)) {
-      console.error(JSON.stringify({ error: `PRD file not found at ${prdPath}` }));
-      process.exit(1);
-    }
+    const prd = updateTaskPRDStory(task, options.storyId, {
+      passes: options.passes,
+      notes: options.notes,
+    });
+    const story = prd.userStories.find((entry) => entry.id === options.storyId);
 
-    const prd = JSON.parse(fs.readFileSync(prdPath, 'utf-8'));
-    
-    // Find and update the user story
-    const story = prd.userStories?.find((s: any) => s.id === options.storyId);
     if (!story) {
-      console.error(JSON.stringify({ error: `Story ${options.storyId} not found in PRD` }));
-      process.exit(1);
+      throw new Error(`Story ${options.storyId} not found in PRD`);
     }
 
-    if (options.passes !== undefined) {
-      story.passes = options.passes;
-    }
-    if (options.notes !== undefined) {
-      story.notes = options.notes;
+    const completedUS = new Set(task.completedUS);
+    if (options.passes === true) {
+      completedUS.add(options.storyId);
+    } else if (options.passes === false) {
+      completedUS.delete(options.storyId);
     }
 
-    // Write back to PRD
-    fs.writeFileSync(prdPath, JSON.stringify(prd, null, 2));
-
-    // Update task's completed stories list
-    if (options.passes && !task.completedUS.includes(options.storyId)) {
-      task.completedUS.push(options.storyId);
-      await stateManager.saveTask(task);
-    }
+    await stateManager.updateTask(taskId, {
+      completedUS: [...completedUS],
+    });
 
     console.log(JSON.stringify({
       success: true,

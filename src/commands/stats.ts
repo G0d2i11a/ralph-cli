@@ -1,7 +1,7 @@
 import { StateManager } from '../core/state';
-import { PRD } from '../types/prd';
+import { loadTaskPRD } from '../utils/helpers';
 import * as fs from 'fs';
-import * as path from 'path';
+import { Task } from '../types/task';
 
 interface UserStoryStats {
   id: string;
@@ -21,7 +21,7 @@ interface TaskStats {
   successRate: number;
 }
 
-export async function statsCommand(taskId: string, options: { format?: string; all?: boolean }): Promise<void> {
+export async function statsCommand(taskId: string | undefined, options: { format?: string; all?: boolean }): Promise<void> {
   const stateManager = new StateManager();
 
   if (options.all) {
@@ -40,9 +40,9 @@ export async function statsCommand(taskId: string, options: { format?: string; a
     process.exit(1);
   }
 
-  const stats = await calculateStats(task, stateManager);
-  
+  const stats = await calculateStats(task);
   const format = options.format || 'table';
+
   if (format === 'json') {
     console.log(JSON.stringify(stats, null, 2));
   } else if (format === 'summary') {
@@ -52,46 +52,40 @@ export async function statsCommand(taskId: string, options: { format?: string; a
   }
 }
 
-async function calculateStats(task: any, stateManager: StateManager): Promise<TaskStats> {
-  const duration = task.endTime 
+async function calculateStats(task: Task): Promise<TaskStats> {
+  const duration = task.endTime
     ? Math.round((task.endTime - task.startTime) / 1000)
     : Math.round((Date.now() - task.startTime) / 1000);
 
-  // Load PRD to get User Story info
-  let prd: PRD | null = null;
+  let userStoriesFromPrd: import('../types/prd').UserStory[] = [];
   try {
-    if (fs.existsSync(task.prdPath)) {
-      const prdContent = fs.readFileSync(task.prdPath, 'utf-8');
-      prd = parsePRD(prdContent);
-    }
-  } catch (error) {
-    // PRD not available, use basic info
+    userStoriesFromPrd = loadTaskPRD(task).userStories;
+  } catch {
+    userStoriesFromPrd = [];
   }
 
-  // Parse log file for detailed stats
   const logStats = await parseLogFile(task.logPath);
+  const completedUS = new Set(task.completedUS || []);
+  const userStories: UserStoryStats[] = userStoriesFromPrd.map((userStory) => {
+    const usLog = logStats.userStories[userStory.id] || {};
+    return {
+      id: userStory.id,
+      title: userStory.title,
+      duration: usLog.duration || 0,
+      iterations: usLog.iterations || 0,
+      status: completedUS.has(userStory.id) || userStory.passes
+        ? 'completed'
+        : task.currentUS === userStory.id
+          ? 'in-progress'
+          : 'pending'
+    };
+  });
 
-  const userStories: UserStoryStats[] = [];
-  const completedUS = task.completedUS || [];
-  
-  if (prd) {
-    for (const us of prd.userStories) {
-      const usLog = logStats.userStories[us.id] || {};
-      userStories.push({
-        id: us.id,
-        title: us.title,
-        duration: usLog.duration || 0,
-        iterations: usLog.iterations || 0,
-        status: completedUS.includes(us.id) ? 'completed' : 
-                task.currentUS === us.id ? 'in-progress' : 'pending'
-      });
-    }
-  }
-
-  const totalIterations = task.loopCount || userStories.reduce((sum, us) => sum + us.iterations, 0);
+  const totalIterations = task.loopCount || userStories.reduce((sum, userStory) => sum + userStory.iterations, 0);
   const avgIterationTime = totalIterations > 0 ? duration / totalIterations : 0;
-  const successRate = prd ? completedUS.length / prd.userStories.length : 
-                      task.status === 'completed' ? 1.0 : 0.0;
+  const successRate = userStoriesFromPrd.length > 0
+    ? completedUS.size / userStoriesFromPrd.length
+    : task.status === 'completed' ? 1.0 : 0.0;
 
   return {
     taskId: task.id,
@@ -104,9 +98,9 @@ async function calculateStats(task: any, stateManager: StateManager): Promise<Ta
   };
 }
 
-async function parseLogFile(logPath: string): Promise<any> {
-  const stats: any = {
-    userStories: {}
+async function parseLogFile(logPath: string): Promise<{ userStories: Record<string, { duration: number; iterations: number }> }> {
+  const stats = {
+    userStories: {} as Record<string, { duration: number; iterations: number }>
   };
 
   if (!fs.existsSync(logPath)) {
@@ -119,16 +113,13 @@ async function parseLogFile(logPath: string): Promise<any> {
 
     let currentUS: string | null = null;
     let usStartTime: number | null = null;
-    let usIterations: { [key: string]: number } = {};
+    const usIterations: Record<string, number> = {};
 
     for (const line of lines) {
-      // Detect User Story start
-      const usMatch = line.match(/Starting User Story: (US-\d+)/i) || 
-                      line.match(/Processing (US-\d+)/i);
+      const usMatch = line.match(/Starting User Story: (US-\d+)/i) || line.match(/Processing (US-\d+)/i);
       if (usMatch) {
         const usId = usMatch[1];
         if (currentUS && usStartTime) {
-          // Save previous US stats
           const timestamp = extractTimestamp(line);
           if (timestamp) {
             const duration = Math.round((timestamp - usStartTime) / 1000);
@@ -138,18 +129,17 @@ async function parseLogFile(logPath: string): Promise<any> {
             };
           }
         }
+
         currentUS = usId;
         usStartTime = extractTimestamp(line);
         usIterations[usId] = (usIterations[usId] || 0) + 1;
       }
 
-      // Detect iteration
       if (currentUS && line.match(/iteration|retry|attempt/i)) {
         usIterations[currentUS] = (usIterations[currentUS] || 0) + 1;
       }
     }
 
-    // Save last US
     if (currentUS && usStartTime) {
       const lastTimestamp = Date.now();
       const duration = Math.round((lastTimestamp - usStartTime) / 1000);
@@ -158,15 +148,14 @@ async function parseLogFile(logPath: string): Promise<any> {
         iterations: usIterations[currentUS] || 1
       };
     }
-  } catch (error) {
-    // Log parsing failed, return empty stats
+  } catch {
+    // Ignore log parsing failures.
   }
 
   return stats;
 }
 
 function extractTimestamp(line: string): number | null {
-  // Try to extract timestamp from log line
   const isoMatch = line.match(/\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}/);
   if (isoMatch) {
     return new Date(isoMatch[0]).getTime();
@@ -174,54 +163,10 @@ function extractTimestamp(line: string): number | null {
 
   const unixMatch = line.match(/\[(\d{13})\]/);
   if (unixMatch) {
-    return parseInt(unixMatch[1]);
+    return parseInt(unixMatch[1], 10);
   }
 
   return null;
-}
-
-function parsePRD(content: string): PRD | null {
-  try {
-    // Try JSON format first
-    return JSON.parse(content);
-  } catch {
-    // Parse markdown format
-    const lines = content.split('\n');
-    const prd: PRD = {
-      id: '',
-      title: '',
-      description: '',
-      userStories: []
-    };
-
-    let currentSection = '';
-    let currentUS: any = null;
-
-    for (const line of lines) {
-      if (line.startsWith('# ')) {
-        prd.title = line.substring(2).trim();
-      } else if (line.match(/^## (US-\d+)/)) {
-        if (currentUS) {
-          prd.userStories.push(currentUS);
-        }
-        const match = line.match(/^## (US-\d+):?\s*(.+)/);
-        currentUS = {
-          id: match![1],
-          title: match![2] || '',
-          description: '',
-          acceptanceCriteria: []
-        };
-      } else if (currentUS && line.trim()) {
-        currentUS.description += line + '\n';
-      }
-    }
-
-    if (currentUS) {
-      prd.userStories.push(currentUS);
-    }
-
-    return prd.userStories.length > 0 ? prd : null;
-  }
 }
 
 function printTable(stats: TaskStats): void {
@@ -231,26 +176,26 @@ function printTable(stats: TaskStats): void {
   console.log(`Total Iterations: ${stats.totalIterations}`);
   console.log(`Avg Iteration Time: ${formatDuration(stats.avgIterationTime)}`);
   console.log(`Success Rate: ${(stats.successRate * 100).toFixed(0)}%`);
-  
+
   if (stats.userStories.length > 0) {
     console.log('\n📝 User Stories:');
     console.log('─'.repeat(80));
     console.log(
-      'ID'.padEnd(10) + 
-      'Title'.padEnd(35) + 
-      'Duration'.padEnd(12) + 
-      'Iterations'.padEnd(12) + 
+      'ID'.padEnd(10) +
+      'Title'.padEnd(35) +
+      'Duration'.padEnd(12) +
+      'Iterations'.padEnd(12) +
       'Status'
     );
     console.log('─'.repeat(80));
 
-    for (const us of stats.userStories) {
+    for (const userStory of stats.userStories) {
       console.log(
-        us.id.padEnd(10) +
-        truncate(us.title, 33).padEnd(35) +
-        formatDuration(us.duration).padEnd(12) +
-        us.iterations.toString().padEnd(12) +
-        formatStatus(us.status)
+        userStory.id.padEnd(10) +
+        truncate(userStory.title, 33).padEnd(35) +
+        formatDuration(userStory.duration).padEnd(12) +
+        userStory.iterations.toString().padEnd(12) +
+        formatStatus(userStory.status)
       );
     }
     console.log('─'.repeat(80));
@@ -259,9 +204,9 @@ function printTable(stats: TaskStats): void {
 }
 
 function printSummary(stats: TaskStats): void {
-  const completed = stats.userStories.filter(us => us.status === 'completed').length;
+  const completed = stats.userStories.filter((userStory) => userStory.status === 'completed').length;
   const total = stats.userStories.length;
-  
+
   console.log(`Task ${stats.taskId}: ${stats.status}`);
   console.log(`Completed ${completed}/${total} User Stories in ${formatDuration(stats.duration)}`);
   console.log(`${stats.totalIterations} iterations, avg ${formatDuration(stats.avgIterationTime)} per iteration`);
@@ -269,7 +214,7 @@ function printSummary(stats: TaskStats): void {
 
 async function showAllStats(stateManager: StateManager, format: string): Promise<void> {
   const tasks = await stateManager.listTasks();
-  
+
   if (tasks.length === 0) {
     console.log('No tasks found');
     return;
@@ -277,70 +222,76 @@ async function showAllStats(stateManager: StateManager, format: string): Promise
 
   const allStats: TaskStats[] = [];
   for (const task of tasks) {
-    const stats = await calculateStats(task, stateManager);
-    allStats.push(stats);
+    allStats.push(await calculateStats(task));
   }
 
   if (format === 'json') {
     console.log(JSON.stringify(allStats, null, 2));
-  } else {
-    console.log('\n📊 All Tasks Statistics\n');
-    console.log('─'.repeat(100));
-    console.log(
-      'Task ID'.padEnd(30) +
-      'Status'.padEnd(12) +
-      'Duration'.padEnd(12) +
-      'US Done'.padEnd(12) +
-      'Iterations'.padEnd(12) +
-      'Success Rate'
-    );
-    console.log('─'.repeat(100));
-
-    for (const stats of allStats) {
-      const completed = stats.userStories.filter(us => us.status === 'completed').length;
-      const total = stats.userStories.length;
-      
-      console.log(
-        truncate(stats.taskId, 28).padEnd(30) +
-        formatStatus(stats.status).padEnd(12) +
-        formatDuration(stats.duration).padEnd(12) +
-        `${completed}/${total}`.padEnd(12) +
-        stats.totalIterations.toString().padEnd(12) +
-        `${(stats.successRate * 100).toFixed(0)}%`
-      );
-    }
-    console.log('─'.repeat(100));
-    console.log();
+    return;
   }
+
+  console.log('\n📊 All Tasks Statistics\n');
+  console.log('─'.repeat(100));
+  console.log(
+    'Task ID'.padEnd(30) +
+    'Status'.padEnd(18) +
+    'Duration'.padEnd(12) +
+    'US Done'.padEnd(12) +
+    'Iterations'.padEnd(12) +
+    'Success Rate'
+  );
+  console.log('─'.repeat(100));
+
+  for (const stats of allStats) {
+    const completed = stats.userStories.filter((userStory) => userStory.status === 'completed').length;
+    const total = stats.userStories.length;
+
+    console.log(
+      truncate(stats.taskId, 28).padEnd(30) +
+      truncate(formatStatus(stats.status), 16).padEnd(18) +
+      formatDuration(stats.duration).padEnd(12) +
+      `${completed}/${total}`.padEnd(12) +
+      stats.totalIterations.toString().padEnd(12) +
+      `${(stats.successRate * 100).toFixed(0)}%`
+    );
+  }
+  console.log('─'.repeat(100));
+  console.log();
 }
 
 function formatDuration(seconds: number): string {
   if (seconds < 60) {
     return `${seconds}s`;
-  } else if (seconds < 3600) {
+  }
+  if (seconds < 3600) {
     const mins = Math.floor(seconds / 60);
     const secs = seconds % 60;
     return `${mins}m ${secs}s`;
-  } else {
-    const hours = Math.floor(seconds / 3600);
-    const mins = Math.floor((seconds % 3600) / 60);
-    return `${hours}h ${mins}m`;
   }
+
+  const hours = Math.floor(seconds / 3600);
+  const mins = Math.floor((seconds % 3600) / 60);
+  return `${hours}h ${mins}m`;
 }
 
 function formatStatus(status: string): string {
-  const statusMap: { [key: string]: string } = {
-    'completed': '✅ completed',
-    'running': '🔄 running',
+  const statusMap: Record<string, string> = {
+    completed: '✅ completed',
+    running: '🔄 running',
     'in-progress': '🔄 in-progress',
-    'pending': '⏳ pending',
-    'failed': '❌ failed',
-    'stagnant': '⚠️  stagnant'
+    pending: '⏳ pending',
+    ready_to_finalize: '🧹 ready_to_finalize',
+    finalizing: '🧹 finalizing',
+    failed: '❌ failed',
+    failed_finalize: '❌ failed_finalize',
+    stagnant: '⚠️ stagnant'
   };
   return statusMap[status] || status;
 }
 
 function truncate(str: string, maxLen: number): string {
-  if (str.length <= maxLen) return str;
-  return str.substring(0, maxLen - 3) + '...';
+  if (str.length <= maxLen) {
+    return str;
+  }
+  return `${str.substring(0, maxLen - 3)}...`;
 }

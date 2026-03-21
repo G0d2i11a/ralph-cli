@@ -4,7 +4,7 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 
-const { DEFAULT_AGENT, resolveAgentType } = require('../dist/core/agent.js');
+const { DEFAULT_AGENT, DEFAULT_BACKEND, resolveAgentType, resolveAgentBackend } = require('../dist/core/agent.js');
 const { PrdAutoIngestor } = require('../dist/core/prd-auto-ingest.js');
 
 class FakeStateManager {
@@ -78,9 +78,11 @@ function createPrdFile(dir, name, overrides = {}) {
   return filePath;
 }
 
-test('default agent resolves to codex', () => {
+test('default agent and backend resolve to codex/cli', () => {
   assert.equal(DEFAULT_AGENT, 'codex');
+  assert.equal(DEFAULT_BACKEND, 'cli');
   assert.equal(resolveAgentType(), 'codex');
+  assert.equal(resolveAgentBackend(), 'cli');
 });
 
 test('PrdAutoIngestor skips backlog, ingests new files once, and ignores later modifications', async () => {
@@ -100,6 +102,7 @@ test('PrdAutoIngestor skips backlog, ingests new files once, and ignores later m
       watchDir,
       repoPath: '/repo',
       agent: 'codex',
+      backend: 'sdk-runner',
       settleMs: 1000,
     }, {
       stateManager,
@@ -125,6 +128,7 @@ test('PrdAutoIngestor skips backlog, ingests new files once, and ignores later m
     assert.equal(firstResults[0].action, 'ingested');
     assert.equal(tasksAfterFirstIngest.length, 1);
     assert.equal(path.basename(tasksAfterFirstIngest[0].prdPath), 'ez4ielts-new.json');
+    assert.equal(tasksAfterFirstIngest[0].backend, 'sdk-runner');
     assert.equal(scheduler.scheduleCalls, 1);
 
     signatures.set(newPrd, 'new-v2');
@@ -193,6 +197,7 @@ test('PrdAutoIngestor retries invalid JSON only after the file changes', async (
     assert.equal(validResults[0].action, 'ingested');
     assert.equal(tasks.length, 1);
     assert.equal(path.basename(tasks[0].prdPath), 'ez4ielts-invalid.json');
+    assert.equal(tasks[0].backend, 'cli');
   } finally {
     process.env.HOME = previousHome;
     fs.rmSync(watchDir, { recursive: true, force: true });

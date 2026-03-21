@@ -11,10 +11,12 @@ Based on [Geoffrey Huntley's Ralph pattern](https://ghuntley.com/ralph/) and ins
 ## Quick Start
 
 ```bash
-# Install
-npm install -g ralph-cli
+# Build from source (recommended until an npm release is published)
+npm install
+npm run build
+npm link
 
-# Start a task (defaults to Codex)
+# Start a task (defaults to Codex on the `cli` backend)
 ralph start ./my-prd.json
 
 # Check status
@@ -32,26 +34,20 @@ ralph list
 | Lost progress on restart | Persistent state tracking |
 | Manual git branch management | Automatic worktree isolation |
 | No visibility into progress | Real-time status monitoring |
-| Manual quality checks | Auto quality gates (type check, lint, build) |
+| Manual quality checks | Auto quality gates before finalize |
 
 ## Features
 
 - **Simple CLI Interface** - Start, stop, and monitor tasks from command line
 - **Git Worktree Isolation** - Each task runs in its own worktree, zero conflicts
-- **Dual Agent Support** - Use Claude Code or Codex CLI
+- **Provider + Backend Support** - Keep `claude|codex` provider semantics and choose `cli` or `sdk-runner`
 - **State Persistence** - Task state survives restarts
-- **Quality Gates** - Automatic type check, lint, and build before commits
+- **Quality Gates** - Runs available `typecheck`, `lint`, and `build` scripts before the final commit
 - **Batch Execution** - Start multiple PRDs at once
 - **Watch + Auto-Ingestion** - Poll the queue and auto-enqueue new ez4ielts PRDs
 - **Progress Tracking** - Monitor task status and completion
 
 ## Installation
-
-### From npm (coming soon)
-
-```bash
-npm install -g ralph-cli
-```
 
 ### From source
 
@@ -73,6 +69,7 @@ ralph start <prd-path> [options]
 Options:
   --repo <path>    Repository path (defaults to current directory)
   --agent <name>   Agent to use: claude or codex (default: codex)
+  --backend <name> Backend to use: cli or sdk-runner (default: cli)
 ```
 
 **Examples:**
@@ -83,6 +80,9 @@ ralph start ./prd-auth.json
 
 # Start with Claude Code explicitly
 ralph start ./prd-payment.md --agent claude
+
+# Keep using the legacy sdk-runner backend
+ralph start ./prd-auth.json --backend sdk-runner
 
 # Specify repository
 ralph start ./prd-api.json --repo ~/Code/my-project
@@ -106,12 +106,14 @@ ralph watch
 ralph watch --auto-ingest-ez4ielts
 ```
 
-When `--auto-ingest-ez4ielts` is enabled, Ralph polls the configured ez4ielts PRD directory (set `RALPH_EZ4IELTS_WATCH_DIR` or configure `ingestion.ez4ielts.watchDir` in `~/.ralph/config.json`) for new files matching `ez4ielts-*.json` and sends them through the same queue/start flow as `ralph start`.
+When `--auto-ingest-ez4ielts` is enabled, Ralph polls the configured ez4ielts PRD directory (pass `--ez4ielts-dir`, set `RALPH_EZ4IELTS_WATCH_DIR`, or configure `ingestion.ez4ielts.watchDir` in `~/.ralph/config.json`) for new files matching `ez4ielts-*.json` and sends them through the same queue/start flow as `ralph start`.
 
 - Existing matching files are treated as backlog and skipped when the watcher starts.
 - Each new file is ingested once, even if it is modified again later.
 - Auto-ingested tasks default to Codex unless `--agent claude` is passed.
-- Auto-ingested tasks default to the watched docs directory parent as their repo unless `--repo` is passed. For your current setup, pass `--repo ~/Project/ez4ielts` so execution happens in the project repo rather than the docs workspace.
+- Auto-ingested tasks default to the `cli` backend unless `--backend sdk-runner` is passed.
+- Auto-ingested tasks default to the watched docs directory parent as their repo unless `--repo` is passed.
+- Auto-ingest requires an explicit watch directory via `--ez4ielts-dir`, `RALPH_EZ4IELTS_WATCH_DIR`, or `ingestion.ez4ielts.watchDir`.
 - New files still respect dependency checks and the configured concurrency limit.
 
 You can also enable the same mode through `~/.ralph/config.json` and then run plain `ralph watch`.
@@ -147,7 +149,8 @@ ralph stop <task-id>
 ### Update task progress
 
 ```bash
-ralph update <task-id> --status completed --notes "Implemented authentication"
+ralph update <task-id> --story-id US-001 --passes
+ralph update <task-id> --story-id US-001 --notes "Implemented authentication"
 ```
 
 ### Retry failed task
@@ -171,7 +174,8 @@ ralph reset-stagnation <task-id>
 ### View statistics
 
 ```bash
-ralph stats
+ralph stats <task-id>
+ralph stats --all
 ```
 
 ## PRD Format
@@ -241,13 +245,15 @@ dependencies: []
 This PRD implements a secure authentication system using industry best practices.
 ```
 
+Ralph also supports Markdown body sections like `## US-001: Title` or `### US-001: Title` with `**Description**` and `**Acceptance Criteria**` blocks.
+
 ## How It Works
 
 1. **Parse PRD** - Ralph reads your PRD file and extracts user stories
 2. **Create Worktree** - Creates a git worktree for isolated development
 3. **Spawn Agent** - Launches Codex by default, or Claude Code when requested
 4. **Track Progress** - Maintains state in `~/.ralph/tasks/<task-id>/`
-5. **Quality Gates** - Runs type check, lint, and build before commits
+5. **Quality Gates** - Runs available `typecheck`, `lint`, and `build` scripts before the restricted final commit
 6. **Watch + Queue** - `ralph watch` can keep the queue moving and auto-ingest new ez4ielts PRDs
 7. **Complete** - Marks task as completed when all user stories pass
 
@@ -266,6 +272,7 @@ Task state is stored in `~/.ralph/tasks/<task-id>/state.json`:
   "worktree": "/path/to/worktree",
   "logPath": "/path/to/log",
   "agent": "codex",
+  "backend": "cli",
   "createdAt": "2026-03-07T10:00:00Z",
   "updatedAt": "2026-03-07T10:30:00Z"
 }
@@ -273,18 +280,38 @@ Task state is stored in `~/.ralph/tasks/<task-id>/state.json`:
 
 ## Agents
 
+### CLI backend (default)
+
+Runs the provider CLI directly.
+
+**Codex command:** `codex exec <prompt> --full-auto`
+
+**Claude command:** `claude -p <prompt> --model <model> --dangerously-skip-permissions --permission-mode bypassPermissions`
+
+**Commands:**
+```bash
+ralph start ./prd.json
+ralph start ./prd.json --agent claude
+```
+
+### sdk-runner backend
+
+Uses the legacy unified sdk-runner path and preserves Claude session IDs / Codex thread IDs across user stories.
+
+**Command:**
+```bash
+ralph start ./prd.json --backend sdk-runner
+ralph start ./prd.json --agent claude --backend sdk-runner
+```
+
 ### Claude Code
 
-Uses Claude Opus 4 via LiteLLM proxy.
+Provider semantics stay the same on both backends: `--agent claude` means Claude Code.
 
 **Requirements:**
 - Claude Code CLI installed (`npm install -g @anthropic/claude-code`)
-- LiteLLM running on `localhost:4000`
-- Environment variables:
-  ```bash
-  export ANTHROPIC_BASE_URL=http://localhost:4000/v1
-  export ANTHROPIC_API_KEY=<your-litellm-master-key>
-  ```
+- For `sdk-runner`, `agent.sdkRunnerPath` or `RALPH_SDK_RUNNER_CLI` points at the sdk-runner CLI
+- If you route Claude traffic through LiteLLM or another proxy, set the corresponding env vars before starting Ralph
 
 **Command:**
 ```bash
@@ -293,16 +320,12 @@ ralph start ./prd.json --agent claude
 
 ### Codex
 
-Uses GPT-5.3 Codex via LiteLLM proxy.
+Provider semantics stay the same on both backends: `--agent codex` means Codex.
 
 **Requirements:**
 - Codex CLI installed
-- LiteLLM running on `localhost:4000`
-- Environment variables:
-  ```bash
-  export OPENAI_BASE_URL=http://localhost:4000/v1
-  export OPENAI_API_KEY=<your-litellm-master-key>
-  ```
+- For `sdk-runner`, `agent.sdkRunnerPath` or `RALPH_SDK_RUNNER_CLI` points at the sdk-runner CLI
+- If you route OpenAI-compatible traffic through LiteLLM or another proxy, set the corresponding env vars before starting Ralph
 
 **Command:**
 ```bash
@@ -316,7 +339,9 @@ Ralph CLI stores configuration in `~/.ralph/config.json`:
 ```json
 {
   "agent": {
+    "backend": "cli",
     "path": "codex",
+    "sdkRunnerPath": "/absolute/path/to/sdk-runners/dist/cli.js",
     "timeout": 600,
     "model": "claude-opus-4-6-thinking-xchai"
   },
@@ -333,18 +358,17 @@ Ralph CLI stores configuration in `~/.ralph/config.json`:
       "pattern": "ez4ielts-*.json",
       "settleMs": 2000
     }
-  },
-  "notification": {
-    "enabled": false,
-    "channel": "feishu",
-    "target": ""
   }
 }
 ```
 
-`agent.path` defaults to `codex` in the generated config. New tasks also default to Codex unless `--agent claude` is passed. `agent.model` is only used for Claude runs.
+`agent.backend` defaults to `cli` in new configs. New tasks also default to Codex unless `--agent claude` is passed. `agent.sdkRunnerPath` (or `RALPH_SDK_RUNNER_CLI`) points at the unified sdk-runner CLI when you choose the `sdk-runner` backend, `agent.timeout` is measured in seconds, and `agent.model` is only used for Claude runs. `agent.path` is kept for Codex CLI path compatibility.
 
-Set concurrency to `2` by changing `runner.maxConcurrent`:
+If you already have an older config that points at `agent.sdkRunnerPath` (or exports `RALPH_SDK_RUNNER_CLI`) but does not set `agent.backend`, Ralph continues to resolve that setup as `sdk-runner` until you explicitly set `agent.backend`.
+
+Built-in notification delivery is not wired up yet, so the generated config intentionally omits any `notification` block.
+
+Set concurrency to `2` by changing `runner.maxConcurrent`. `runner.pollInterval` is read from config in seconds when `ralph watch` is launched without `--interval`, and `runner.stagnationTimeout` is used in seconds to mark long-stalled workers as stagnant:
 
 ```json
 {
@@ -354,7 +378,7 @@ Set concurrency to `2` by changing `runner.maxConcurrent`:
 }
 ```
 
-Enable ez4ielts auto-ingestion by changing `ingestion.ez4ielts.enabled` to `true` and then running `ralph watch`:
+Enable ez4ielts auto-ingestion by changing `ingestion.ez4ielts.enabled` to `true`, setting `ingestion.ez4ielts.watchDir` (or `RALPH_EZ4IELTS_WATCH_DIR` / `--ez4ielts-dir`), and then running `ralph watch`:
 
 ```json
 {
@@ -455,12 +479,17 @@ which claude
 which codex
 ```
 
-### LiteLLM connection error
+### SDK runner / proxy connection error
 
-Check that LiteLLM is running:
+Check the following:
 
 ```bash
-curl http://localhost:4000/health
+# sdk-runner path
+echo $RALPH_SDK_RUNNER_CLI
+
+# Optional proxy variables if you use LiteLLM or another gateway
+echo $ANTHROPIC_BASE_URL
+echo $OPENAI_BASE_URL
 ```
 
 ## License

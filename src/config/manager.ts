@@ -4,7 +4,9 @@ import * as os from 'os';
 
 export interface RalphConfig {
   agent: {
+    backend: string;
     path: string;
+    sdkRunnerPath: string;
     timeout: number;
     model: string;
   };
@@ -21,16 +23,13 @@ export interface RalphConfig {
       settleMs: number;
     };
   };
-  notification: {
-    enabled: boolean;
-    channel: string;
-    target: string;
-  };
 }
 
 const DEFAULT_CONFIG: RalphConfig = {
   agent: {
+    backend: 'cli',
     path: 'codex',
+    sdkRunnerPath: process.env.RALPH_SDK_RUNNER_CLI || '',
     timeout: 600,
     model: 'claude-opus-4-6-thinking-xchai'
   },
@@ -42,34 +41,38 @@ const DEFAULT_CONFIG: RalphConfig = {
   ingestion: {
     ez4ielts: {
       enabled: false,
-      watchDir: process.env.RALPH_EZ4IELTS_WATCH_DIR || '~/Workspace/openclaw/docs',
+      watchDir: process.env.RALPH_EZ4IELTS_WATCH_DIR || '',
       pattern: 'ez4ielts-*.json',
       settleMs: 2000,
     },
   },
-  notification: {
-    enabled: false,
-    channel: 'feishu',
-    target: ''
-  }
 };
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
+function cloneConfig<T>(value: T): T {
+  return JSON.parse(JSON.stringify(value)) as T;
+}
+
 function mergeConfig<T extends Record<string, any>>(defaults: T, overrides: Partial<T>): T {
   const merged: Record<string, unknown> = { ...defaults };
+  const overrideRecord: Record<string, unknown> = isPlainObject(overrides) ? overrides : {};
 
-  for (const [key, value] of Object.entries(overrides)) {
-    const defaultValue = merged[key];
+  for (const [key, defaultValue] of Object.entries(defaults)) {
+    const overrideValue = overrideRecord[key];
 
-    if (isPlainObject(defaultValue) && isPlainObject(value)) {
-      merged[key] = mergeConfig(defaultValue, value);
+    if (overrideValue === undefined) {
       continue;
     }
 
-    merged[key] = value;
+    if (isPlainObject(defaultValue) && isPlainObject(overrideValue)) {
+      merged[key] = mergeConfig(defaultValue, overrideValue);
+      continue;
+    }
+
+    merged[key] = overrideValue;
   }
 
   return merged as T;
@@ -78,6 +81,7 @@ function mergeConfig<T extends Record<string, any>>(defaults: T, overrides: Part
 export class ConfigManager {
   private configPath: string;
   private config: RalphConfig;
+  private rawConfig: Record<string, unknown> = {};
 
   constructor() {
     const ralphDir = path.join(os.homedir(), '.ralph');
@@ -90,16 +94,21 @@ export class ConfigManager {
 
   private load(): RalphConfig {
     if (!fs.existsSync(this.configPath)) {
-      this.save(DEFAULT_CONFIG);
-      return DEFAULT_CONFIG;
+      const config = cloneConfig(DEFAULT_CONFIG);
+      this.rawConfig = cloneConfig(config) as unknown as Record<string, unknown>;
+      this.save(config);
+      return config;
     }
 
     try {
       const content = fs.readFileSync(this.configPath, 'utf-8');
-      return mergeConfig(DEFAULT_CONFIG, JSON.parse(content));
+      const parsed = JSON.parse(content);
+      this.rawConfig = isPlainObject(parsed) ? parsed : {};
+      return mergeConfig(DEFAULT_CONFIG, this.rawConfig as Partial<RalphConfig>);
     } catch (error) {
       console.error('Failed to load config, using defaults:', error);
-      return DEFAULT_CONFIG;
+      this.rawConfig = {};
+      return cloneConfig(DEFAULT_CONFIG);
     }
   }
 
@@ -107,12 +116,13 @@ export class ConfigManager {
     const tempPath = `${this.configPath}.tmp`;
     fs.writeFileSync(tempPath, JSON.stringify(config, null, 2));
     fs.renameSync(tempPath, this.configPath);
+    this.rawConfig = cloneConfig(config) as unknown as Record<string, unknown>;
   }
 
   get(key: string): any {
     const parts = key.split('.');
     let value: any = this.config;
-    
+
     for (const part of parts) {
       if (value && typeof value === 'object' && part in value) {
         value = value[part];
@@ -120,26 +130,41 @@ export class ConfigManager {
         return undefined;
       }
     }
-    
+
     return value;
   }
 
   set(key: string, value: any): void {
     const parts = key.split('.');
     let target: any = this.config;
-    
+
     for (let i = 0; i < parts.length - 1; i++) {
       const part = parts[i];
-      if (!(part in target)) {
+      if (!(part in target) || !isPlainObject(target[part])) {
         target[part] = {};
       }
       target = target[part];
     }
-    
+
     const lastPart = parts[parts.length - 1];
     target[lastPart] = value;
-    
+
     this.save(this.config);
+  }
+
+  has(key: string): boolean {
+    const parts = key.split('.');
+    let value: unknown = this.rawConfig;
+
+    for (const part of parts) {
+      if (!isPlainObject(value) || !(part in value)) {
+        return false;
+      }
+
+      value = value[part];
+    }
+
+    return true;
   }
 
   list(): RalphConfig {

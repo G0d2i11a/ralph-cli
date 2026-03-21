@@ -3,6 +3,9 @@ export interface UserStory {
   title: string;
   description: string;
   acceptanceCriteria: string[];
+  passes?: boolean;
+  notes?: string;
+  priority?: string;
 }
 
 export interface PRD {

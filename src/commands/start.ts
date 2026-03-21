@@ -2,12 +2,13 @@ import { enqueueTaskFromPrd } from '../core/task-intake';
 
 export async function startCommand(
   prdPath: string,
-  options: { repo?: string; agent?: string }
+  options: { repo?: string; agent?: string; backend?: string }
 ): Promise<void> {
   try {
     const { taskId, latestTask, pendingState } = await enqueueTaskFromPrd(prdPath, {
       repoPath: options.repo,
       agent: options.agent,
+      backend: options.backend,
     });
 
     if (latestTask.status === 'running') {
@@ -16,6 +17,9 @@ export async function startCommand(
         status: 'started',
         worktree: latestTask.worktree,
         logPath: latestTask.logPath,
+        backend: latestTask.backend,
+        sessionId: latestTask.sessionId,
+        threadId: latestTask.threadId,
       }));
       return;
     }
@@ -28,6 +32,7 @@ export async function startCommand(
       taskId,
       status: 'pending',
       reason: pendingState.reason === 'dependencies' ? 'waiting for dependencies' : 'queued',
+      backend: latestTask.backend,
       dependencies: pendingState.dependencies,
       concurrencyLimit: pendingState.maxConcurrent,
       message: pendingState.reason === 'dependencies'

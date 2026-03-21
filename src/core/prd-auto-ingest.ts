@@ -1,12 +1,12 @@
 import * as fs from 'fs';
 import * as path from 'path';
-import { AgentType, DEFAULT_AGENT, resolveAgentType } from './agent';
+import { AgentBackend, AgentType, DEFAULT_AGENT, resolveAgentBackend, resolveAgentType } from './agent';
 import { TaskScheduler } from './scheduler';
 import { StateManager } from './state';
 import { enqueueTaskFromPrd } from './task-intake';
 import { parsePRD } from '../utils/helpers';
 
-export const DEFAULT_EZ4IELTS_WATCH_DIR = process.env.RALPH_EZ4IELTS_WATCH_DIR || '~/Workspace/openclaw/docs';
+export const DEFAULT_EZ4IELTS_WATCH_DIR = '';
 export const DEFAULT_EZ4IELTS_PATTERN = 'ez4ielts-*.json';
 export const DEFAULT_EZ4IELTS_SETTLE_MS = 2000;
 
@@ -21,6 +21,7 @@ export interface PrdAutoIngestOptions {
   pattern?: string;
   repoPath?: string;
   agent?: string;
+  backend?: string;
   settleMs?: number;
   logger?: (message: string) => void;
 }
@@ -41,11 +42,17 @@ export interface PrdAutoIngestResult {
   error?: string;
 }
 
+function resolveConfiguredWatchDir(watchDir?: string): string | null {
+  const candidate = watchDir?.trim() || process.env.RALPH_EZ4IELTS_WATCH_DIR?.trim() || DEFAULT_EZ4IELTS_WATCH_DIR;
+  return candidate ? path.resolve(candidate) : null;
+}
+
 export class PrdAutoIngestor {
   private readonly stateManager: StateManager;
   private readonly scheduler: TaskScheduler;
   private readonly repoPath: string;
   private readonly agent: AgentType;
+  private readonly backend: AgentBackend;
   private readonly watchDir: string;
   private readonly pattern: string;
   private readonly settleMs: number;
@@ -59,11 +66,17 @@ export class PrdAutoIngestor {
   private initialized = false;
 
   constructor(options: PrdAutoIngestOptions = {}, deps: PrdAutoIngestDeps = {}) {
+    const resolvedWatchDir = resolveConfiguredWatchDir(options.watchDir);
+    if (!resolvedWatchDir) {
+      throw new Error('ez4ielts auto-ingest requires a watch directory. Pass `--ez4ielts-dir` or set `ingestion.ez4ielts.watchDir` / `RALPH_EZ4IELTS_WATCH_DIR`.');
+    }
+
     this.stateManager = deps.stateManager ?? new StateManager();
     this.scheduler = deps.scheduler ?? new TaskScheduler({ stateManager: this.stateManager });
-    this.watchDir = path.resolve(options.watchDir || DEFAULT_EZ4IELTS_WATCH_DIR);
+    this.watchDir = resolvedWatchDir;
     this.repoPath = path.resolve(options.repoPath || path.dirname(this.watchDir));
     this.agent = resolveAgentType(options.agent || DEFAULT_AGENT);
+    this.backend = resolveAgentBackend(options.backend);
     this.pattern = options.pattern || DEFAULT_EZ4IELTS_PATTERN;
     this.settleMs = options.settleMs ?? DEFAULT_EZ4IELTS_SETTLE_MS;
     this.now = deps.now ?? (() => Date.now());
@@ -154,6 +167,7 @@ export class PrdAutoIngestor {
       const queuedTask = await enqueueTaskFromPrd(filePath, {
         repoPath: this.repoPath,
         agent: this.agent,
+        backend: this.backend,
         dedupeByPrdPath: true,
         stateManager: this.stateManager,
         scheduler: this.scheduler,

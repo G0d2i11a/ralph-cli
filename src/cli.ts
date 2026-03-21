@@ -14,8 +14,7 @@ import { retryCommand } from './commands/retry';
 import { resetStagnationCommand } from './commands/reset-stagnation';
 import { completionCommand } from './commands/completion';
 import { watch } from './commands/watch';
-import { DEFAULT_AGENT } from './core/agent';
-import { DEFAULT_EZ4IELTS_WATCH_DIR } from './core/prd-auto-ingest';
+import { DEFAULT_AGENT, DEFAULT_BACKEND } from './core/agent';
 
 const program = new Command();
 
@@ -29,11 +28,13 @@ program
   .description('Start a new task from a PRD file')
   .option('--repo <path>', 'Repository path (defaults to current directory)')
   .option('--agent <name>', 'Agent to use (claude|codex)', DEFAULT_AGENT)
+  .option('--backend <name>', `Backend to use (cli|sdk-runner, default: ${DEFAULT_BACKEND})`)
   .addHelpText('after', `
 Examples:
   $ ralph start prd.md
   $ ralph start prd.md --repo ~/Project/myproject
-  $ ralph start prd.json --agent claude`)
+  $ ralph start prd.json --agent claude
+  $ ralph start prd.json --backend sdk-runner`)
   .action(startCommand);
 
 program
@@ -88,7 +89,7 @@ Examples:
   .action(finalizeCommand);
 
 program
-  .command('stats <task-id>')
+  .command('stats [task-id]')
   .description('Show performance statistics for a task')
   .option('--format <type>', 'Output format: json, table, summary (default: table)', 'table')
   .option('--all', 'Show stats for all tasks')
@@ -104,10 +105,12 @@ program
   .description('Start multiple tasks from PRD files')
   .option('--repo <path>', 'Repository path (defaults to current directory)')
   .option('--agent <name>', 'Agent to use (claude|codex)', DEFAULT_AGENT)
+  .option('--backend <name>', `Backend to use (cli|sdk-runner, default: ${DEFAULT_BACKEND})`)
   .addHelpText('after', `
 Examples:
   $ ralph batch-start prd1.md prd2.md prd3.md
-  $ ralph batch-start prds/*.md --agent codex`)
+  $ ralph batch-start prds/*.md --agent codex
+  $ ralph batch-start prds/*.md --backend sdk-runner`)
   .action(batchStartCommand);
 
 program
@@ -141,17 +144,19 @@ Examples:
 program
   .command('watch')
   .description('Poll pending tasks and optionally auto-ingest new ez4ielts PRDs into the queue')
-  .option('--interval <ms>', 'Polling interval in milliseconds', '30000')
+  .option('--interval <ms>', 'Polling interval in milliseconds')
   .option('--repo <path>', 'Repository path for auto-ingested tasks (defaults to the watched docs directory parent)')
   .option('--agent <name>', 'Agent to use (claude|codex)', DEFAULT_AGENT)
+  .option('--backend <name>', `Backend to use for auto-ingested tasks (cli|sdk-runner, default: ${DEFAULT_BACKEND})`)
   .option('--auto-ingest-ez4ielts', 'Auto-enqueue new ez4ielts-*.json files discovered by the watcher')
-  .option('--ez4ielts-dir <path>', 'Directory to scan for ez4ielts-*.json files', DEFAULT_EZ4IELTS_WATCH_DIR)
+  .option('--ez4ielts-dir <path>', 'Directory to scan for ez4ielts-*.json files')
   .addHelpText('after', `
 Examples:
   $ ralph watch
   $ ralph watch --interval 10000
   $ ralph watch --auto-ingest-ez4ielts
-  $ ralph watch --auto-ingest-ez4ielts --repo ~/Project/ez4ielts --ez4ielts-dir ${DEFAULT_EZ4IELTS_WATCH_DIR}
+  $ ralph watch --auto-ingest-ez4ielts --repo ~/Project/ez4ielts --ez4ielts-dir ~/Project/ez4ielts/docs
+  $ ralph watch --auto-ingest-ez4ielts --backend sdk-runner
   
 Description:
   Starts a background watcher that reconciles the pending queue.
@@ -168,9 +173,10 @@ Description:
   
   Press Ctrl+C to stop the watcher.`)
   .action((options) => watch({
-    interval: parseInt(options.interval, 10),
+    interval: options.interval ? parseInt(options.interval, 10) : undefined,
     repo: options.repo,
     agent: options.agent,
+    backend: options.backend,
     autoIngestEz4ielts: options.autoIngestEz4ielts,
     ez4ieltsDir: options.ez4ieltsDir,
   }));

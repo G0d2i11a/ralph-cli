@@ -1,18 +1,21 @@
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
-import { resolveAgentType } from './agent';
+import { ConfigManager } from '../config/manager';
+import { resolveAgentBackend, resolveAgentType, resolveConfiguredBackend } from './agent';
 import { TaskScheduler, PendingTaskState } from './scheduler';
 import { StateManager } from './state';
-import { generateTaskId, parsePRD } from '../utils/helpers';
+import { generateTaskId, parsePRD, saveTaskPRD } from '../utils/helpers';
 import { Task } from '../types/task';
 
 export interface EnqueueTaskOptions {
   repoPath?: string;
   agent?: string;
+  backend?: string;
   dedupeByPrdPath?: boolean;
   stateManager?: StateManager;
   scheduler?: TaskScheduler;
+  configManager?: Pick<ConfigManager, 'get'> & Partial<Pick<ConfigManager, 'has'>>;
   now?: () => number;
 }
 
@@ -30,11 +33,15 @@ export async function enqueueTaskFromPrd(
   const resolvedPrdPath = path.resolve(prdPath);
   const repoPath = path.resolve(options.repoPath || process.cwd());
   const agent = resolveAgentType(options.agent);
+  const configManager = options.configManager ?? new ConfigManager();
+  const backend = options.backend
+    ? resolveAgentBackend(options.backend)
+    : resolveConfiguredBackend(configManager);
   const stateManager = options.stateManager ?? new StateManager();
   const scheduler = options.scheduler ?? new TaskScheduler({ stateManager });
   const now = options.now ?? (() => Date.now());
 
-  parsePRD(resolvedPrdPath);
+  const prd = parsePRD(resolvedPrdPath);
 
   if (options.dedupeByPrdPath) {
     const existingTask = await stateManager.getTaskByPrdPath(resolvedPrdPath);
@@ -68,6 +75,7 @@ export async function enqueueTaskFromPrd(
     worktree: '',
     logPath,
     agent,
+    backend,
     repoPath,
     loopCount: 0,
     consecutiveNoProgress: 0,
@@ -76,6 +84,7 @@ export async function enqueueTaskFromPrd(
     lastFilesChanged: 0,
   };
 
+  saveTaskPRD(task, prd);
   await stateManager.saveTask(task);
   await scheduler.schedulePendingTasks();
 

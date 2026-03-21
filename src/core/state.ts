@@ -2,6 +2,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
 import { Task, TaskStatus } from '../types/task';
+import { parsePRD } from '../utils/helpers';
 
 export class StateManager {
   private baseDir: string;
@@ -33,8 +34,7 @@ export class StateManager {
 
     const statePath = this.getStatePath(task.id);
     const tempPath = `${statePath}.tmp`;
-    
-    // Atomic write
+
     fs.writeFileSync(tempPath, JSON.stringify(task, null, 2));
     fs.renameSync(tempPath, statePath);
   }
@@ -93,10 +93,10 @@ export class StateManager {
 
   async getTaskByPrdId(prdId: string): Promise<Task | null> {
     const tasks = await this.listTasks();
-    return tasks.find(t => {
+
+    return tasks.find((task) => {
       try {
-        const prd = require(t.prdPath);
-        return prd.id === prdId;
+        return parsePRD(task.prdPath).id === prdId;
       } catch {
         return false;
       }
