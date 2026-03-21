@@ -11,8 +11,9 @@ export type AcceptedAgentBackend = AgentBackend | 'sdk-runner';
 
 export const DEFAULT_AGENT: AgentType = 'codex';
 export const DEFAULT_BACKEND: AgentBackend = 'cli';
-const DEFAULT_AGENT_RUNNERS_CLI = '~/Workspace/openclaw/agent-runners/dist/cli.js';
-const LEGACY_SDK_RUNNERS_CLI = '~/Workspace/openclaw/sdk-runners/dist/cli.js';
+const OPENCLAW_ROOT = '~/Workspace/openclaw';
+const DEFAULT_AGENT_RUNNERS_CLI = path.join(OPENCLAW_ROOT, 'agent-runners', 'dist', 'cli.js');
+const LEGACY_SDK_RUNNERS_CLI = path.join(OPENCLAW_ROOT, 'sdk-runners', 'dist', 'cli.js');
 const AGENT_RUNNERS_ENV = 'RALPH_AGENT_RUNNERS_CLI';
 const LEGACY_SDK_RUNNER_ENV = 'RALPH_SDK_RUNNER_CLI';
 const FORCE_KILL_GRACE_MS = 5000;
