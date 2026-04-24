@@ -3,6 +3,13 @@ import { finalizeTaskOutput } from '../core/finalizer';
 import { appendTaskEvent } from '../core/events';
 import { withTaskFinalizeLock } from '../core/locks';
 import { mergeBranch, MergeStrategy } from '../core/merge';
+import {
+  buildMergeFailureUpdates,
+  createMergeFailureError,
+  formatDestructiveAutoResolveError,
+  getTaskUpdatesFromError,
+  isDestructiveMergeStrategy,
+} from '../core/merge-policy';
 import { StateManager } from '../core/state';
 import { TaskScheduler } from '../core/scheduler';
 
@@ -83,6 +90,13 @@ export async function finalizeCommand(taskId: string): Promise<void> {
       if (Boolean(configManager.get('autoMerge'))) {
         const targetBranch = resolveMergeTargetBranch(configManager.get('merge.targetBranch'));
         const strategy = resolveMergeStrategy(configManager.get('merge.strategy'));
+        if (
+          isDestructiveMergeStrategy(strategy)
+          && !Boolean(configManager.get('merge.allowDestructiveAutoResolve'))
+        ) {
+          throw new Error(formatDestructiveAutoResolveError(strategy));
+        }
+
         const pullLatest = configManager.get('merge.pullLatest') !== false;
         const configuredIntegrationDir = configManager.get('merge.integrationWorktreeDir');
         const mergeResult = await mergeBranch(latestTask, targetBranch, strategy, {
@@ -95,7 +109,10 @@ export async function finalizeCommand(taskId: string): Promise<void> {
         });
 
         if (!mergeResult.success) {
-          throw new Error(mergeResult.message);
+          throw createMergeFailureError(
+            mergeResult,
+            buildMergeFailureUpdates(mergeResult, targetBranch, strategy)
+          );
         }
 
         mergeUpdates = {
@@ -109,6 +126,8 @@ export async function finalizeCommand(taskId: string): Promise<void> {
           mergeStrategy: strategy,
           mergeMessage: mergeResult.message,
           mergeError: undefined,
+          mergeConflictFiles: undefined,
+          mergeConflictAt: undefined,
           targetSyncedAt: mergeResult.targetSynced ? Date.now() : undefined,
           targetSyncDeferredReason: mergeResult.targetSynced === false ? mergeResult.targetSyncMessage : undefined,
         };
@@ -152,6 +171,7 @@ export async function finalizeCommand(taskId: string): Promise<void> {
   } catch (error) {
     const latestTask = await stateManager.loadTask(taskId).catch(() => null);
     const finalizerAttempts = (latestTask?.finalizerAttempts ?? 0) + 1;
+    const failureUpdates = getTaskUpdatesFromError(error);
     await stateManager.updateTask(taskId, {
       status: 'failed_finalize',
       endTime: Date.now(),
@@ -163,13 +183,17 @@ export async function finalizeCommand(taskId: string): Promise<void> {
       leaseOwner: undefined,
       leaseHeartbeatAt: undefined,
       leaseExpiresAt: undefined,
+      ...failureUpdates,
     }).catch(() => undefined);
     if (latestTask) {
       appendTaskEvent(latestTask, {
         type: 'finalizer_failed',
         status: 'failed_finalize',
         message: error instanceof Error ? error.message : String(error),
-        data: { finalizerAttempts },
+        data: {
+          finalizerAttempts,
+          conflictFiles: failureUpdates.mergeConflictFiles,
+        },
       });
     }
 

@@ -37,6 +37,7 @@ export interface RalphConfig {
     useIntegrationWorktree: boolean;
     integrationWorktreeDir: string;
     syncTargetBranch: boolean;
+    allowDestructiveAutoResolve: boolean;
   };
   finalizer: {
     qualityGateTimeout: number;
@@ -79,6 +80,7 @@ const DEFAULT_CONFIG: RalphConfig = {
     useIntegrationWorktree: true,
     integrationWorktreeDir: '.ralph-integration',
     syncTargetBranch: true,
+    allowDestructiveAutoResolve: false,
   },
   finalizer: {
     qualityGateTimeout: 600,

@@ -16,6 +16,10 @@ export interface MergeResult {
   integrationWorktree?: string;
   targetSynced?: boolean;
   targetSyncMessage?: string;
+  conflictFiles?: string[];
+  sourceBranch?: string;
+  targetBranch?: string;
+  baseCommitSha?: string;
 }
 
 export interface MergeOptions {
@@ -246,12 +250,15 @@ function syncTargetBranchIfSafe(
 function mergeConflictResult(
   repoPath: string,
   conflicts: string[],
+  details: Partial<Pick<MergeResult, 'sourceBranch' | 'targetBranch' | 'baseCommitSha'>> = {},
 ): MergeResult {
   tryAbortMerge(repoPath);
   return {
     success: false,
     hasConflicts: true,
     message: `Merge conflicts detected: ${conflicts.join(', ')}`,
+    conflictFiles: conflicts,
+    ...details,
   };
 }
 
@@ -323,7 +330,11 @@ async function mergeBranchInLiveCheckout(
 
       if (strategy === 'manual') {
         mergeInProgress = false;
-        return mergeConflictResult(repoPath, conflicts);
+        return mergeConflictResult(repoPath, conflicts, {
+          sourceBranch: branchName,
+          targetBranch,
+          baseCommitSha: task.baseCommitSha,
+        });
       }
 
       if (strategy === 'ours') {
@@ -395,7 +406,11 @@ async function mergeBranchInIntegrationWorktree(
       const conflicts = detectConflicts(integration.integrationWorktree);
       if (conflicts.length > 0) {
         return {
-          ...mergeConflictResult(integration.integrationWorktree, conflicts),
+          ...mergeConflictResult(integration.integrationWorktree, conflicts, {
+            sourceBranch: normalizedTarget,
+            targetBranch: integration.integrationBranch,
+            baseCommitSha: task.baseCommitSha,
+          }),
           integrationBranch: integration.integrationBranch,
           integrationWorktree: integration.integrationWorktree,
         };
@@ -452,7 +467,11 @@ async function mergeBranchInIntegrationWorktree(
       if (strategy === 'manual') {
         mergeInProgress = false;
         return {
-          ...mergeConflictResult(integration.integrationWorktree, conflicts),
+          ...mergeConflictResult(integration.integrationWorktree, conflicts, {
+            sourceBranch: branchName,
+            targetBranch: integration.integrationBranch,
+            baseCommitSha: task.baseCommitSha,
+          }),
           integrationBranch: integration.integrationBranch,
           integrationWorktree: integration.integrationWorktree,
         };

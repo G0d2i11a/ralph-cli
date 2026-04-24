@@ -34,6 +34,14 @@ function summarizeTask(task: Task, pendingState?: PendingSummary) {
           expiresAt: task.leaseExpiresAt ? new Date(task.leaseExpiresAt).toISOString() : undefined,
         }
       : undefined,
+    mergeConflict: task.mergeConflictFiles?.length
+      ? {
+          files: task.mergeConflictFiles,
+          at: task.mergeConflictAt ? new Date(task.mergeConflictAt).toISOString() : undefined,
+          repairAttempts: task.mergeRepairAttempts ?? 0,
+          error: task.mergeError,
+        }
+      : undefined,
     nextAction: resolveNextAction(task, pendingState),
   };
 }
@@ -49,6 +57,10 @@ function resolveNextAction(task: Task, pendingState?: PendingSummary): string {
 
   if (task.status === 'running') {
     return 'wait for worker completion or stale lease recovery';
+  }
+
+  if (task.status === 'failed_finalize' && task.mergeConflictFiles?.length) {
+    return 'merge conflict repair should run before retrying finalizer';
   }
 
   if (task.status === 'ready_to_finalize' || task.status === 'failed_finalize') {

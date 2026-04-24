@@ -71,4 +71,9 @@ export interface Task {
   mergeStrategy?: TaskMergeStrategy;
   mergeMessage?: string;
   mergeError?: string;
+  mergeConflictFiles?: string[];
+  mergeConflictAt?: number;
+  mergeRepairAttempts?: number;
+  mergeRepairBranch?: string;
+  mergeRepairWorktree?: string;
 }

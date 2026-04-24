@@ -48,6 +48,7 @@ ralph finalize <task-id>
 - 启用 auto-ingest 时，需要显式提供 `--ez4ielts-dir`、`RALPH_EZ4IELTS_WATCH_DIR` 或 `ingestion.ez4ielts.watchDir`
 - `runner.pollInterval` 在配置文件里按秒读取；CLI 的 `--interval` 仍然使用毫秒
 - `runner.stagnationTimeout` 现在按秒生效，用于把长时间没有进展的 worker 标记为 stagnant
+- unattended auto-merge 默认使用 `merge.strategy=manual`；遇到 Git 冲突时，Ralph 会记录 `mergeConflictFiles`、integration worktree 和 repair attempt，并把任务带着专门的 merge repair context 送回修复，而不是静默使用 `ours/theirs` 覆盖其中一边。`ours/theirs` 只适合显式人工 merge，除非你主动设置 `merge.allowDestructiveAutoResolve=true`
 - 当前还没有内建通知发送能力，因此生成的配置里不会包含 `notification` 配置块
 - Ralph MCP 也支持 Codex/Claude provider 和 PRD watch；两边机制独立，建议按入口选择一个控制面管理同一批任务
 

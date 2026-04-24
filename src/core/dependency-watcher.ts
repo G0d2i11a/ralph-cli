@@ -5,6 +5,13 @@ import { appendTaskEvent } from './events';
 import { FinalizeResult, finalizeTaskOutput } from './finalizer';
 import { withTaskFinalizeLock } from './locks';
 import { mergeBranch, MergeStrategy } from './merge';
+import {
+  buildMergeFailureUpdates,
+  createMergeFailureError,
+  formatDestructiveAutoResolveError,
+  getTaskUpdatesFromError,
+  isDestructiveMergeStrategy,
+} from './merge-policy';
 import { evaluateFailedTaskForFinalizeRecovery } from './soft-success';
 import { DEFAULT_AGENT, resolveAgentBackend, resolveAgentType, resolveConfiguredBackend } from './agent';
 import {
@@ -87,6 +94,54 @@ function resolveMergeTargetBranch(value: unknown): string {
 
   const trimmed = value.trim();
   return trimmed || 'main';
+}
+
+function hasMergeConflict(task: Task): boolean {
+  if (task.mergeConflictFiles && task.mergeConflictFiles.length > 0) {
+    return true;
+  }
+
+  const message = task.mergeError || task.lastError || '';
+  return /Merge conflicts detected/i.test(message);
+}
+
+function buildMergeRepairContext(task: Task): string {
+  const conflictFiles = task.mergeConflictFiles?.length
+    ? task.mergeConflictFiles.join(', ')
+    : 'unknown conflict files';
+  const integrationTarget = task.integrationBranch || task.mergeTargetBranch || task.intendedMergeTarget || 'main';
+  const repairIntro = [
+    'Merge repair required by Ralph.',
+    `Conflict files: ${conflictFiles}.`,
+    `Integration target: ${integrationTarget}.`,
+    'Resolve the semantic conflict by preserving the already-integrated target behavior and this task\'s intended behavior.',
+    'Do not choose ours/theirs wholesale unless one side is provably obsolete.',
+    'Update the task branch so it can merge cleanly, and run the relevant tests before finishing.',
+  ];
+
+  if (task.mergeError || task.lastError) {
+    repairIntro.push(`Original merge error: ${task.mergeError || task.lastError}`);
+  }
+
+  return repairIntro.join(' ');
+}
+
+function selectFinalizeRepairStoryId(task: Task, mergeConflict: boolean): string | undefined {
+  if (mergeConflict) {
+    const needsRepairStory = (task.storyProgress || [])
+      .slice()
+      .reverse()
+      .find((story) => story.status === 'needs_repair');
+    if (needsRepairStory) {
+      return needsRepairStory.id;
+    }
+
+    return task.storyProgress?.[task.storyProgress.length - 1]?.id
+      || task.completedUS[task.completedUS.length - 1];
+  }
+
+  return task.completedUS[task.completedUS.length - 1]
+    || task.storyProgress?.[task.storyProgress.length - 1]?.id;
 }
 
 export class DependencyWatcher {
@@ -274,30 +329,40 @@ export class DependencyWatcher {
       .sort((a: Task, b: Task) => a.startTime - b.startTime);
 
     for (const task of failedFinalizeTasks) {
-      const attempts = task.finalizerAttempts ?? 0;
-      if (attempts > repairLimit) {
-        continue;
-      }
-
-      const repairStoryId = task.completedUS[task.completedUS.length - 1]
-        || task.storyProgress?.[task.storyProgress.length - 1]?.id;
+      const mergeConflict = hasMergeConflict(task);
+      const attempts = mergeConflict ? (task.mergeRepairAttempts ?? 0) : (task.finalizerAttempts ?? 0);
+      const repairStoryId = selectFinalizeRepairStoryId(task, mergeConflict);
       if (!repairStoryId) {
         continue;
       }
 
+      const repairStory = task.storyProgress?.find((story) => story.id === repairStoryId);
+      const hasUnrunMergeRepair = Boolean(
+        mergeConflict
+        && repairStory?.status === 'needs_repair'
+        && !task.completedUS.includes(repairStoryId)
+      );
+      if ((mergeConflict ? attempts >= repairLimit : attempts > repairLimit) && !hasUnrunMergeRepair) {
+        continue;
+      }
+
+      const repairMessage = mergeConflict
+        ? buildMergeRepairContext(task)
+        : task.lastError || task.mergeError || 'Finalizer failed; repair required';
       const completedUS = task.completedUS.filter((storyId) => storyId !== repairStoryId);
       const storyProgress = (task.storyProgress || []).map((story) => story.id === repairStoryId
         ? {
             ...story,
             status: 'needs_repair' as const,
-            lastError: task.lastError || task.mergeError || 'Finalizer failed; repair required',
+            attempts: mergeConflict ? 0 : story.attempts,
+            lastError: repairMessage,
             updatedAt: Date.now(),
             history: [
               ...(story.history || []),
               {
                 attempt: story.attempts,
                 status: 'needs_repair' as const,
-                message: task.lastError || task.mergeError || 'Finalizer failed; repair required',
+                message: repairMessage,
                 updatedAt: Date.now(),
               },
             ],
@@ -314,15 +379,27 @@ export class DependencyWatcher {
         leaseOwner: undefined,
         leaseHeartbeatAt: undefined,
         leaseExpiresAt: undefined,
+        ...(mergeConflict ? { mergeRepairAttempts: hasUnrunMergeRepair ? attempts : attempts + 1 } : {}),
       });
       appendTaskEvent(task, {
-        type: 'task_recovered_failed_finalize',
+        type: mergeConflict ? 'merge_repair_started' : 'task_recovered_failed_finalize',
         status: 'pending',
         storyId: repairStoryId,
-        message: `Returned ${repairStoryId} to repair after failed finalizer attempt`,
-        data: { finalizerAttempts: attempts, repairLimit },
+        message: mergeConflict && hasUnrunMergeRepair
+          ? `Requeued unrun merge repair for ${repairStoryId}`
+          : mergeConflict
+          ? `Returned ${repairStoryId} to merge repair after conflict`
+          : `Returned ${repairStoryId} to repair after failed finalizer attempt`,
+        data: {
+          finalizerAttempts: task.finalizerAttempts,
+          mergeRepairAttempts: mergeConflict ? (hasUnrunMergeRepair ? attempts : attempts + 1) : undefined,
+          repairLimit,
+          conflictFiles: task.mergeConflictFiles,
+        },
       });
-      this.logger.log(`Task ${task.id} returned to pending repair for ${repairStoryId}`);
+      this.logger.log(mergeConflict
+        ? `Task ${task.id} returned to pending merge repair for ${repairStoryId}`
+        : `Task ${task.id} returned to pending repair for ${repairStoryId}`);
     }
   }
 
@@ -331,14 +408,21 @@ export class DependencyWatcher {
       return {};
     }
 
+    const targetBranch = resolveMergeTargetBranch(this.configManager.get('merge.targetBranch'));
+    const strategy = resolveMergeStrategy(this.configManager.get('merge.strategy'));
+    if (
+      isDestructiveMergeStrategy(strategy)
+      && !Boolean(this.configManager.get('merge.allowDestructiveAutoResolve'))
+    ) {
+      throw new Error(formatDestructiveAutoResolveError(strategy));
+    }
+
     const delayMs = resolveAutoMergeDelayMs(this.configManager.get('autoMergeDelay'));
     if (delayMs > 0) {
       this.logger.log(`Task ${task.id} waiting ${delayMs}ms before auto-merge`);
       await this.sleep(delayMs);
     }
 
-    const targetBranch = resolveMergeTargetBranch(this.configManager.get('merge.targetBranch'));
-    const strategy = resolveMergeStrategy(this.configManager.get('merge.strategy'));
     const pullLatest = this.configManager.get('merge.pullLatest') !== false;
     const useIntegrationWorktree = this.configManager.get('merge.useIntegrationWorktree') !== false;
     const configuredIntegrationDir = this.configManager.get('merge.integrationWorktreeDir');
@@ -361,12 +445,18 @@ export class DependencyWatcher {
     });
 
     if (!result.success) {
+      const failureUpdates = buildMergeFailureUpdates(result, targetBranch, strategy);
       appendTaskEvent(task, {
         type: 'merge_failed',
         message: result.message,
-        data: { targetBranch, strategy, hasConflicts: result.hasConflicts },
+        data: {
+          targetBranch,
+          strategy,
+          hasConflicts: result.hasConflicts,
+          conflictFiles: result.conflictFiles,
+        },
       });
-      throw new Error(result.message);
+      throw createMergeFailureError(result, failureUpdates);
     }
 
     appendTaskEvent(task, {
@@ -386,6 +476,8 @@ export class DependencyWatcher {
       mergeStrategy: strategy,
       mergeMessage: result.message,
       mergeError: undefined,
+      mergeConflictFiles: undefined,
+      mergeConflictAt: undefined,
       targetSyncedAt: result.targetSynced ? Date.now() : undefined,
       targetSyncDeferredReason: result.targetSynced === false ? result.targetSyncMessage : undefined,
     };
@@ -464,6 +556,7 @@ export class DependencyWatcher {
         } catch (error) {
           const latestTask = await this.stateManager.loadTask(task.id);
           const finalizerAttempts = (latestTask?.finalizerAttempts ?? task.finalizerAttempts ?? 0) + 1;
+          const failureUpdates = getTaskUpdatesFromError(error);
           await this.stateManager.updateTask(task.id, {
             status: 'failed_finalize',
             endTime: Date.now(),
@@ -477,12 +570,16 @@ export class DependencyWatcher {
             leaseOwner: undefined,
             leaseHeartbeatAt: undefined,
             leaseExpiresAt: undefined,
+            ...failureUpdates,
           });
           appendTaskEvent(task, {
             type: 'finalizer_failed',
             status: 'failed_finalize',
             message: error instanceof Error ? error.message : String(error),
-            data: { finalizerAttempts },
+            data: {
+              finalizerAttempts,
+              conflictFiles: failureUpdates.mergeConflictFiles,
+            },
           });
           this.logger.error(`Failed to finalize task ${task.id}:`, error);
         }

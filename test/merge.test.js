@@ -129,3 +129,54 @@ test('mergeBranch can still refuse dirty live checkout when integration worktree
     fs.rmSync(repoDir, { recursive: true, force: true });
   }
 });
+
+test('mergeBranch reports structured conflicts without updating main', async () => {
+  const repoDir = createRepo();
+
+  try {
+    const worktreePath = path.join(repoDir, '.ralph-worktrees', 'task-conflict');
+    fs.mkdirSync(path.dirname(worktreePath), { recursive: true });
+    git(['worktree', 'add', '-b', 'ralph/task-conflict', worktreePath, 'main'], repoDir);
+    fs.writeFileSync(path.join(worktreePath, 'feature.txt'), 'task side\n');
+    git(['add', 'feature.txt'], worktreePath);
+    git(['commit', '-m', 'feat: task side'], worktreePath);
+
+    fs.writeFileSync(path.join(repoDir, 'feature.txt'), 'main side\n');
+    git(['add', 'feature.txt'], repoDir);
+    git(['commit', '-m', 'feat: main side'], repoDir);
+    const mainBeforeMerge = git(['rev-parse', 'main'], repoDir);
+
+    const task = {
+      id: 'task-conflict',
+      prdPath: path.join(repoDir, 'prd.json'),
+      status: 'completed',
+      startTime: Date.now(),
+      completedUS: [],
+      worktree: worktreePath,
+      logPath: path.join(repoDir, '.ralph', 'tasks', 'task-conflict', 'agent.log'),
+      agent: 'codex',
+      repoPath: repoDir,
+      baseCommitSha: git(['rev-parse', 'main~1'], repoDir),
+      loopCount: 0,
+      consecutiveNoProgress: 0,
+      consecutiveErrors: 0,
+      lastProgressTime: Date.now(),
+      lastFilesChanged: 1,
+    };
+
+    const result = await mergeBranch(task, 'main', 'manual', { pullLatest: false });
+
+    assert.equal(result.success, false);
+    assert.equal(result.hasConflicts, true);
+    assert.deepEqual(result.conflictFiles, ['feature.txt']);
+    assert.equal(result.integrationBranch, 'ralph/integration/main');
+    assert.equal(result.sourceBranch, 'ralph/task-conflict');
+    assert.equal(result.targetBranch, 'ralph/integration/main');
+    assert.equal(git(['rev-parse', 'main'], repoDir), mainBeforeMerge);
+    assert.equal(fs.readFileSync(path.join(repoDir, 'feature.txt'), 'utf-8'), 'main side\n');
+    const integrationStatus = git(['status', '--porcelain'], result.integrationWorktree);
+    assert.equal(integrationStatus, '');
+  } finally {
+    fs.rmSync(repoDir, { recursive: true, force: true });
+  }
+});

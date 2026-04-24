@@ -239,6 +239,8 @@ ralph merge <task-id>
 
 Merge runs in a dedicated `.ralph-integration/<target>` worktree by default. Completed task branches are merged into `ralph/integration/<target>` first, so dirty user checkouts do not block autonomous integration. If the target branch checkout is clean, Ralph fast-forwards it; if the target checkout has uncommitted user changes, Ralph defers target sync and records the integration branch/worktree in task state.
 
+Conflict handling is deliberately conservative. Unattended auto-merge defaults to `merge.strategy=manual`; when Git reports conflicts, Ralph records structured conflict metadata (`mergeConflictFiles`, integration branch/worktree, and repair attempts) and routes the task through merge-repair context instead of silently choosing `ours` or `theirs`. The destructive `ours`/`theirs` strategies are only intended for explicit manual merge commands, or for installations that deliberately set `merge.allowDestructiveAutoResolve=true`.
+
 ### Reset stagnation detection
 
 ```bash

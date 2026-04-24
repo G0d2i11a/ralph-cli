@@ -83,6 +83,9 @@ export async function retryCommand(taskId: string) {
       lastError: undefined,
       finalizerAttempts: previousStatus === 'failed_finalize' ? 0 : task.finalizerAttempts,
       mergeError: previousStatus === 'failed_finalize' ? undefined : task.mergeError,
+      mergeConflictFiles: previousStatus === 'failed_finalize' ? undefined : task.mergeConflictFiles,
+      mergeConflictAt: previousStatus === 'failed_finalize' ? undefined : task.mergeConflictAt,
+      mergeRepairAttempts: previousStatus === 'failed_finalize' ? 0 : task.mergeRepairAttempts,
     });
     await scheduler.schedulePendingTasks();
 

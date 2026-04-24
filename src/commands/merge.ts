@@ -36,7 +36,12 @@ export async function mergeCommand(
 
     console.log(JSON.stringify({
       message: `Merging task ${taskId} into ${targetBranch}...`,
-      strategy
+      strategy,
+      ...(options.auto && strategy !== 'manual'
+        ? {
+            warning: `${strategy} resolves every conflicted path by choosing one side; use only when that data loss risk is acceptable.`,
+          }
+        : {}),
     }));
     appendTaskEvent(task, {
       type: 'merge_started',
@@ -59,6 +64,8 @@ export async function mergeCommand(
         mergeStrategy: strategy,
         mergeMessage: result.message,
         mergeError: undefined,
+        mergeConflictFiles: undefined,
+        mergeConflictAt: undefined,
         targetSyncedAt: result.targetSynced ? Date.now() : undefined,
         targetSyncDeferredReason: result.targetSynced === false ? result.targetSyncMessage : undefined,
       });
@@ -77,15 +84,25 @@ export async function mergeCommand(
         mergeTargetBranch: targetBranch,
         mergeStrategy: strategy,
         mergeError: result.message,
+        integrationBranch: result.integrationBranch,
+        integrationWorktree: result.integrationWorktree,
+        mergeConflictFiles: result.conflictFiles,
+        mergeConflictAt: result.hasConflicts ? Date.now() : undefined,
       });
       appendTaskEvent(task, {
         type: 'merge_failed',
         message: result.message,
-        data: { targetBranch, strategy, hasConflicts: result.hasConflicts },
+        data: {
+          targetBranch,
+          strategy,
+          hasConflicts: result.hasConflicts,
+          conflictFiles: result.conflictFiles,
+        },
       });
       console.error(JSON.stringify({
         success: false,
         hasConflicts: result.hasConflicts,
+        conflictFiles: result.conflictFiles,
         message: result.message
       }));
       process.exit(1);
