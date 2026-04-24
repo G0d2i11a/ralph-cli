@@ -1,12 +1,13 @@
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
-import { ChildProcess, fork, ForkOptions } from 'child_process';
+import { ChildProcess, execFileSync, fork, ForkOptions } from 'child_process';
 import { ConfigManager } from '../config/manager';
 import { PRD } from '../types/prd';
 import { Task, TaskStatus } from '../types/task';
-import { checkDependencies, parsePRD } from '../utils/helpers';
+import { checkDependencies, isProcessRunning, parsePRD } from '../utils/helpers';
 import { bootstrapWorktreeDeps } from './bootstrap';
+import { appendTaskEvent } from './events';
 import { StateManager } from './state';
 import { WorktreeManager } from './worktree';
 
@@ -14,14 +15,18 @@ const DEFAULT_MAX_CONCURRENT = 3;
 const LOCK_RETRY_MS = 50;
 const LOCK_TIMEOUT_MS = 30000;
 const LOCK_STALE_MS = 300000;
+const DEFAULT_RUNNING_LEASE_TIMEOUT_MS = 5 * 60 * 1000;
+const DEFAULT_FINALIZING_LEASE_TIMEOUT_MS = 30 * 60 * 1000;
 
 export type TerminalTaskStatus = Exclude<TaskStatus, 'pending' | 'running' | 'ready_to_finalize' | 'finalizing'>;
 
 type DependencyResult = { satisfied: boolean; pending: string[] };
 type DependencyChecker = (
   prd: PRD,
-  stateManager: StateManager
+  stateManager: StateManager,
+  options?: { repoPath?: string; task?: Task }
 ) => Promise<DependencyResult>;
+type ProcessChecker = (pid: number) => boolean;
 
 export interface SchedulerDeps {
   stateManager?: StateManager;
@@ -35,6 +40,7 @@ export interface SchedulerDeps {
     args?: ReadonlyArray<string>,
     options?: ForkOptions
   ) => ChildProcess;
+  isProcessRunning?: ProcessChecker;
   lockDir?: string;
   now?: () => number;
   sleep?: (ms: number) => Promise<void>;
@@ -61,6 +67,28 @@ function resolveConcurrencyLimit(
   return Math.floor(rawValue);
 }
 
+function resolveHeadCommit(worktreePath: string): string | undefined {
+  try {
+    return execFileSync('git', ['rev-parse', 'HEAD'], {
+      cwd: worktreePath,
+      encoding: 'utf-8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+    }).trim();
+  } catch {
+    return undefined;
+  }
+}
+
+function toTimeoutMs(value: unknown, fallbackMs: number): number {
+  const numericValue = Number(value);
+
+  if (!Number.isFinite(numericValue) || numericValue <= 0) {
+    return fallbackMs;
+  }
+
+  return numericValue * 1000;
+}
+
 export class TaskScheduler {
   private readonly stateManager: StateManager;
   private readonly worktreeManager: Pick<WorktreeManager, 'createWorktree'>;
@@ -73,6 +101,7 @@ export class TaskScheduler {
     args?: ReadonlyArray<string>,
     options?: ForkOptions
   ) => ChildProcess;
+  private readonly isProcessRunningFn: ProcessChecker;
   private readonly now: () => number;
   private readonly sleep: (ms: number) => Promise<void>;
   private readonly lockDir: string;
@@ -86,6 +115,7 @@ export class TaskScheduler {
     this.parsePRDFn = deps.parsePRD ?? parsePRD;
     this.checkDependenciesFn = deps.checkDependencies ?? checkDependencies;
     this.forkProcessFn = deps.forkProcess ?? fork;
+    this.isProcessRunningFn = deps.isProcessRunning ?? isProcessRunning;
     this.now = deps.now ?? (() => Date.now());
     this.sleep = deps.sleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
     this.lockDir = deps.lockDir ?? path.join(os.homedir(), '.ralph', 'scheduler.lock');
@@ -97,15 +127,162 @@ export class TaskScheduler {
   }
 
   async countRunningTasks(): Promise<number> {
-    const runningTasks = await this.stateManager.listTasks('running');
+    const runningTasks = await this.reconcileRunningTasks();
     return runningTasks.length;
+  }
+
+  async recoverStaleTasks(): Promise<void> {
+    await this.reconcileRunningTasks();
+    await this.reconcileFinalizingTasks();
+  }
+
+  private getRunningLeaseTimeoutMs(): number {
+    return toTimeoutMs(this.configManager.get('runner.leaseTimeout'), DEFAULT_RUNNING_LEASE_TIMEOUT_MS);
+  }
+
+  private getFinalizingLeaseTimeoutMs(): number {
+    return toTimeoutMs(
+      this.configManager.get('finalizer.leaseTimeout') ?? this.configManager.get('finalizer.qualityGateTimeout'),
+      DEFAULT_FINALIZING_LEASE_TIMEOUT_MS
+    );
+  }
+
+  private isLeaseFresh(task: Task, timeoutMs: number): boolean {
+    if (typeof task.leaseExpiresAt === 'number') {
+      return task.leaseExpiresAt > this.now();
+    }
+
+    if (typeof task.leaseHeartbeatAt === 'number') {
+      return this.now() - task.leaseHeartbeatAt < timeoutMs;
+    }
+
+    return false;
+  }
+
+  private async reconcileRunningTasks(): Promise<Task[]> {
+    const runningTasks = await this.stateManager.listTasks('running');
+    const activeTasks: Task[] = [];
+    const leaseTimeoutMs = this.getRunningLeaseTimeoutMs();
+
+    for (const task of runningTasks) {
+      const latestTask = await this.stateManager.loadTask(task.id);
+
+      if (!latestTask || latestTask.status !== 'running') {
+        continue;
+      }
+
+      if (typeof latestTask.pid !== 'number') {
+        if (this.isLeaseFresh(latestTask, leaseTimeoutMs)) {
+          activeTasks.push(latestTask);
+          continue;
+        }
+
+        const lastError = 'Worker process PID is missing and the running lease is stale';
+        console.error(`Recovering stale running task ${latestTask.id}: ${lastError}`);
+        await this.stateManager.updateTask(latestTask.id, {
+          status: 'failed',
+          endTime: this.now(),
+          currentUS: undefined,
+          pid: undefined,
+          leaseOwner: undefined,
+          leaseHeartbeatAt: undefined,
+          leaseExpiresAt: undefined,
+          lastError,
+        });
+        appendTaskEvent(latestTask, {
+          type: 'task_recovered_stale_running',
+          status: 'failed',
+          message: lastError,
+        });
+        continue;
+      }
+
+      if (this.isProcessRunningFn(latestTask.pid)) {
+        activeTasks.push(latestTask);
+        continue;
+      }
+
+      const lastError = `Worker process ${latestTask.pid} is no longer running`;
+
+      console.error(`Recovering stale running task ${latestTask.id}: ${lastError}`);
+      await this.stateManager.updateTask(latestTask.id, {
+        status: 'failed',
+        endTime: this.now(),
+        currentUS: undefined,
+        pid: undefined,
+        leaseOwner: undefined,
+        leaseHeartbeatAt: undefined,
+        leaseExpiresAt: undefined,
+        lastError,
+      });
+      appendTaskEvent(latestTask, {
+        type: 'task_recovered_stale_running',
+        status: 'failed',
+        message: lastError,
+        data: { pid: latestTask.pid },
+      });
+    }
+
+    return activeTasks;
+  }
+
+  private async reconcileFinalizingTasks(): Promise<void> {
+    const finalizingTasks = await this.stateManager.listTasks('finalizing');
+    const leaseTimeoutMs = this.getFinalizingLeaseTimeoutMs();
+
+    for (const task of finalizingTasks) {
+      const latestTask = await this.stateManager.loadTask(task.id);
+
+      if (!latestTask || latestTask.status !== 'finalizing') {
+        continue;
+      }
+
+      if (this.isLeaseFresh(latestTask, leaseTimeoutMs)) {
+        continue;
+      }
+
+      const lastError = 'Finalizer lease is stale; task was returned to ready_to_finalize for retry';
+      console.error(`Recovering stale finalizing task ${latestTask.id}: ${lastError}`);
+      await this.stateManager.updateTask(latestTask.id, {
+        status: 'ready_to_finalize',
+        endTime: undefined,
+        pid: undefined,
+        currentUS: undefined,
+        leaseOwner: undefined,
+        leaseHeartbeatAt: undefined,
+        leaseExpiresAt: undefined,
+        lastError,
+      });
+      appendTaskEvent(latestTask, {
+        type: 'task_recovered_stale_finalizing',
+        status: 'ready_to_finalize',
+        message: lastError,
+      });
+    }
+  }
+
+  private getDependencyPRD(task: Task): PRD {
+    if (task.prdId && Array.isArray(task.prdDependencies)) {
+      return {
+        id: task.prdId,
+        title: task.prdTitle || task.prdId,
+        description: '',
+        userStories: [],
+        dependencies: task.prdDependencies || [],
+      };
+    }
+
+    return this.parsePRDFn(task.prdPath);
   }
 
   async describePendingTask(task: Task): Promise<PendingTaskState> {
     const maxConcurrent = this.getConcurrencyLimit();
     const running = await this.countRunningTasks();
-    const prd = this.parsePRDFn(task.prdPath);
-    const dependencyState = await this.checkDependenciesFn(prd, this.stateManager);
+    const prd = this.getDependencyPRD(task);
+    const dependencyState = await this.checkDependenciesFn(prd, this.stateManager, {
+      repoPath: task.repoPath,
+      task,
+    });
 
     if (!dependencyState.satisfied) {
       return {
@@ -128,6 +305,7 @@ export class TaskScheduler {
     return this.withLock(async () => {
       const startedTasks: Task[] = [];
       const maxConcurrent = this.getConcurrencyLimit();
+      await this.reconcileFinalizingTasks();
       let runningCount = await this.countRunningTasks();
 
       if (runningCount >= maxConcurrent) {
@@ -144,8 +322,11 @@ export class TaskScheduler {
         }
 
         try {
-          const prd = this.parsePRDFn(task.prdPath);
-          const dependencyState = await this.checkDependenciesFn(prd, this.stateManager);
+          const prd = this.getDependencyPRD(task);
+          const dependencyState = await this.checkDependenciesFn(prd, this.stateManager, {
+            repoPath: task.repoPath,
+            task,
+          });
 
           if (!dependencyState.satisfied) {
             continue;
@@ -174,13 +355,25 @@ export class TaskScheduler {
       if (!currentTask.worktree) {
         const worktreePath = await this.worktreeManager.createWorktree(
           currentTask.repoPath,
-          currentTask.id
+          currentTask.id,
+          currentTask.baseRef || currentTask.baseCommitSha
         );
         await this.stateManager.updateTask(currentTask.id, { worktree: worktreePath });
         currentTask = {
           ...currentTask,
           worktree: worktreePath,
         };
+      }
+
+      if (!currentTask.baseCommitSha) {
+        const baseCommitSha = resolveHeadCommit(currentTask.worktree);
+        if (baseCommitSha) {
+          await this.stateManager.updateTask(currentTask.id, { baseCommitSha });
+          currentTask = {
+            ...currentTask,
+            baseCommitSha,
+          };
+        }
       }
 
       this.bootstrapWorktreeDepsFn(currentTask.worktree, {
@@ -193,6 +386,9 @@ export class TaskScheduler {
         status: 'running',
         startTime,
         endTime: undefined,
+        leaseOwner: `scheduler:${process.pid}`,
+        leaseHeartbeatAt: startTime,
+        leaseExpiresAt: startTime + this.getRunningLeaseTimeoutMs(),
       });
       currentTask = {
         ...currentTask,
@@ -215,6 +411,20 @@ export class TaskScheduler {
 
       await this.stateManager.updateTask(currentTask.id, {
         pid: child.pid,
+        leaseOwner: `worker:${child.pid}`,
+        leaseHeartbeatAt: this.now(),
+        leaseExpiresAt: this.now() + this.getRunningLeaseTimeoutMs(),
+      });
+      appendTaskEvent(currentTask, {
+        type: 'task_started',
+        status: 'running',
+        message: `Worker process started for task ${currentTask.id}`,
+        data: {
+          pid: child.pid,
+          worktree: currentTask.worktree,
+          baseRef: currentTask.baseRef,
+          baseCommitSha: currentTask.baseCommitSha,
+        },
       });
 
       return await this.stateManager.loadTask(currentTask.id);
@@ -224,6 +434,9 @@ export class TaskScheduler {
         status: 'failed',
         endTime: this.now(),
         pid: undefined,
+        leaseOwner: undefined,
+        leaseHeartbeatAt: undefined,
+        leaseExpiresAt: undefined,
         lastError: error instanceof Error ? error.message : String(error),
       });
       return null;
@@ -321,8 +534,24 @@ export async function finalizeTask(
   task.endTime = now();
   task.currentUS = undefined;
   task.pid = undefined;
+  task.leaseOwner = undefined;
+  task.leaseHeartbeatAt = undefined;
+  task.leaseExpiresAt = undefined;
 
-  await stateManager.saveTask(task);
+  await stateManager.updateTask(task.id, {
+    status: task.status,
+    endTime: task.endTime,
+    currentUS: undefined,
+    pid: undefined,
+    leaseOwner: undefined,
+    leaseHeartbeatAt: undefined,
+    leaseExpiresAt: undefined,
+  });
+  appendTaskEvent(task, {
+    type: 'task_terminal',
+    status,
+    message: `Task moved to ${status}`,
+  });
 
   const scheduler = new TaskScheduler({
     ...deps,
@@ -333,5 +562,46 @@ export async function finalizeTask(
     await scheduler.schedulePendingTasks();
   } catch (error) {
     console.error('Failed to schedule pending tasks after terminal transition:', error);
+  }
+}
+
+export async function markTaskReadyToFinalize(
+  task: Task,
+  deps: SchedulerDeps = {}
+): Promise<void> {
+  const stateManager = deps.stateManager ?? new StateManager();
+
+  task.status = 'ready_to_finalize';
+  task.endTime = undefined;
+  task.currentUS = undefined;
+  task.pid = undefined;
+  task.leaseOwner = undefined;
+  task.leaseHeartbeatAt = undefined;
+  task.leaseExpiresAt = undefined;
+
+  await stateManager.updateTask(task.id, {
+    status: task.status,
+    endTime: undefined,
+    currentUS: undefined,
+    pid: undefined,
+    leaseOwner: undefined,
+    leaseHeartbeatAt: undefined,
+    leaseExpiresAt: undefined,
+  });
+  appendTaskEvent(task, {
+    type: 'task_ready_to_finalize',
+    status: 'ready_to_finalize',
+    message: 'Task implementation completed and is ready to finalize',
+  });
+
+  const scheduler = new TaskScheduler({
+    ...deps,
+    stateManager,
+  });
+
+  try {
+    await scheduler.schedulePendingTasks();
+  } catch (error) {
+    console.error('Failed to schedule pending tasks after marking task ready to finalize:', error);
   }
 }

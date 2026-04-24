@@ -2,6 +2,30 @@ import { StateManager } from '../core/state';
 import { finalizeTask } from '../core/scheduler';
 import { isProcessRunning } from '../utils/helpers';
 
+function signalTaskProcess(pid: number, signal: NodeJS.Signals): boolean {
+  try {
+    process.kill(-pid, signal);
+    return true;
+  } catch (error) {
+    const processError = error as NodeJS.ErrnoException;
+    if (processError.code !== 'ESRCH' && processError.code !== 'EPERM' && processError.code !== 'EINVAL') {
+      throw processError;
+    }
+  }
+
+  try {
+    process.kill(pid, signal);
+    return true;
+  } catch (error) {
+    const processError = error as NodeJS.ErrnoException;
+    if (processError.code === 'ESRCH') {
+      return false;
+    }
+
+    throw processError;
+  }
+}
+
 export async function stopCommand(taskId: string): Promise<void> {
   try {
     const stateManager = new StateManager();
@@ -28,14 +52,14 @@ export async function stopCommand(taskId: string): Promise<void> {
     
     // Send SIGTERM
     try {
-      process.kill(task.pid, 'SIGTERM');
+      signalTaskProcess(task.pid, 'SIGTERM');
       
       // Wait a bit and check if it stopped
       await new Promise(resolve => setTimeout(resolve, 1000));
       
       if (isProcessRunning(task.pid)) {
         // Force kill if still running
-        process.kill(task.pid, 'SIGKILL');
+        signalTaskProcess(task.pid, 'SIGKILL');
       }
       
       await finalizeTask(task, 'failed', { stateManager });

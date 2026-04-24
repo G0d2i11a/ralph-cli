@@ -1,6 +1,7 @@
 import { execFileSync, spawnSync } from 'child_process';
 import * as fs from 'fs';
 import * as path from 'path';
+import { ConfigManager } from '../config/manager';
 import { Task } from '../types/task';
 import { detectPackageManager, findInstallRoot } from './bootstrap';
 import { parsePRD } from '../utils/helpers';
@@ -10,13 +11,16 @@ export interface FinalizeResult {
   committed: boolean;
   message: string;
   commitMessage?: string;
+  commitSha?: string;
 }
 
 interface PackageManifest {
   scripts?: Record<string, string>;
+  workspaces?: string[] | { packages?: string[] };
 }
 
-const QUALITY_GATE_SCRIPTS = ['typecheck', 'lint', 'build'] as const;
+const QUALITY_GATE_SCRIPTS = ['typecheck', 'lint', 'test', 'build'] as const;
+type QualityGateScript = typeof QUALITY_GATE_SCRIPTS[number] | string;
 
 function resolveExistingPath(targetPath: string): string {
   try {
@@ -88,6 +92,14 @@ function runGit(worktreePath: string, args: string[]): string {
   }).trim();
 }
 
+function tryRunGit(worktreePath: string, args: string[]): string | undefined {
+  try {
+    return runGit(worktreePath, args);
+  } catch {
+    return undefined;
+  }
+}
+
 function appendFinalizeLog(task: Task, message: string): void {
   const logDir = path.dirname(task.logPath);
   if (!fs.existsSync(logDir)) {
@@ -106,7 +118,187 @@ function readPackageManifest(installRoot: string): PackageManifest | null {
   return JSON.parse(fs.readFileSync(packageJsonPath, 'utf-8')) as PackageManifest;
 }
 
-function runQualityGates(task: Task): string[] {
+function getWorkspacePatterns(manifest: PackageManifest | null): string[] {
+  const workspaces = manifest?.workspaces;
+  if (Array.isArray(workspaces)) {
+    return workspaces;
+  }
+
+  if (workspaces && Array.isArray(workspaces.packages)) {
+    return workspaces.packages;
+  }
+
+  return [];
+}
+
+function expandSimpleWorkspacePattern(rootPath: string, pattern: string): string[] {
+  if (!pattern.endsWith('/*') || pattern.includes('**')) {
+    return [];
+  }
+
+  const parent = path.join(rootPath, pattern.slice(0, -2));
+  try {
+    return fs.readdirSync(parent, { withFileTypes: true })
+      .filter((entry) => entry.isDirectory())
+      .map((entry) => path.join(parent, entry.name))
+      .filter((candidate) => fs.existsSync(path.join(candidate, 'package.json')));
+  } catch {
+    return [];
+  }
+}
+
+function resolveWorkspacePackageDirs(rootPath: string, manifest: PackageManifest | null): string[] {
+  const dirs = new Set<string>();
+
+  for (const pattern of getWorkspacePatterns(manifest)) {
+    for (const workspaceDir of expandSimpleWorkspacePattern(rootPath, pattern)) {
+      dirs.add(path.resolve(workspaceDir));
+    }
+  }
+
+  return [...dirs];
+}
+
+function listChangedFiles(worktreePath: string): string[] {
+  const files = new Set<string>();
+  const diffFiles = tryRunGit(worktreePath, ['diff', '--name-only', 'HEAD']);
+  const untrackedFiles = tryRunGit(worktreePath, ['ls-files', '--others', '--exclude-standard']);
+
+  for (const output of [diffFiles, untrackedFiles]) {
+    if (!output) {
+      continue;
+    }
+
+    for (const file of output.split(/\r?\n/)) {
+      const trimmed = file.trim();
+      if (trimmed) {
+        files.add(trimmed);
+      }
+    }
+  }
+
+  return [...files];
+}
+
+interface QualityGateTarget {
+  cwd: string;
+  label: string;
+  manifest: PackageManifest | null;
+}
+
+function resolveQualityGateTargets(
+  task: Task,
+  installRoot: string,
+  manifest: PackageManifest | null,
+): QualityGateTarget[] {
+  const workspaceDirs = resolveWorkspacePackageDirs(installRoot, manifest);
+  if (workspaceDirs.length === 0) {
+    return [{ cwd: installRoot, label: path.basename(installRoot), manifest }];
+  }
+
+  const changedFiles = listChangedFiles(task.worktree);
+  const targets = new Map<string, QualityGateTarget>();
+  let hasRootScopedChange = false;
+
+  for (const file of changedFiles) {
+    const workspaceDir = workspaceDirs.find((candidate) => {
+      const relativeWorkspacePath = path.relative(installRoot, candidate);
+      return file === relativeWorkspacePath || file.startsWith(`${relativeWorkspacePath}${path.sep}`);
+    });
+
+    if (!workspaceDir) {
+      hasRootScopedChange = true;
+      continue;
+    }
+
+    targets.set(workspaceDir, {
+      cwd: workspaceDir,
+      label: path.relative(installRoot, workspaceDir),
+      manifest: readPackageManifest(workspaceDir),
+    });
+  }
+
+  if (hasRootScopedChange || targets.size === 0) {
+    targets.set(installRoot, {
+      cwd: installRoot,
+      label: path.basename(installRoot),
+      manifest,
+    });
+  }
+
+  return [...targets.values()];
+}
+
+function resolveTaskBaseCommit(task: Task, worktreePath: string): string | undefined {
+  if (typeof task.baseCommitSha === 'string' && task.baseCommitSha.trim()) {
+    return task.baseCommitSha.trim();
+  }
+
+  const repoHead = tryRunGit(task.repoPath, ['rev-parse', 'HEAD']);
+  if (!repoHead) {
+    return undefined;
+  }
+
+  return tryRunGit(worktreePath, ['merge-base', 'HEAD', repoHead]);
+}
+
+function detectExistingTaskCommit(task: Task, worktreePath: string): { hasExistingCommit: boolean; headCommit?: string } {
+  const headCommit = tryRunGit(worktreePath, ['rev-parse', 'HEAD']);
+  const baseCommit = resolveTaskBaseCommit(task, worktreePath);
+
+  if (!headCommit || !baseCommit) {
+    return {
+      hasExistingCommit: false,
+      headCommit,
+    };
+  }
+
+  return {
+    hasExistingCommit: headCommit !== baseCommit,
+    headCommit,
+  };
+}
+
+function resolveQualityGateTimeoutMs(config: Pick<ConfigManager, 'get'>): number {
+  const configuredTimeout = Number(config.get('finalizer.qualityGateTimeout'));
+
+  if (!Number.isFinite(configuredTimeout) || configuredTimeout <= 0) {
+    return 600_000;
+  }
+
+  return configuredTimeout >= 1000 ? configuredTimeout : configuredTimeout * 1000;
+}
+
+function formatTimeoutSeconds(timeoutMs: number): string {
+  const timeoutSeconds = timeoutMs / 1000;
+  return Number.isInteger(timeoutSeconds)
+    ? String(timeoutSeconds)
+    : timeoutSeconds.toFixed(2).replace(/0+$/, '').replace(/\.$/, '');
+}
+
+function resolveConfiguredQualityGates(config: Pick<ConfigManager, 'get'>): QualityGateScript[] {
+  const configuredGates = config.get('finalizer.qualityGates');
+
+  if (Array.isArray(configuredGates)) {
+    return configuredGates
+      .filter((entry): entry is string => typeof entry === 'string')
+      .map((entry) => entry.trim())
+      .filter(Boolean);
+  }
+
+  if (typeof configuredGates === 'string') {
+    const trimmed = configuredGates.trim();
+    if (!trimmed || trimmed.toLowerCase() === 'none') {
+      return [];
+    }
+
+    return trimmed.split(',').map((entry) => entry.trim()).filter(Boolean);
+  }
+
+  return [...QUALITY_GATE_SCRIPTS];
+}
+
+function runQualityGates(task: Task, timeoutMs: number, configuredScripts: QualityGateScript[]): string[] {
   const installRoot = findInstallRoot(task.worktree, task.repoPath);
   if (!installRoot) {
     appendFinalizeLog(task, 'Skipped quality gates (no package.json detected)');
@@ -119,50 +311,75 @@ function runQualityGates(task: Task): string[] {
     return [];
   }
 
-  const availableScripts = QUALITY_GATE_SCRIPTS.filter((scriptName) => typeof manifest.scripts?.[scriptName] === 'string');
-  if (availableScripts.length === 0) {
-    appendFinalizeLog(task, `Skipped quality gates (no typecheck/lint/build scripts in ${installRoot})`);
+  const requestedScripts = configuredScripts.length > 0 ? configuredScripts : [];
+  if (requestedScripts.length === 0) {
+    appendFinalizeLog(task, 'Skipped quality gates (finalizer.qualityGates is empty)');
     return [];
   }
 
   const packageManager = detectPackageManager(task.worktree, task.repoPath) ?? 'npm';
+  const targets = resolveQualityGateTargets(task, installRoot, manifest);
+  const executedScripts: string[] = [];
 
-  for (const scriptName of availableScripts) {
-    appendFinalizeLog(task, `Running quality gate: ${packageManager} run ${scriptName} (cwd: ${installRoot})`);
-    const result = spawnSync(packageManager, ['run', scriptName], {
-      cwd: installRoot,
-      encoding: 'utf-8',
-      env: process.env,
-    });
-
-    if (result.stdout?.trim()) {
-      appendFinalizeLog(task, result.stdout.trim());
-    }
-    if (result.stderr?.trim()) {
-      appendFinalizeLog(task, result.stderr.trim());
+  for (const target of targets) {
+    const availableScripts = requestedScripts.filter((scriptName) => typeof target.manifest?.scripts?.[scriptName] === 'string');
+    if (availableScripts.length === 0) {
+      appendFinalizeLog(task, `Skipped quality gates for ${target.label} (none of ${requestedScripts.join(', ')} exist)`);
+      continue;
     }
 
-    if (result.error) {
-      throw new Error(`Quality gate \"${scriptName}\" failed to start: ${result.error.message}`);
-    }
+    for (const scriptName of availableScripts) {
+      appendFinalizeLog(task, `Running quality gate: ${packageManager} run ${scriptName} (cwd: ${target.cwd})`);
+      const result = spawnSync(packageManager, ['run', scriptName], {
+        cwd: target.cwd,
+        encoding: 'utf-8',
+        env: process.env,
+        timeout: timeoutMs,
+      });
 
-    if (result.status !== 0) {
-      const errorMessage = result.stderr?.trim() || result.stdout?.trim() || `exit code ${result.status}`;
-      throw new Error(`Quality gate \"${scriptName}\" failed: ${errorMessage}`);
+      if (result.stdout?.trim()) {
+        appendFinalizeLog(task, result.stdout.trim());
+      }
+      if (result.stderr?.trim()) {
+        appendFinalizeLog(task, result.stderr.trim());
+      }
+
+      if (result.error) {
+        if ((result.error as NodeJS.ErrnoException).code === 'ETIMEDOUT') {
+          throw new Error(`Quality gate "${scriptName}" timed out after ${formatTimeoutSeconds(timeoutMs)}s`);
+        }
+        throw new Error(`Quality gate \"${scriptName}\" failed to start: ${result.error.message}`);
+      }
+
+      if (result.status !== 0) {
+        const errorMessage = result.stderr?.trim() || result.stdout?.trim() || `exit code ${result.status}`;
+        throw new Error(`Quality gate \"${scriptName}\" failed: ${errorMessage}`);
+      }
+
+      executedScripts.push(`${target.label}:${scriptName}`);
     }
   }
 
-  appendFinalizeLog(task, `Quality gates passed: ${availableScripts.join(', ')}`);
-  return availableScripts;
+  if (executedScripts.length === 0) {
+    appendFinalizeLog(task, `Skipped quality gates (none of ${requestedScripts.join(', ')} exist in changed targets)`);
+    return [];
+  }
+
+  appendFinalizeLog(task, `Quality gates passed: ${executedScripts.join(', ')}`);
+  return executedScripts;
 }
 
 export function finalizeTaskOutput(task: Task): FinalizeResult {
   assertFinalizerScope(task);
 
+  const configManager = new ConfigManager();
+  const qualityGateTimeoutMs = resolveQualityGateTimeoutMs(configManager);
+  const qualityGateScripts = resolveConfiguredQualityGates(configManager);
   const worktreePath = path.resolve(task.worktree);
+  const existingCommitState = detectExistingTaskCommit(task, worktreePath);
   const statusBefore = runGit(worktreePath, ['status', '--porcelain']);
 
-  if (!statusBefore) {
+  if (!statusBefore && !existingCommitState.hasExistingCommit) {
     return {
       success: true,
       committed: false,
@@ -170,7 +387,27 @@ export function finalizeTaskOutput(task: Task): FinalizeResult {
     };
   }
 
-  const qualityGates = runQualityGates(task);
+  const qualityGates = runQualityGates(task, qualityGateTimeoutMs, qualityGateScripts);
+
+  if (!statusBefore && existingCommitState.hasExistingCommit) {
+    const latestCommitMessage = tryRunGit(worktreePath, ['log', '-1', '--pretty=%s']);
+    const qualityGateSuffix = qualityGates.length > 0
+      ? ` after quality gates (${qualityGates.join(', ')})`
+      : '';
+
+    appendFinalizeLog(
+      task,
+      `Detected existing task commit ${existingCommitState.headCommit ?? 'unknown'} before finalizer commit; validating without creating another commit`
+    );
+
+    return {
+      success: true,
+      committed: false,
+      message: `Validated existing task commits${qualityGateSuffix}`,
+      commitMessage: latestCommitMessage,
+      commitSha: existingCommitState.headCommit,
+    };
+  }
 
   runGit(worktreePath, ['add', '-A']);
 
@@ -195,5 +432,6 @@ export function finalizeTaskOutput(task: Task): FinalizeResult {
     committed: true,
     message: `Committed task changes successfully${qualityGateSuffix}`,
     commitMessage,
+    commitSha: tryRunGit(worktreePath, ['rev-parse', 'HEAD']),
   };
 }

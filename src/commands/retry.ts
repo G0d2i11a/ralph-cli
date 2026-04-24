@@ -1,5 +1,46 @@
 import { StateManager } from '../core/state';
 import { TaskScheduler } from '../core/scheduler';
+import { StoryProgress, Task } from '../types/task';
+
+const RETRYABLE_STATUSES = new Set(['failed', 'stagnant', 'failed_finalize']);
+
+function resetRetryableStoryProgress(task: Task): {
+  storyProgress: StoryProgress[] | undefined;
+  completedUS: string[];
+  resetStoryIds: string[];
+} {
+  const resetStoryIds: string[] = [];
+  const updatedAt = Date.now();
+  const storyProgress = task.storyProgress?.map((story) => {
+    if (story.status !== 'failed' && story.status !== 'needs_repair') {
+      return story;
+    }
+
+    resetStoryIds.push(story.id);
+    return {
+      ...story,
+      status: 'pending' as const,
+      attempts: 0,
+      updatedAt,
+      history: [
+        ...(story.history || []),
+        {
+          attempt: story.attempts,
+          status: 'pending' as const,
+          message: 'Reset for explicit retry',
+          updatedAt,
+        },
+      ],
+    };
+  });
+
+  const resetStoryIdSet = new Set(resetStoryIds);
+  return {
+    storyProgress,
+    completedUS: task.completedUS.filter((storyId) => !resetStoryIdSet.has(storyId)),
+    resetStoryIds,
+  };
+}
 
 export async function retryCommand(taskId: string) {
   const stateManager = new StateManager();
@@ -14,29 +55,35 @@ export async function retryCommand(taskId: string) {
 
     const previousStatus = task.status;
 
-    // Only allow retry for failed or stagnant tasks
-    if (previousStatus !== 'failed' && previousStatus !== 'stagnant') {
+    // Only retry terminal failure states. ready_to_finalize/finalizing are handled by manager/finalizer.
+    if (!RETRYABLE_STATUSES.has(previousStatus)) {
       console.error(JSON.stringify({
-        error: `Cannot retry task with status '${previousStatus}'. Only 'failed' or 'stagnant' tasks can be retried.`,
+        error: `Cannot retry task with status '${previousStatus}'. Only 'failed', 'stagnant', or 'failed_finalize' tasks can be retried.`,
         taskId,
         currentStatus: previousStatus
       }));
       process.exit(1);
     }
 
-    // Reset stagnation counters
-    task.loopCount = 0;
-    task.consecutiveNoProgress = 0;
-    task.consecutiveErrors = 0;
-    task.lastProgressTime = Date.now();
-    task.lastError = undefined;
-    task.status = 'pending';
-    task.endTime = undefined;
-    task.pid = undefined;
-    task.currentUS = undefined;
-    // sessionId/threadId are preserved for continuation
-
-    await stateManager.saveTask(task);
+    const retryProgress = resetRetryableStoryProgress(task);
+    await stateManager.updateTask(taskId, {
+      status: 'pending',
+      endTime: undefined,
+      pid: undefined,
+      currentUS: undefined,
+      completedUS: retryProgress.completedUS,
+      storyProgress: retryProgress.storyProgress,
+      leaseOwner: undefined,
+      leaseHeartbeatAt: undefined,
+      leaseExpiresAt: undefined,
+      loopCount: 0,
+      consecutiveNoProgress: 0,
+      consecutiveErrors: 0,
+      lastProgressTime: Date.now(),
+      lastError: undefined,
+      finalizerAttempts: previousStatus === 'failed_finalize' ? 0 : task.finalizerAttempts,
+      mergeError: previousStatus === 'failed_finalize' ? undefined : task.mergeError,
+    });
     await scheduler.schedulePendingTasks();
 
     const latestTask = await stateManager.loadTask(taskId);
@@ -61,6 +108,7 @@ export async function retryCommand(taskId: string) {
       dependencies: pendingState?.dependencies,
       concurrencyLimit: pendingState?.maxConcurrent,
       completedUS: latestTask.completedUS.length,
+      resetStoryIds: retryProgress.resetStoryIds,
       worktree: latestTask.worktree,
       logPath: latestTask.logPath,
       sessionId: latestTask.sessionId,

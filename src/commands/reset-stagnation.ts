@@ -10,13 +10,12 @@ export async function resetStagnationCommand(taskId: string) {
       process.exit(1);
     }
 
-    // Reset stagnation counters
-    task.loopCount = 0;
-    task.consecutiveNoProgress = 0;
-    task.consecutiveErrors = 0;
-    task.lastProgressTime = Date.now();
-
-    await stateManager.saveTask(task);
+    await stateManager.updateTask(taskId, {
+      loopCount: 0,
+      consecutiveNoProgress: 0,
+      consecutiveErrors: 0,
+      lastProgressTime: Date.now(),
+    });
 
     console.log(JSON.stringify({
       success: true,

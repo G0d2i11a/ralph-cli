@@ -6,6 +6,7 @@ interface BatchStartOptions {
   repo?: string;
   agent?: string;
   backend?: string;
+  allowDuplicate?: boolean;
 }
 
 export async function batchStartCommand(prdPaths: string[], options: BatchStartOptions) {
@@ -33,6 +34,7 @@ export async function batchStartCommand(prdPaths: string[], options: BatchStartO
         repoPath: repo,
         agent,
         backend: options.backend,
+        allowDuplicate: options.allowDuplicate,
       });
 
       results.push({
@@ -45,6 +47,7 @@ export async function batchStartCommand(prdPaths: string[], options: BatchStartO
         backend: queuedTask.latestTask.backend,
         sessionId: queuedTask.latestTask.sessionId,
         threadId: queuedTask.latestTask.threadId,
+        ...(queuedTask.alreadyExists ? { existing: true } : {}),
       });
     } catch (error) {
       results.push({

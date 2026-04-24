@@ -2,14 +2,28 @@ import { enqueueTaskFromPrd } from '../core/task-intake';
 
 export async function startCommand(
   prdPath: string,
-  options: { repo?: string; agent?: string; backend?: string }
+  options: { repo?: string; agent?: string; backend?: string; allowDuplicate?: boolean }
 ): Promise<void> {
   try {
-    const { taskId, latestTask, pendingState } = await enqueueTaskFromPrd(prdPath, {
+    const { taskId, latestTask, pendingState, alreadyExists } = await enqueueTaskFromPrd(prdPath, {
       repoPath: options.repo,
       agent: options.agent,
       backend: options.backend,
+      allowDuplicate: options.allowDuplicate,
     });
+
+    if (alreadyExists) {
+      console.log(JSON.stringify({
+        taskId,
+        status: latestTask.status,
+        existing: true,
+        worktree: latestTask.worktree,
+        logPath: latestTask.logPath,
+        backend: latestTask.backend,
+        message: 'An active task for this PRD already exists; pass --allow-duplicate to enqueue another one',
+      }));
+      return;
+    }
 
     if (latestTask.status === 'running') {
       console.log(JSON.stringify({

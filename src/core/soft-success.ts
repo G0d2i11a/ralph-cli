@@ -26,6 +26,9 @@ export function detectCompletionSignals(rawText: string): CompletionSignals {
   const hasCompletionSummary = [
     /\*\*Done\*\*/i,
     /implementation complete/i,
+    /implemented and validated/i,
+    /acceptance criteria (are )?(covered|met)/i,
+    /all acceptance criteria (are )?(covered|met)/i,
     /task .* completed successfully/i,
     /all done/i,
   ].some((pattern) => pattern.test(text));
@@ -91,6 +94,10 @@ export function shouldTreatNonZeroExitAsSuccess(input: {
     reason: `Insufficient completion signals: ${signals.matchedSignals.join(', ') || 'none'}`,
     signals,
   };
+}
+
+export function hasObjectiveProgressEvidence(progress: ProgressLike): boolean {
+  return progress.filesChanged > 0 || progress.newCommits > 0;
 }
 
 export function evaluateFailedTaskForFinalizeRecovery(input: {

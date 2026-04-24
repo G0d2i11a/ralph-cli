@@ -22,6 +22,9 @@ ralph start ./my-prd.json
 # Check status
 ralph status
 
+# Run the always-on manager loop
+ralph manager
+
 # List all tasks
 ralph list
 ```
@@ -39,12 +42,19 @@ ralph list
 ## Features
 
 - **Simple CLI Interface** - Start, stop, and monitor tasks from command line
-- **Git Worktree Isolation** - Each task runs in its own worktree, zero conflicts
+- **Git Worktree Isolation** - Each task runs in its own worktree to avoid checkout collisions; merge conflicts can still happen later
 - **Provider + Backend Support** - Keep `claude|codex` provider semantics and choose `cli` or `agent-runners`
 - **State Persistence** - Task state survives restarts
-- **Quality Gates** - Runs available `typecheck`, `lint`, and `build` scripts before the final commit
-- **Batch Execution** - Start multiple PRDs at once
+- **Immutable Task Intake** - PRD identity, dependencies, source hash, base ref, and merge target are captured when a task is enqueued
+- **Active PRD Dedupe** - The same active PRD is not queued twice for the same repo unless explicitly requested
+- **Quality Gates** - Runs available `typecheck`, `lint`, `test`, and `build` scripts before the final commit
+- **Batch Execution** - Start multiple PRDs at once with task-level parallelism
+- **Repo-Scoped Integrated Dependencies** - PRD dependencies only resolve against integrated tasks from the same repository
+- **Lease + Revision Safety** - State updates are revisioned and stale `running` / `finalizing` leases are recoverable
+- **Structured Event Log** - Task lifecycle events are written to `events.jsonl` and used by stats when available
+- **Dedicated Integration Worktree** - Background merge runs in `.ralph-integration/` so dirty user checkouts do not block task integration
 - **Watch + Auto-Ingestion** - Poll the queue and auto-enqueue new ez4ielts PRDs
+- **Manager Health + launchd Restart** - The manager records heartbeat/status, prevents duplicate loops, and can install a macOS launchd service
 - **Progress Tracking** - Monitor task status and completion
 
 ## Installation
@@ -67,9 +77,10 @@ npm link
 ralph start <prd-path> [options]
 
 Options:
-  --repo <path>    Repository path (defaults to current directory)
-  --agent <name>   Agent to use: claude or codex (default: codex)
-  --backend <name> Backend to use: cli or agent-runners (default: cli)
+  --repo <path>        Repository path (defaults to current directory)
+  --agent <name>       Agent to use: claude or codex (default: codex)
+  --backend <name>     Backend to use: cli or agent-runners (default: cli)
+  --allow-duplicate    Queue another active copy of the same PRD for this repo
 ```
 
 **Examples:**
@@ -86,6 +97,9 @@ ralph start ./prd-auth.json --backend agent-runners
 
 # Specify repository
 ralph start ./prd-api.json --repo ~/Code/my-project
+
+# Queue a duplicate active PRD intentionally
+ralph start ./prd-api.json --allow-duplicate
 ```
 
 ### Batch start multiple PRDs
@@ -95,6 +109,8 @@ ralph batch-start prds/*.json
 ```
 
 Tasks beyond the configured concurrency limit stay `pending` and start automatically as running tasks finish.
+
+Queued tasks are pinned to the repo base ref captured at intake. Changing the repo checkout later does not change the base used when the queued task eventually starts.
 
 ### Watch pending tasks and auto-ingest new ez4ielts PRDs
 
@@ -117,6 +133,60 @@ When `--auto-ingest-ez4ielts` is enabled, Ralph polls the configured ez4ielts PR
 - New files still respect dependency checks and the configured concurrency limit.
 
 You can also enable the same mode through `~/.ralph/config.json` and then run plain `ralph watch`.
+
+### Run the manager loop
+
+```bash
+ralph manager
+ralph manager-status
+```
+
+`ralph manager` is the named always-on control-plane entry point. It performs queue movement, stale lease recovery, ready-to-finalize processing, optional auto-merge, and optional ez4ielts auto-ingestion. It writes a heartbeat to `~/.ralph/manager/state.json` and holds `~/.ralph/manager.lock` so a second manager does not accidentally run the same queue.
+
+Use `ralph manager-status` to inspect the current manager PID, heartbeat age, loop timing, and stale status. `ralph doctor` includes the same manager health signal in its JSON output.
+
+### Keep the manager running with launchd
+
+```bash
+# Inspect the launchd config that would be generated
+ralph manager-install --dry-run --repo ~/Project/atta --disable-auto-ingest-ez4ielts
+
+# Install and start the always-on manager for the current macOS user
+ralph manager-install --repo ~/Project/atta --disable-auto-ingest-ez4ielts --load
+
+# Remove the launchd service
+ralph manager-uninstall
+```
+
+Ralph intentionally does not self-daemonize. The CLI owns internal health, heartbeat, lock, queue recovery, and status reporting; macOS `launchd` owns process restart via `KeepAlive`. This keeps restart behavior inspectable with normal OS tooling while avoiding duplicate manager loops.
+
+Use `--disable-auto-ingest-ez4ielts` when you want the manager to process only the existing Ralph queue and not inherit a global `ingestion.ez4ielts.enabled=true` setting from `~/.ralph/config.json`.
+
+### Inspect the active queue
+
+```bash
+ralph queue
+```
+
+The queue view reports pending reasons, dependency blockers, slot usage, lease owner/expiry, story progress, and the next expected action.
+
+### Preflight the environment
+
+```bash
+ralph doctor
+ralph doctor --repo ~/Code/my-project
+```
+
+`doctor` checks git availability, repo validity, dirty working tree risk, Codex availability, backend configuration, and runner concurrency settings.
+
+### Cleanup old task worktrees
+
+```bash
+ralph cleanup --dry-run
+ralph cleanup --older-than-hours 168
+```
+
+`cleanup` removes terminal task worktrees after the retention window. Use `--dry-run` first to inspect candidates.
 
 ### Check task status
 
@@ -164,6 +234,8 @@ ralph retry <task-id>
 ```bash
 ralph merge <task-id>
 ```
+
+Merge runs in a dedicated `.ralph-integration/<target>` worktree by default. Completed task branches are merged into `ralph/integration/<target>` first, so dirty user checkouts do not block autonomous integration. If the target branch checkout is clean, Ralph fast-forwards it; if the target checkout has uncommitted user changes, Ralph defers target sync and records the integration branch/worktree in task state.
 
 ### Reset stagnation detection
 
@@ -250,12 +322,14 @@ Ralph also supports Markdown body sections like `## US-001: Title` or `### US-00
 ## How It Works
 
 1. **Parse PRD** - Ralph reads your PRD file and extracts user stories
-2. **Create Worktree** - Creates a git worktree for isolated development
-3. **Spawn Agent** - Launches Codex by default, or Claude Code when requested
-4. **Track Progress** - Maintains state in `~/.ralph/tasks/<task-id>/`
-5. **Quality Gates** - Runs available `typecheck`, `lint`, and `build` scripts before the restricted final commit
-6. **Watch + Queue** - `ralph watch` can keep the queue moving and auto-ingest new ez4ielts PRDs
-7. **Complete** - Marks task as completed when all user stories pass
+2. **Capture Intake Metadata** - Persists PRD id/title/dependencies/source hash, queue time, base ref, and merge target into task state
+3. **Create Worktree** - Creates a git worktree from the captured base ref for isolated development
+4. **Spawn Agent** - Launches Codex by default, or Claude Code when requested
+5. **Track Progress** - Maintains revisioned state in `~/.ralph/tasks/<task-id>/`
+6. **Require Objective Evidence** - A story is not marked passed from a success message alone; Ralph requires a diff or commit evidence
+7. **Quality Gates** - Runs available `typecheck`, `lint`, `test`, and `build` scripts before the restricted final commit
+8. **Watch + Queue** - `ralph watch` can keep the queue moving, recover stale leases, finalize ready tasks, and auto-ingest new ez4ielts PRDs
+9. **Complete / Integrate** - Marks task as completed after finalization; dependency chains wait for integrated upstream tasks
 
 ## State Management
 
@@ -264,17 +338,43 @@ Task state is stored in `~/.ralph/tasks/<task-id>/state.json`:
 ```json
 {
   "id": "task-xxx",
+  "prdPath": "/path/to/prd-auth.json",
   "prdId": "prd-auth",
+  "prdTitle": "User Authentication System",
+  "prdDependencies": [],
+  "prdSourceHash": "sha256...",
+  "enqueuedAt": 1772544497000,
+  "baseRef": "main",
+  "baseCommitSha": "abc123...",
+  "intendedMergeTarget": "main",
   "status": "running",
+  "revision": 3,
+  "updatedAt": 1772544501000,
+  "startTime": 1772544497775,
   "currentUS": "US-001",
   "completedUS": [],
-  "failedUS": [],
+  "storyProgress": [
+    {
+      "id": "US-001",
+      "status": "in_progress",
+      "attempts": 1,
+      "updatedAt": 1772544500123
+    }
+  ],
   "worktree": "/path/to/worktree",
   "logPath": "/path/to/log",
+  "eventLogPath": "/path/to/events.jsonl",
+  "leaseOwner": "worker:12345",
+  "leaseHeartbeatAt": 1772544500123,
+  "leaseExpiresAt": 1772544800123,
   "agent": "codex",
   "backend": "cli",
-  "createdAt": "2026-03-07T10:00:00Z",
-  "updatedAt": "2026-03-07T10:30:00Z"
+  "repoPath": "/path/to/repo",
+  "loopCount": 1,
+  "consecutiveNoProgress": 0,
+  "consecutiveErrors": 0,
+  "lastProgressTime": 1772544500123,
+  "lastFilesChanged": 3
 }
 ```
 
@@ -351,13 +451,20 @@ Ralph CLI stores configuration in `~/.ralph/config.json`:
   "runner": {
     "maxConcurrent": 3,
     "stagnationTimeout": 1800,
-    "pollInterval": 10
+    "pollInterval": 10,
+    "leaseTimeout": 300,
+    "maxStoryAttempts": 2
+  },
+  "finalizer": {
+    "qualityGateTimeout": 600,
+    "leaseTimeout": 1800,
+    "qualityGates": ["typecheck", "lint", "test", "build"],
+    "maxRepairAttempts": 1
   },
   "ingestion": {
     "ez4ielts": {
       "enabled": false,
       "watchDir": "/absolute/path/to/your/ez4ielts-prds",
-      // Or set RALPH_EZ4IELTS_WATCH_DIR to override this per machine.
       "pattern": "ez4ielts-*.json",
       "settleMs": 2000
     }
@@ -365,7 +472,7 @@ Ralph CLI stores configuration in `~/.ralph/config.json`:
 }
 ```
 
-`agent.backend` defaults to `cli` in new configs. New tasks also default to Codex unless `--agent claude` is passed. `agent.agentRunnersPath` (or `RALPH_AGENT_RUNNERS_CLI`) points at the unified agent-runners CLI when you choose the `agent-runners` backend, `agent.timeout` is measured in seconds, and `agent.model` is only used for Claude runs. `agent.path` is kept for Codex CLI path compatibility.
+`agent.backend` defaults to `cli` in new configs. New tasks also default to Codex unless `--agent claude` is passed. `agent.agentRunnersPath` (or `RALPH_AGENT_RUNNERS_CLI`) points at the unified agent-runners CLI when you choose the `agent-runners` backend, `agent.timeout` is measured in seconds, `runner.leaseTimeout` and `finalizer.leaseTimeout` are measured in seconds unless you pass a value >= 1000 (treated as milliseconds), `runner.maxStoryAttempts` controls bounded repair attempts per story, `finalizer.qualityGates` controls which package scripts run before final commit, `finalizer.maxRepairAttempts` controls how many failed-finalize tasks can be routed back to repair, `finalizer.qualityGateTimeout` follows the same unit rule, and `agent.model` is only used for Claude runs. `agent.path` is kept for Codex CLI path compatibility.
 
 Legacy `agent.sdkRunnerPath` and `RALPH_SDK_RUNNER_CLI` are still accepted for compatibility.
 
@@ -373,7 +480,7 @@ If you already have an older config that points at `agent.sdkRunnerPath` (or exp
 
 Built-in notification delivery is not wired up yet, so the generated config intentionally omits any `notification` block.
 
-Set concurrency to `2` by changing `runner.maxConcurrent`. `runner.pollInterval` is read from config in seconds when `ralph watch` is launched without `--interval`, and `runner.stagnationTimeout` is used in seconds to mark long-stalled workers as stagnant:
+Set concurrency to `2` by changing `runner.maxConcurrent`. `runner.pollInterval` is read from config in seconds when `ralph watch` is launched without `--interval`, `runner.stagnationTimeout` is used in seconds to mark long-stalled workers as stagnant, and `runner.leaseTimeout` controls how long a `running` task without a fresh worker heartbeat is trusted:
 
 ```json
 {
@@ -463,6 +570,9 @@ src/
 ```bash
 # Check task status
 ralph status <task-id>
+
+# Run the watcher/manager loop so stale leases are reconciled
+ralph watch
 
 # Reset stagnation detection
 ralph reset-stagnation <task-id>

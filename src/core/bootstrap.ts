@@ -283,6 +283,176 @@ function hasInstallArtifacts(installRoot: string, packageManager: PackageManager
   return true;
 }
 
+function removePathIfExists(targetPath: string): void {
+  if (!fs.existsSync(targetPath)) {
+    return;
+  }
+
+  fs.rmSync(targetPath, { recursive: true, force: true });
+}
+
+function createDirSymlink(targetPath: string, linkPath: string): void {
+  const symlinkType: fs.symlink.Type = process.platform === 'win32' ? 'junction' : 'dir';
+  fs.symlinkSync(targetPath, linkPath, symlinkType);
+}
+
+function getWorkspacePatterns(manifest: PackageManifest | null): string[] {
+  const workspaces = manifest?.workspaces;
+  if (Array.isArray(workspaces)) {
+    return workspaces;
+  }
+
+  if (workspaces && Array.isArray(workspaces.packages)) {
+    return workspaces.packages;
+  }
+
+  return [];
+}
+
+function expandSimpleWorkspacePattern(rootPath: string, pattern: string): string[] {
+  if (!pattern.endsWith('/*') || pattern.includes('**')) {
+    return [];
+  }
+
+  const parent = path.join(rootPath, pattern.slice(0, -2));
+  try {
+    return fs.readdirSync(parent, { withFileTypes: true })
+      .filter((entry) => entry.isDirectory())
+      .map((entry) => path.join(parent, entry.name))
+      .filter((candidate) => fs.existsSync(path.join(candidate, 'package.json')));
+  } catch {
+    return [];
+  }
+}
+
+function resolveWorkspacePackageDirs(rootPath: string, manifest: PackageManifest | null): string[] {
+  const dirs = new Set<string>();
+
+  for (const pattern of getWorkspacePatterns(manifest)) {
+    for (const workspaceDir of expandSimpleWorkspacePattern(rootPath, pattern)) {
+      dirs.add(path.resolve(workspaceDir));
+    }
+  }
+
+  return [...dirs];
+}
+
+function maybeReuseWorkspaceInstallArtifacts(
+  repoInstallRoot: string,
+  worktreeInstallRoot: string,
+  logger: BootstrapLogger,
+): void {
+  const repoManifest = readManifest(repoInstallRoot);
+  const worktreeManifest = readManifest(worktreeInstallRoot);
+  const repoWorkspaceDirs = resolveWorkspacePackageDirs(repoInstallRoot, repoManifest);
+  const worktreeWorkspaceDirs = resolveWorkspacePackageDirs(worktreeInstallRoot, worktreeManifest);
+  const worktreeDirsByRelativePath = new Map(
+    worktreeWorkspaceDirs.map((workspaceDir) => [
+      path.relative(worktreeInstallRoot, workspaceDir),
+      workspaceDir,
+    ]),
+  );
+
+  for (const repoWorkspaceDir of repoWorkspaceDirs) {
+    const relativePath = path.relative(repoInstallRoot, repoWorkspaceDir);
+    const worktreeWorkspaceDir = worktreeDirsByRelativePath.get(relativePath);
+    if (!worktreeWorkspaceDir) {
+      continue;
+    }
+
+    const repoNodeModulesPath = path.join(repoWorkspaceDir, 'node_modules');
+    if (!fs.existsSync(repoNodeModulesPath)) {
+      continue;
+    }
+
+    const worktreeNodeModulesPath = path.join(worktreeWorkspaceDir, 'node_modules');
+    try {
+      if (fs.existsSync(worktreeNodeModulesPath)) {
+        const existingStats = fs.lstatSync(worktreeNodeModulesPath);
+        if (existingStats.isSymbolicLink()) {
+          const linkedTarget = fs.realpathSync.native(worktreeNodeModulesPath);
+          if (linkedTarget === fs.realpathSync.native(repoNodeModulesPath)) {
+            continue;
+          }
+        }
+
+        logger(`Replacing workspace install artifacts in ${worktreeNodeModulesPath} with a shared repo symlink`);
+        removePathIfExists(worktreeNodeModulesPath);
+      }
+
+      createDirSymlink(repoNodeModulesPath, worktreeNodeModulesPath);
+      logger(`Reused workspace install artifacts for ${relativePath}`);
+    } catch (error) {
+      logger(
+        `Workspace install reuse failed for ${relativePath}: ${error instanceof Error ? error.message : String(error)}`,
+        'error',
+      );
+    }
+  }
+}
+
+function maybeReuseRepoInstallArtifacts(
+  inspection: Pick<BootstrapInspection, 'installRoot' | 'packageManager'>,
+  repoPath: string | undefined,
+  logger: BootstrapLogger,
+): string | null {
+  if (!repoPath || !inspection.installRoot || !inspection.packageManager) {
+    return null;
+  }
+
+  const repoInstallRoot = findInstallRoot(repoPath, repoPath);
+  if (!repoInstallRoot) {
+    return null;
+  }
+
+  const resolvedRepoInstallRoot = path.resolve(repoInstallRoot);
+  const resolvedWorktreeInstallRoot = path.resolve(inspection.installRoot);
+
+  if (resolvedRepoInstallRoot === resolvedWorktreeInstallRoot) {
+    return null;
+  }
+
+  if (!hasInstallArtifacts(resolvedRepoInstallRoot, inspection.packageManager)) {
+    return null;
+  }
+
+  const repoNodeModulesPath = path.join(resolvedRepoInstallRoot, 'node_modules');
+  if (!fs.existsSync(repoNodeModulesPath)) {
+    return null;
+  }
+
+  const worktreeNodeModulesPath = path.join(resolvedWorktreeInstallRoot, 'node_modules');
+
+  try {
+    if (fs.existsSync(worktreeNodeModulesPath)) {
+      const existingStats = fs.lstatSync(worktreeNodeModulesPath);
+      if (existingStats.isSymbolicLink()) {
+        const linkedTarget = fs.realpathSync.native(worktreeNodeModulesPath);
+        if (linkedTarget === fs.realpathSync.native(repoNodeModulesPath)) {
+          return `Reusing repo install artifacts from ${resolvedRepoInstallRoot}`;
+        }
+      }
+
+      logger(`Replacing worktree install artifacts in ${worktreeNodeModulesPath} with a shared repo symlink`);
+      removePathIfExists(worktreeNodeModulesPath);
+    }
+
+    createDirSymlink(repoNodeModulesPath, worktreeNodeModulesPath);
+    maybeReuseWorkspaceInstallArtifacts(
+      resolvedRepoInstallRoot,
+      resolvedWorktreeInstallRoot,
+      logger,
+    );
+    return `Reused repo install artifacts from ${resolvedRepoInstallRoot}`;
+  } catch (error) {
+    logger(
+      `Repo install reuse failed for ${resolvedWorktreeInstallRoot}: ${error instanceof Error ? error.message : String(error)}`,
+      'error',
+    );
+    return null;
+  }
+}
+
 function defaultCommandRunner(
   command: string,
   args: string[],
@@ -537,9 +707,23 @@ export function bootstrapWorktreeDeps(
 ): BootstrapResult {
   const options = normalizeOptions(repoPathOrOptions);
   const logger = createLogger(options.logPath, options.logger);
-  const inspection = inspectBootstrap(worktreePath, options.repoPath);
+  let inspection = inspectBootstrap(worktreePath, options.repoPath);
 
   logger(inspection.reason);
+
+  if (
+    !options.commandRunner &&
+    inspection.needsInstall &&
+    inspection.installRoot &&
+    inspection.packageManager
+  ) {
+    const reuseMessage = maybeReuseRepoInstallArtifacts(inspection, options.repoPath, logger);
+    if (reuseMessage) {
+      logger(reuseMessage);
+      inspection = inspectBootstrap(worktreePath, options.repoPath);
+      logger(inspection.reason);
+    }
+  }
 
   if (!inspection.needsInstall || !inspection.installRoot || !inspection.packageManager) {
     return {

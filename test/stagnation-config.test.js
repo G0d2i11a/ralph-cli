@@ -29,3 +29,29 @@ test('detectStagnation honors configured timeout windows', () => {
   assert.equal(result.isStagnant, true);
   assert.match(result.reason, /No progress for 6s/);
 });
+
+test('detectStagnation does not treat completed story count as stagnation by itself', () => {
+  const task = {
+    id: 'task-many-stories',
+    prdPath: '/tmp/prd.json',
+    status: 'running',
+    startTime: 0,
+    completedUS: Array.from({ length: 12 }, (_, index) => `US-${String(index + 1).padStart(3, '0')}`),
+    worktree: '/tmp/worktree',
+    logPath: '/tmp/agent.log',
+    agent: 'codex',
+    repoPath: '/tmp/repo',
+    loopCount: 12,
+    consecutiveNoProgress: 0,
+    consecutiveErrors: 0,
+    lastProgressTime: 10_000,
+    lastFilesChanged: 2,
+  };
+
+  const result = detectStagnation(task, {
+    timeoutMs: 60_000,
+    now: () => 20_000,
+  });
+
+  assert.equal(result.isStagnant, false);
+});

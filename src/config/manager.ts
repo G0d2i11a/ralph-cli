@@ -2,6 +2,8 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
 
+export type RalphMergeStrategy = 'manual' | 'ours' | 'theirs';
+
 export interface RalphConfig {
   agent: {
     backend: string;
@@ -15,6 +17,8 @@ export interface RalphConfig {
     maxConcurrent: number;
     stagnationTimeout: number;
     pollInterval: number;
+    leaseTimeout: number;
+    maxStoryAttempts: number;
   };
   ingestion: {
     ez4ielts: {
@@ -23,6 +27,22 @@ export interface RalphConfig {
       pattern: string;
       settleMs: number;
     };
+  };
+  autoMerge: boolean;
+  autoMergeDelay: number;
+  merge: {
+    targetBranch: string;
+    strategy: RalphMergeStrategy;
+    pullLatest: boolean;
+    useIntegrationWorktree: boolean;
+    integrationWorktreeDir: string;
+    syncTargetBranch: boolean;
+  };
+  finalizer: {
+    qualityGateTimeout: number;
+    leaseTimeout: number;
+    qualityGates: string[];
+    maxRepairAttempts: number;
   };
 }
 
@@ -38,7 +58,9 @@ const DEFAULT_CONFIG: RalphConfig = {
   runner: {
     maxConcurrent: 3,
     stagnationTimeout: 1800,
-    pollInterval: 10
+    pollInterval: 10,
+    leaseTimeout: 300,
+    maxStoryAttempts: 2,
   },
   ingestion: {
     ez4ielts: {
@@ -47,6 +69,22 @@ const DEFAULT_CONFIG: RalphConfig = {
       pattern: 'ez4ielts-*.json',
       settleMs: 2000,
     },
+  },
+  autoMerge: false,
+  autoMergeDelay: 0,
+  merge: {
+    targetBranch: 'main',
+    strategy: 'manual',
+    pullLatest: true,
+    useIntegrationWorktree: true,
+    integrationWorktreeDir: '.ralph-integration',
+    syncTargetBranch: true,
+  },
+  finalizer: {
+    qualityGateTimeout: 600,
+    leaseTimeout: 1800,
+    qualityGates: ['typecheck', 'lint', 'test', 'build'],
+    maxRepairAttempts: 1,
   },
 };
 

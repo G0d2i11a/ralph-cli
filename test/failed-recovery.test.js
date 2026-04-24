@@ -11,6 +11,11 @@ class FakeStateManager {
     this.tasks = new Map(tasks.map((task) => [task.id, { ...task }]));
   }
 
+  async loadTask(taskId) {
+    const task = this.tasks.get(taskId);
+    return task ? { ...task } : null;
+  }
+
   async listTasks(statusFilter) {
     const tasks = [...this.tasks.values()]
       .filter((task) => !statusFilter || task.status === statusFilter)
@@ -24,6 +29,24 @@ class FakeStateManager {
     if (!task) throw new Error(`Task ${taskId} not found`);
     this.tasks.set(taskId, { ...task, ...updates });
   }
+}
+
+function createConfigManager() {
+  const values = {
+    'runner.pollInterval': 10,
+    'ingestion.ez4ielts.enabled': false,
+    'autoMerge': false,
+    'autoMergeDelay': 0,
+    'merge.targetBranch': 'main',
+    'merge.strategy': 'manual',
+    'merge.pullLatest': true,
+  };
+
+  return {
+    get(key) {
+      return values[key];
+    },
+  };
 }
 
 test('dependency watcher recovers soft-failed tasks into finalize flow', async () => {
@@ -62,6 +85,7 @@ Suggested commit message: refactor(api): replace raw service errors with domain 
     {},
     {
       stateManager,
+      configManager: createConfigManager(),
       scheduler: {
         schedulePendingTasks: async () => [],
       },

@@ -1,7 +1,10 @@
 import * as path from 'path';
 import { ConfigManager } from '../config/manager';
 import { StateManager } from '../core/state';
-import { finalizeTaskOutput } from './finalizer';
+import { appendTaskEvent } from './events';
+import { FinalizeResult, finalizeTaskOutput } from './finalizer';
+import { withTaskFinalizeLock } from './locks';
+import { mergeBranch, MergeStrategy } from './merge';
 import { evaluateFailedTaskForFinalizeRecovery } from './soft-success';
 import { DEFAULT_AGENT, resolveAgentBackend, resolveAgentType, resolveConfiguredBackend } from './agent';
 import {
@@ -29,6 +32,16 @@ interface DependencyWatcherDeps {
   sleep?: (ms: number) => Promise<void>;
   logger?: Pick<typeof console, 'log' | 'error'>;
   finalizer?: typeof finalizeTaskOutput;
+  mergeTask?: typeof mergeBranch;
+  lifecycle?: DependencyWatcherLifecycleHooks;
+}
+
+interface DependencyWatcherLifecycleHooks {
+  onStarted?: () => void | Promise<void>;
+  onLoopStarted?: () => void | Promise<void>;
+  onLoopCompleted?: () => void | Promise<void>;
+  onLoopError?: (error: unknown) => void | Promise<void>;
+  onStopped?: () => void | Promise<void>;
 }
 
 function resolveConfiguredPollIntervalMs(value: unknown): number {
@@ -38,7 +51,42 @@ function resolveConfiguredPollIntervalMs(value: unknown): number {
     return 30000;
   }
 
+  return numericValue * 1000;
+}
+
+function resolveAutoMergeDelayMs(value: unknown): number {
+  const numericValue = Number(value);
+
+  if (!Number.isFinite(numericValue) || numericValue <= 0) {
+    return 0;
+  }
+
   return numericValue >= 1000 ? numericValue : numericValue * 1000;
+}
+
+function resolveFinalizerLeaseTimeoutMs(value: unknown): number {
+  const numericValue = Number(value);
+
+  if (!Number.isFinite(numericValue) || numericValue <= 0) {
+    return 30 * 60 * 1000;
+  }
+
+  return numericValue * 1000;
+}
+
+function resolveMergeStrategy(value: unknown): MergeStrategy {
+  return value === 'ours' || value === 'theirs' || value === 'manual'
+    ? value
+    : 'manual';
+}
+
+function resolveMergeTargetBranch(value: unknown): string {
+  if (typeof value !== 'string') {
+    return 'main';
+  }
+
+  const trimmed = value.trim();
+  return trimmed || 'main';
 }
 
 export class DependencyWatcher {
@@ -48,7 +96,11 @@ export class DependencyWatcher {
   private readonly logger: Pick<typeof console, 'log' | 'error'>;
   private readonly autoIngestor?: Pick<PrdAutoIngestor, 'initialize' | 'scan'>;
   private readonly stateManager: StateManager;
+  private readonly configManager: Pick<ConfigManager, 'get'>;
   private readonly finalizer: typeof finalizeTaskOutput;
+  private readonly mergeTask: typeof mergeBranch;
+  private readonly lifecycle?: DependencyWatcherLifecycleHooks;
+  private readonly autoIngestEnabled: boolean;
   private isRunning = false;
 
   constructor(
@@ -59,15 +111,18 @@ export class DependencyWatcher {
     const configManager = deps.configManager ?? new ConfigManager();
 
     this.stateManager = stateManager;
+    this.configManager = configManager;
     this.finalizer = deps.finalizer ?? finalizeTaskOutput;
+    this.mergeTask = deps.mergeTask ?? mergeBranch;
     this.scheduler = deps.scheduler ?? new TaskScheduler({ stateManager });
     this.pollInterval = Number.isFinite(options.interval) && Number(options.interval) > 0
       ? Number(options.interval)
       : resolveConfiguredPollIntervalMs(configManager.get('runner.pollInterval'));
     this.sleep = deps.sleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
     this.logger = deps.logger ?? console;
+    this.lifecycle = deps.lifecycle;
 
-    const autoIngestEnabled = options.autoIngestEz4ielts
+    this.autoIngestEnabled = options.autoIngestEz4ielts
       ?? Boolean(configManager.get('ingestion.ez4ielts.enabled'));
 
     if (deps.autoIngestor) {
@@ -75,7 +130,7 @@ export class DependencyWatcher {
       return;
     }
 
-    if (autoIngestEnabled) {
+    if (this.autoIngestEnabled) {
       const settleMs = Number(configManager.get('ingestion.ez4ielts.settleMs'));
       const configuredPattern = configManager.get('ingestion.ez4ielts.pattern');
       const configuredWatchDir = configManager.get('ingestion.ez4ielts.watchDir');
@@ -114,24 +169,68 @@ export class DependencyWatcher {
     this.isRunning = true;
     await this.autoIngestor?.initialize();
     this.logger.log(`Dependency watcher started (polling every ${this.pollInterval / 1000}s)`);
+    await this.invokeLifecycleHook('onStarted');
 
     while (this.isRunning) {
+      await this.invokeLifecycleHook('onLoopStarted');
       try {
         await this.autoIngestor?.scan();
+        await this.scheduler.recoverStaleTasks();
         await this.recoverSoftFailedTasks();
+        await this.recoverFailedFinalizeTasks();
         await this.finalizeReadyTasks();
         await this.checkPendingTasks();
+        await this.invokeLifecycleHook('onLoopCompleted');
       } catch (error) {
+        await this.invokeLoopErrorHook(error);
         this.logger.error('Error checking pending tasks:', error);
       }
 
       await this.sleep(this.pollInterval);
     }
+
+    await this.invokeLifecycleHook('onStopped');
   }
 
   stop(): void {
     this.isRunning = false;
     this.logger.log('Dependency watcher stopped');
+  }
+
+  getPollIntervalMs(): number {
+    return this.pollInterval;
+  }
+
+  isAutoIngestEnabled(): boolean {
+    return this.autoIngestEnabled;
+  }
+
+  private async invokeLifecycleHook(
+    hookName: Exclude<keyof DependencyWatcherLifecycleHooks, 'onLoopError'>
+  ): Promise<void> {
+    const hook = this.lifecycle?.[hookName];
+
+    if (!hook) {
+      return;
+    }
+
+    try {
+      await hook();
+    } catch (error) {
+      this.logger.error(`Dependency watcher lifecycle hook ${hookName} failed:`, error);
+    }
+  }
+
+  private async invokeLoopErrorHook(error: unknown): Promise<void> {
+    if (!this.lifecycle?.onLoopError) {
+      return;
+    }
+
+    try {
+      await this.lifecycle.onLoopError(error);
+    } catch (hookError) {
+      this.logger.error('Dependency watcher lifecycle hook onLoopError failed:', hookError);
+    }
   }
 
   async recoverSoftFailedTasks(): Promise<void> {
@@ -156,8 +255,140 @@ export class DependencyWatcher {
         pid: undefined,
         endTime: undefined,
       });
+      appendTaskEvent(task, {
+        type: 'task_recovered_soft_failed',
+        status: 'ready_to_finalize',
+        message: decision.reason,
+      });
       this.logger.log(`Task ${task.id} recovered into ready_to_finalize (${decision.reason})`);
     }
+  }
+
+  async recoverFailedFinalizeTasks(): Promise<void> {
+    const maxRepairAttempts = Number(this.configManager.get('finalizer.maxRepairAttempts'));
+    const repairLimit = Number.isFinite(maxRepairAttempts) && maxRepairAttempts >= 0
+      ? Math.floor(maxRepairAttempts)
+      : 1;
+    const failedFinalizeTasks = (await this.stateManager.listTasks('failed_finalize'))
+      .slice()
+      .sort((a: Task, b: Task) => a.startTime - b.startTime);
+
+    for (const task of failedFinalizeTasks) {
+      const attempts = task.finalizerAttempts ?? 0;
+      if (attempts > repairLimit) {
+        continue;
+      }
+
+      const repairStoryId = task.completedUS[task.completedUS.length - 1]
+        || task.storyProgress?.[task.storyProgress.length - 1]?.id;
+      if (!repairStoryId) {
+        continue;
+      }
+
+      const completedUS = task.completedUS.filter((storyId) => storyId !== repairStoryId);
+      const storyProgress = (task.storyProgress || []).map((story) => story.id === repairStoryId
+        ? {
+            ...story,
+            status: 'needs_repair' as const,
+            lastError: task.lastError || task.mergeError || 'Finalizer failed; repair required',
+            updatedAt: Date.now(),
+            history: [
+              ...(story.history || []),
+              {
+                attempt: story.attempts,
+                status: 'needs_repair' as const,
+                message: task.lastError || task.mergeError || 'Finalizer failed; repair required',
+                updatedAt: Date.now(),
+              },
+            ],
+          }
+        : story);
+
+      await this.stateManager.updateTask(task.id, {
+        status: 'pending',
+        completedUS,
+        storyProgress,
+        currentUS: undefined,
+        pid: undefined,
+        endTime: undefined,
+        leaseOwner: undefined,
+        leaseHeartbeatAt: undefined,
+        leaseExpiresAt: undefined,
+      });
+      appendTaskEvent(task, {
+        type: 'task_recovered_failed_finalize',
+        status: 'pending',
+        storyId: repairStoryId,
+        message: `Returned ${repairStoryId} to repair after failed finalizer attempt`,
+        data: { finalizerAttempts: attempts, repairLimit },
+      });
+      this.logger.log(`Task ${task.id} returned to pending repair for ${repairStoryId}`);
+    }
+  }
+
+  private async autoMergeTaskIfEnabled(task: Task): Promise<Partial<Task>> {
+    if (!Boolean(this.configManager.get('autoMerge'))) {
+      return {};
+    }
+
+    const delayMs = resolveAutoMergeDelayMs(this.configManager.get('autoMergeDelay'));
+    if (delayMs > 0) {
+      this.logger.log(`Task ${task.id} waiting ${delayMs}ms before auto-merge`);
+      await this.sleep(delayMs);
+    }
+
+    const targetBranch = resolveMergeTargetBranch(this.configManager.get('merge.targetBranch'));
+    const strategy = resolveMergeStrategy(this.configManager.get('merge.strategy'));
+    const pullLatest = this.configManager.get('merge.pullLatest') !== false;
+    const useIntegrationWorktree = this.configManager.get('merge.useIntegrationWorktree') !== false;
+    const configuredIntegrationDir = this.configManager.get('merge.integrationWorktreeDir');
+    const integrationWorktreeDir = typeof configuredIntegrationDir === 'string' && configuredIntegrationDir.trim()
+      ? configuredIntegrationDir.trim()
+      : undefined;
+    const syncTargetBranch = this.configManager.get('merge.syncTargetBranch') !== false;
+
+    this.logger.log(`Task ${task.id} auto-merging into ${targetBranch} (${strategy})`);
+    appendTaskEvent(task, {
+      type: 'merge_started',
+      message: `Merging into ${targetBranch} (${strategy})`,
+      data: { targetBranch, strategy },
+    });
+    const result = await this.mergeTask(task, targetBranch, strategy, {
+      pullLatest,
+      useIntegrationWorktree,
+      integrationWorktreeDir,
+      syncTargetBranch,
+    });
+
+    if (!result.success) {
+      appendTaskEvent(task, {
+        type: 'merge_failed',
+        message: result.message,
+        data: { targetBranch, strategy, hasConflicts: result.hasConflicts },
+      });
+      throw new Error(result.message);
+    }
+
+    appendTaskEvent(task, {
+      type: 'merge_completed',
+      message: result.message,
+      data: { targetBranch, strategy, commitSha: result.commitSha },
+    });
+
+    return {
+      mergedAt: Date.now(),
+      integratedAt: Date.now(),
+      mergeCommitSha: result.commitSha,
+      integrationCommitSha: result.commitSha,
+      integrationBranch: result.integrationBranch,
+      integrationWorktree: result.integrationWorktree,
+      mergeTargetBranch: targetBranch,
+      mergeStrategy: strategy,
+      mergeMessage: result.message,
+      mergeError: undefined,
+      targetSyncedAt: result.targetSynced ? Date.now() : undefined,
+      targetSyncDeferredReason: result.targetSynced === false ? result.targetSyncMessage : undefined,
+    };
   }
 
   async finalizeReadyTasks(): Promise<void> {
@@ -166,34 +397,96 @@ export class DependencyWatcher {
       .sort((a: Task, b: Task) => a.startTime - b.startTime);
 
     for (const task of readyTasks) {
-      try {
-        await this.stateManager.updateTask(task.id, {
-          status: 'finalizing',
-          pid: undefined,
-          currentUS: undefined,
-          endTime: undefined,
-        });
+      await withTaskFinalizeLock(task.id, async () => {
+        let finalizeResult: FinalizeResult | undefined;
+        let finalizerCommittedAt: number | undefined;
 
-        const result = this.finalizer(task);
+        try {
+          const latestTask = await this.stateManager.loadTask(task.id);
+          if (!latestTask || (latestTask.status !== 'ready_to_finalize' && latestTask.status !== 'failed_finalize')) {
+            return;
+          }
 
-        await this.stateManager.updateTask(task.id, {
-          status: 'completed',
-          endTime: Date.now(),
-          finalizerCommitMessage: result.commitMessage,
-          finalizerCommittedAt: result.committed ? Date.now() : undefined,
-        });
+          const finalizingAt = Date.now();
+          const leaseTimeoutMs = resolveFinalizerLeaseTimeoutMs(
+            this.configManager.get('finalizer.leaseTimeout') ?? this.configManager.get('finalizer.qualityGateTimeout')
+          );
 
-        this.logger.log(`Task ${task.id} finalized (${result.message})`);
-      } catch (error) {
-        await this.stateManager.updateTask(task.id, {
-          status: 'failed_finalize',
-          endTime: Date.now(),
-          lastError: error instanceof Error ? error.message : String(error),
-          pid: undefined,
-          currentUS: undefined,
-        });
-        this.logger.error(`Failed to finalize task ${task.id}:`, error);
-      }
+          await this.stateManager.updateTask(task.id, {
+            status: 'finalizing',
+            pid: undefined,
+            currentUS: undefined,
+            endTime: undefined,
+            leaseOwner: `finalizer:${process.pid}`,
+            leaseHeartbeatAt: finalizingAt,
+            leaseExpiresAt: finalizingAt + leaseTimeoutMs,
+          });
+          appendTaskEvent(latestTask, {
+            type: 'finalizer_started',
+            status: 'finalizing',
+            message: 'Restricted finalizer started',
+          });
+
+          const taskToFinalize = await this.stateManager.loadTask(task.id);
+          if (!taskToFinalize) {
+            throw new Error(`Task ${task.id} disappeared before finalization`);
+          }
+
+          finalizeResult = this.finalizer(taskToFinalize);
+          finalizerCommittedAt = finalizeResult.committed ? Date.now() : undefined;
+          const mergeUpdates = await this.autoMergeTaskIfEnabled(taskToFinalize);
+
+          await this.stateManager.updateTask(task.id, {
+            status: 'completed',
+            endTime: Date.now(),
+            finalizerCommitMessage: finalizeResult.commitMessage,
+            finalizerCommittedAt,
+            leaseOwner: undefined,
+            leaseHeartbeatAt: undefined,
+            leaseExpiresAt: undefined,
+            ...mergeUpdates,
+          });
+          appendTaskEvent(taskToFinalize, {
+            type: 'finalizer_completed',
+            status: 'completed',
+            message: finalizeResult.message,
+            data: {
+              committed: finalizeResult.committed,
+              commitSha: finalizeResult.commitSha,
+              commitMessage: finalizeResult.commitMessage,
+            },
+          });
+
+          const mergeSuffix = mergeUpdates.mergedAt
+            ? `; merged into ${mergeUpdates.mergeTargetBranch}`
+            : '';
+          this.logger.log(`Task ${task.id} finalized (${finalizeResult.message}${mergeSuffix})`);
+        } catch (error) {
+          const latestTask = await this.stateManager.loadTask(task.id);
+          const finalizerAttempts = (latestTask?.finalizerAttempts ?? task.finalizerAttempts ?? 0) + 1;
+          await this.stateManager.updateTask(task.id, {
+            status: 'failed_finalize',
+            endTime: Date.now(),
+            lastError: error instanceof Error ? error.message : String(error),
+            finalizerCommitMessage: finalizeResult?.commitMessage,
+            finalizerCommittedAt,
+            finalizerAttempts,
+            mergeError: error instanceof Error ? error.message : String(error),
+            pid: undefined,
+            currentUS: undefined,
+            leaseOwner: undefined,
+            leaseHeartbeatAt: undefined,
+            leaseExpiresAt: undefined,
+          });
+          appendTaskEvent(task, {
+            type: 'finalizer_failed',
+            status: 'failed_finalize',
+            message: error instanceof Error ? error.message : String(error),
+            data: { finalizerAttempts },
+          });
+          this.logger.error(`Failed to finalize task ${task.id}:`, error);
+        }
+      });
     }
   }
 
@@ -201,6 +494,12 @@ export class DependencyWatcher {
     const startedTasks = await this.scheduler.schedulePendingTasks();
 
     for (const task of startedTasks) {
+      appendTaskEvent(task, {
+        type: 'manager_started_task',
+        status: task.status,
+        message: `Manager started task ${task.id}`,
+        data: { pid: task.pid },
+      });
       this.logger.log(`Task ${task.id} started (PID: ${task.pid})`);
     }
   }

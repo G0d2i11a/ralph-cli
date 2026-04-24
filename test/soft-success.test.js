@@ -3,6 +3,7 @@ const assert = require('node:assert/strict');
 
 const {
   detectCompletionSignals,
+  hasObjectiveProgressEvidence,
   shouldTreatNonZeroExitAsSuccess,
 } = require('../dist/core/soft-success.js');
 
@@ -61,4 +62,34 @@ test('shouldTreatNonZeroExitAsSuccess rejects non-zero exit without strong compl
   });
 
   assert.equal(decision.shouldTreatAsSuccess, false);
+});
+
+test('detectCompletionSignals recognizes implemented-and-validated summaries', () => {
+  const output = `
+Implemented and validated; all acceptance criteria are covered.
+
+**Validation**
+- Passed targeted tests
+
+Suggested commit message: feat(api): continue event bus rollout
+`;
+
+  const signals = detectCompletionSignals(output);
+  assert.equal(signals.hasCompletionSummary, true);
+  assert.equal(signals.hasValidationSignal, true);
+  assert.equal(signals.hasSuggestedCommitMessage, true);
+});
+
+test('hasObjectiveProgressEvidence rejects zero-diff completion claims', () => {
+  assert.equal(hasObjectiveProgressEvidence({
+    hasProgress: true,
+    filesChanged: 0,
+    newCommits: 0,
+  }), false);
+
+  assert.equal(hasObjectiveProgressEvidence({
+    hasProgress: true,
+    filesChanged: 1,
+    newCommits: 0,
+  }), true);
 });

@@ -229,17 +229,14 @@ export function detectStagnation(
     };
   }
 
-  if (task.loopCount >= STAGNATION_THRESHOLDS.MAX_LOOPS) {
-    return {
-      isStagnant: true,
-      reason: `Exceeded max loops (${task.loopCount})`
-    };
-  }
-
   return { isStagnant: false };
 }
 
-export async function checkDependencies(prd: PRD, stateManager: StateManager): Promise<{ satisfied: boolean; pending: string[] }> {
+export async function checkDependencies(
+  prd: PRD,
+  stateManager: StateManager,
+  options: { repoPath?: string; task?: Task } = {}
+): Promise<{ satisfied: boolean; pending: string[] }> {
   if (!prd.dependencies || prd.dependencies.length === 0) {
     return { satisfied: true, pending: [] };
   }
@@ -247,8 +244,17 @@ export async function checkDependencies(prd: PRD, stateManager: StateManager): P
   const pending: string[] = [];
 
   for (const depId of prd.dependencies) {
-    const depTask = await stateManager.getTaskByPrdId(depId);
-    if (!depTask || depTask.status !== 'completed') {
+    const depTask = await stateManager.getTaskByPrdId(depId, {
+      repoPath: options.repoPath,
+    });
+
+    const isIntegrated = Boolean(
+      depTask
+      && depTask.status === 'completed'
+      && (depTask.integratedAt || depTask.integrationCommitSha || depTask.mergedAt || depTask.mergeCommitSha)
+    );
+
+    if (!isIntegrated) {
       pending.push(depId);
     }
   }

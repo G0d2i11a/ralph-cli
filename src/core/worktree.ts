@@ -1,9 +1,9 @@
-import { execSync, spawn } from 'child_process';
+import { execFileSync } from 'child_process';
 import * as path from 'path';
 import * as fs from 'fs';
 
 export class WorktreeManager {
-  async createWorktree(repoPath: string, taskId: string): Promise<string> {
+  async createWorktree(repoPath: string, taskId: string, baseRef?: string): Promise<string> {
     const worktreePath = path.join(repoPath, '.ralph-worktrees', taskId);
 
     // Ensure worktrees directory exists
@@ -12,15 +12,14 @@ export class WorktreeManager {
       fs.mkdirSync(worktreesDir, { recursive: true });
     }
 
-    // Get current branch
-    const currentBranch = execSync('git rev-parse --abbrev-ref HEAD', {
+    const resolvedBaseRef = baseRef || execFileSync('git', ['rev-parse', '--abbrev-ref', 'HEAD'], {
       cwd: repoPath,
       encoding: 'utf-8'
     }).trim();
 
     // Create worktree
     const branchName = `ralph/${taskId}`;
-    execSync(`git worktree add -b ${branchName} ${worktreePath} ${currentBranch}`, {
+    execFileSync('git', ['worktree', 'add', '-b', branchName, worktreePath, resolvedBaseRef], {
       cwd: repoPath,
       stdio: 'inherit'
     });
@@ -30,7 +29,7 @@ export class WorktreeManager {
 
   async removeWorktree(repoPath: string, worktreePath: string): Promise<void> {
     try {
-      execSync(`git worktree remove ${worktreePath} --force`, {
+      execFileSync('git', ['worktree', 'remove', worktreePath, '--force'], {
         cwd: repoPath,
         stdio: 'inherit'
       });
@@ -45,7 +44,7 @@ export class WorktreeManager {
 
   async listWorktrees(repoPath: string): Promise<string[]> {
     try {
-      const output = execSync('git worktree list --porcelain', {
+      const output = execFileSync('git', ['worktree', 'list', '--porcelain'], {
         cwd: repoPath,
         encoding: 'utf-8'
       });

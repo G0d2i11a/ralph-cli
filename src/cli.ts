@@ -14,6 +14,12 @@ import { retryCommand } from './commands/retry';
 import { resetStagnationCommand } from './commands/reset-stagnation';
 import { completionCommand } from './commands/completion';
 import { watch } from './commands/watch';
+import { managerCommand } from './commands/manager';
+import { managerInstallCommand, managerUninstallCommand } from './commands/manager-service';
+import { managerStatusCommand } from './commands/manager-status';
+import { doctorCommand } from './commands/doctor';
+import { queueCommand } from './commands/queue';
+import { cleanupCommand } from './commands/cleanup';
 import { DEFAULT_AGENT, DEFAULT_BACKEND } from './core/agent';
 
 const program = new Command();
@@ -29,6 +35,7 @@ program
   .option('--repo <path>', 'Repository path (defaults to current directory)')
   .option('--agent <name>', 'Agent to use (claude|codex)', DEFAULT_AGENT)
   .option('--backend <name>', `Backend to use (cli|agent-runners, default: ${DEFAULT_BACKEND})`)
+  .option('--allow-duplicate', 'Allow enqueueing a duplicate active PRD for the same repo')
   .addHelpText('after', `
 Examples:
   $ ralph start prd.md
@@ -106,6 +113,7 @@ program
   .option('--repo <path>', 'Repository path (defaults to current directory)')
   .option('--agent <name>', 'Agent to use (claude|codex)', DEFAULT_AGENT)
   .option('--backend <name>', `Backend to use (cli|agent-runners, default: ${DEFAULT_BACKEND})`)
+  .option('--allow-duplicate', 'Allow enqueueing duplicate active PRDs for the same repo')
   .addHelpText('after', `
 Examples:
   $ ralph batch-start prd1.md prd2.md prd3.md
@@ -149,6 +157,7 @@ program
   .option('--agent <name>', 'Agent to use (claude|codex)', DEFAULT_AGENT)
   .option('--backend <name>', `Backend to use for auto-ingested tasks (cli|agent-runners, default: ${DEFAULT_BACKEND})`)
   .option('--auto-ingest-ez4ielts', 'Auto-enqueue new ez4ielts-*.json files discovered by the watcher')
+  .option('--disable-auto-ingest-ez4ielts', 'Disable configured ez4ielts auto-ingestion for this watcher run')
   .option('--ez4ielts-dir <path>', 'Directory to scan for ez4ielts-*.json files')
   .addHelpText('after', `
 Examples:
@@ -177,9 +186,109 @@ Description:
     repo: options.repo,
     agent: options.agent,
     backend: options.backend,
-    autoIngestEz4ielts: options.autoIngestEz4ielts,
+    autoIngestEz4ielts: options.disableAutoIngestEz4ielts ? false : options.autoIngestEz4ielts,
     ez4ieltsDir: options.ez4ieltsDir,
   }));
+
+program
+  .command('manager')
+  .description('Run the canonical Ralph manager loop (schedule, recover, finalize, and optionally auto-ingest PRDs)')
+  .option('--interval <ms>', 'Polling interval in milliseconds')
+  .option('--repo <path>', 'Repository path for auto-ingested tasks (defaults to the watched docs directory parent)')
+  .option('--agent <name>', 'Agent to use (claude|codex)', DEFAULT_AGENT)
+  .option('--backend <name>', `Backend to use for auto-ingested tasks (cli|agent-runners, default: ${DEFAULT_BACKEND})`)
+  .option('--auto-ingest-ez4ielts', 'Auto-enqueue new ez4ielts-*.json files discovered by the manager')
+  .option('--disable-auto-ingest-ez4ielts', 'Disable configured ez4ielts auto-ingestion for this manager run')
+  .option('--ez4ielts-dir <path>', 'Directory to scan for ez4ielts-*.json files')
+  .addHelpText('after', `
+Examples:
+  $ ralph manager
+  $ ralph manager --auto-ingest-ez4ielts --ez4ielts-dir ~/Project/ez4ielts/docs
+
+Description:
+  Alias for the authoritative manager loop. It performs the same queue,
+  recovery, finalization, and optional auto-ingestion duties as watch, but
+  is named for the intended always-on control-plane role.`)
+  .action((options) => managerCommand({
+    interval: options.interval ? parseInt(options.interval, 10) : undefined,
+    repo: options.repo,
+    agent: options.agent,
+    backend: options.backend,
+    autoIngestEz4ielts: options.disableAutoIngestEz4ielts ? false : options.autoIngestEz4ielts,
+    ez4ieltsDir: options.ez4ieltsDir,
+  }));
+
+program
+  .command('manager-status')
+  .description('Show Ralph manager heartbeat, PID, loop timing, and stale status')
+  .option('--stale-after-ms <ms>', 'Heartbeat age threshold used to mark the manager stale')
+  .addHelpText('after', `
+Examples:
+  $ ralph manager-status
+  $ ralph manager-status --stale-after-ms 300000`)
+  .action(managerStatusCommand);
+
+program
+  .command('manager-install')
+  .description('Install a macOS launchd service that keeps the Ralph manager running')
+  .option('--label <label>', 'launchd label', 'com.ralph.manager')
+  .option('--plist <path>', 'Path to write the launchd plist')
+  .option('--interval <ms>', 'Polling interval in milliseconds')
+  .option('--repo <path>', 'Repository path for auto-ingested tasks')
+  .option('--agent <name>', 'Agent to use (claude|codex)', DEFAULT_AGENT)
+  .option('--backend <name>', `Backend to use (cli|agent-runners, default: ${DEFAULT_BACKEND})`)
+  .option('--auto-ingest-ez4ielts', 'Auto-enqueue new ez4ielts-*.json files discovered by the manager')
+  .option('--disable-auto-ingest-ez4ielts', 'Disable configured ez4ielts auto-ingestion for this launchd manager')
+  .option('--ez4ielts-dir <path>', 'Directory to scan for ez4ielts-*.json files')
+  .option('--load', 'Load and kickstart the launchd service after writing the plist')
+  .option('--dry-run', 'Print the resolved launchd config without writing or loading it')
+  .addHelpText('after', `
+Examples:
+  $ ralph manager-install --repo ~/Project/atta
+  $ ralph manager-install --repo ~/Project/atta --load
+  $ ralph manager-install --dry-run --interval 10000`)
+  .action(managerInstallCommand);
+
+program
+  .command('manager-uninstall')
+  .description('Unload and remove the macOS launchd service for the Ralph manager')
+  .option('--label <label>', 'launchd label', 'com.ralph.manager')
+  .option('--plist <path>', 'Path to the launchd plist')
+  .option('--dry-run', 'Print what would be removed without unloading or deleting')
+  .addHelpText('after', `
+Examples:
+  $ ralph manager-uninstall
+  $ ralph manager-uninstall --dry-run`)
+  .action(managerUninstallCommand);
+
+program
+  .command('doctor')
+  .description('Run preflight checks for git, repo state, agent binaries, and backend config')
+  .option('--repo <path>', 'Repository path to check (defaults to current directory)')
+  .addHelpText('after', `
+Examples:
+  $ ralph doctor
+  $ ralph doctor --repo ~/Project/my-project`)
+  .action(doctorCommand);
+
+program
+  .command('queue')
+  .description('Inspect active queue state, blockers, leases, and next actions')
+  .addHelpText('after', `
+Examples:
+  $ ralph queue`)
+  .action(queueCommand);
+
+program
+  .command('cleanup')
+  .description('Remove old terminal task worktrees according to a retention window')
+  .option('--older-than-hours <hours>', 'Only clean terminal tasks older than this many hours', '24')
+  .option('--dry-run', 'Show cleanup candidates without removing worktrees')
+  .addHelpText('after', `
+Examples:
+  $ ralph cleanup --dry-run
+  $ ralph cleanup --older-than-hours 168`)
+  .action(cleanupCommand);
 
 program
   .command('completion <shell>')

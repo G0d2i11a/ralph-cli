@@ -131,3 +131,42 @@ test('needsBootstrap treats yarn pnp installs as bootstrapped', (t) => {
 
   assert.equal(needsBootstrap(worktreePath), false);
 });
+
+test('bootstrapWorktreeDeps reuses workspace-level node_modules from repo artifacts', (t) => {
+  const worktreePath = makeTempDir(t);
+  const repoPath = makeTempDir(t);
+  const manifest = {
+    private: true,
+    workspaces: ['apps/*'],
+  };
+
+  writeJson(path.join(repoPath, 'package.json'), manifest);
+  writeFile(path.join(repoPath, 'package-lock.json'));
+  fs.mkdirSync(path.join(repoPath, 'node_modules', '.bin'), { recursive: true });
+  fs.mkdirSync(path.join(repoPath, 'apps', 'web', 'node_modules', '.bin'), { recursive: true });
+  writeJson(path.join(repoPath, 'apps', 'web', 'package.json'), {
+    scripts: { build: 'next build' },
+    dependencies: { next: '^15.0.0' },
+  });
+
+  writeJson(path.join(worktreePath, 'package.json'), manifest);
+  writeFile(path.join(worktreePath, 'package-lock.json'));
+  writeJson(path.join(worktreePath, 'apps', 'web', 'package.json'), {
+    scripts: { build: 'next build' },
+    dependencies: { next: '^15.0.0' },
+  });
+  fs.mkdirSync(path.join(worktreePath, 'apps', 'web', 'node_modules', 'next'), { recursive: true });
+
+  const result = bootstrapWorktreeDeps(worktreePath, {
+    repoPath,
+    logger: () => {},
+  });
+
+  assert.equal(result.bootstrapped, false);
+  assert.equal(fs.lstatSync(path.join(worktreePath, 'node_modules')).isSymbolicLink(), true);
+  assert.equal(fs.lstatSync(path.join(worktreePath, 'apps', 'web', 'node_modules')).isSymbolicLink(), true);
+  assert.equal(
+    fs.realpathSync.native(path.join(worktreePath, 'apps', 'web', 'node_modules')),
+    fs.realpathSync.native(path.join(repoPath, 'apps', 'web', 'node_modules')),
+  );
+});

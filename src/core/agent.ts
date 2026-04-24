@@ -52,8 +52,8 @@ export function resolveAgentBackend(value?: string): AgentBackend {
   return value === 'sdk-runner' ? 'agent-runners' : value;
 }
 
-function looksLikePath(value: string): boolean {
-  return value.includes(path.sep) || value.startsWith('.') || value.endsWith('.js');
+function looksLikeLegacyAgentRunnerPath(value: string): boolean {
+  return value.trim().endsWith('.js');
 }
 
 function resolveExistingFile(filePath?: string): string | null {
@@ -83,7 +83,7 @@ export function resolveConfiguredBackend(config: AgentConfig): AgentBackend {
     || process.env[LEGACY_SDK_RUNNER_ENV]?.trim()
     || (typeof configuredAgentRunnersPath === 'string' && configuredAgentRunnersPath.trim())
     || (typeof configRunnerPath === 'string' && configRunnerPath.trim())
-    || (typeof legacyAgentPath === 'string' && looksLikePath(legacyAgentPath))
+    || (typeof legacyAgentPath === 'string' && looksLikeLegacyAgentRunnerPath(legacyAgentPath))
   );
 
   if (!hasExplicitBackend && hasLegacySdkRunner) {
@@ -97,7 +97,7 @@ function resolveAgentRunnersCli(config: Pick<ConfigManager, 'get'>): string {
   const configuredAgentRunnersPath = config.get('agent.agentRunnersPath');
   const configRunnerPath = config.get('agent.sdkRunnerPath');
   const legacyAgentPath = config.get('agent.path');
-  const legacyCompatiblePath = typeof legacyAgentPath === 'string' && looksLikePath(legacyAgentPath)
+  const legacyCompatiblePath = typeof legacyAgentPath === 'string' && looksLikeLegacyAgentRunnerPath(legacyAgentPath)
     ? legacyAgentPath
     : undefined;
 
@@ -135,7 +135,7 @@ function resolveAgentTimeoutMs(config: Pick<ConfigManager, 'get'>): number {
   return configuredTimeout * 1000;
 }
 
-function resolveCodexCliCommand(config: Pick<ConfigManager, 'get'>): string {
+export function resolveCodexCliCommand(config: Pick<ConfigManager, 'get'>): string {
   const configuredPath = config.get('agent.path');
 
   if (typeof configuredPath === 'string' && configuredPath.trim()) {

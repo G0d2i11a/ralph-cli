@@ -1,4 +1,5 @@
 import { StateManager } from '../core/state';
+import { readTaskEvents } from '../core/events';
 import { loadTaskPRD } from '../utils/helpers';
 import * as fs from 'fs';
 import { Task } from '../types/task';
@@ -65,17 +66,24 @@ async function calculateStats(task: Task): Promise<TaskStats> {
   }
 
   const logStats = await parseLogFile(task.logPath);
+  const eventStats = parseEventStats(task);
   const completedUS = new Set(task.completedUS || []);
   const userStories: UserStoryStats[] = userStoriesFromPrd.map((userStory) => {
     const usLog = logStats.userStories[userStory.id] || {};
+    const usEvents = eventStats.userStories[userStory.id] || {};
+    const storyProgress = task.storyProgress?.find((story) => story.id === userStory.id);
     return {
       id: userStory.id,
       title: userStory.title,
-      duration: usLog.duration || 0,
-      iterations: usLog.iterations || 0,
-      status: completedUS.has(userStory.id) || userStory.passes
+      duration: usEvents.duration ?? usLog.duration ?? 0,
+      iterations: storyProgress?.attempts ?? usEvents.iterations ?? usLog.iterations ?? 0,
+      status: storyProgress?.status === 'passed' || completedUS.has(userStory.id) || userStory.passes
         ? 'completed'
-        : task.currentUS === userStory.id
+        : storyProgress?.status === 'failed'
+          ? 'failed'
+          : storyProgress?.status === 'needs_repair'
+            ? 'needs-repair'
+            : task.currentUS === userStory.id || storyProgress?.status === 'in_progress'
           ? 'in-progress'
           : 'pending'
     };
@@ -96,6 +104,47 @@ async function calculateStats(task: Task): Promise<TaskStats> {
     avgIterationTime: Math.round(avgIterationTime * 10) / 10,
     successRate: Math.round(successRate * 100) / 100
   };
+}
+
+function parseEventStats(task: Task): { userStories: Record<string, { duration?: number; iterations?: number }> } {
+  const stats = {
+    userStories: {} as Record<string, { duration?: number; iterations?: number }>
+  };
+  const events = readTaskEvents(task);
+  const storyStartTimes = new Map<string, number>();
+  const storyIterations = new Map<string, number>();
+
+  for (const event of events) {
+    if (!event.storyId) {
+      continue;
+    }
+
+    if (event.type === 'story_attempt_started') {
+      if (!storyStartTimes.has(event.storyId)) {
+        storyStartTimes.set(event.storyId, event.timestamp);
+      }
+      storyIterations.set(event.storyId, (storyIterations.get(event.storyId) || 0) + 1);
+    }
+
+    if (event.type === 'story_passed' || event.type === 'story_failed') {
+      const startedAt = storyStartTimes.get(event.storyId);
+      if (startedAt) {
+        stats.userStories[event.storyId] = {
+          duration: Math.round((event.timestamp - startedAt) / 1000),
+          iterations: storyIterations.get(event.storyId) || 1,
+        };
+      }
+    }
+  }
+
+  for (const [storyId, iterations] of storyIterations.entries()) {
+    stats.userStories[storyId] = {
+      ...stats.userStories[storyId],
+      iterations,
+    };
+  }
+
+  return stats;
 }
 
 async function parseLogFile(logPath: string): Promise<{ userStories: Record<string, { duration: number; iterations: number }> }> {
@@ -283,6 +332,7 @@ function formatStatus(status: string): string {
     ready_to_finalize: '🧹 ready_to_finalize',
     finalizing: '🧹 finalizing',
     failed: '❌ failed',
+    'needs-repair': '🛠 needs-repair',
     failed_finalize: '❌ failed_finalize',
     stagnant: '⚠️ stagnant'
   };
