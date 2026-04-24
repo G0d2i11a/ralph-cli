@@ -6,6 +6,8 @@
 
 Based on [Geoffrey Huntley's Ralph pattern](https://ghuntley.com/ralph/) and inspired by [ralph-mcp](https://github.com/G0d2i11a/ralph-mcp).
 
+Companion project: use [Ralph MCP](https://github.com/G0d2i11a/ralph-mcp) when you want the same Ralph workflow exposed as MCP tools inside Claude Code. Use Ralph CLI when you want a standalone terminal manager, launchd restart, lease/revision recovery, and a dedicated integration worktree.
+
 [中文文档](./README.zh-CN.md)
 
 ## Quick Start
@@ -555,13 +557,14 @@ src/
 
 | Feature | Ralph CLI | Ralph MCP |
 |---------|-----------|-----------|
-| **Interface** | Command line | MCP protocol (Claude Desktop) |
-| **Agent Support** | Claude Code, Codex | Claude Code only |
-| **Parallel Execution** | Automatic queueing up to configured concurrency | Automatic (Runner) |
-| **Dependency Management** | Automatic task queueing | Automatic |
-| **Stagnation Detection** | Manual reset | Automatic |
+| **Interface** | Command line and always-on manager | MCP tools plus background runner |
+| **Agent Support** | Claude Code, Codex via `cli` or `agent-runners` | Codex or Claude via `cli`, with SDK fallback |
+| **Parallel Execution** | Automatic queueing up to configured concurrency | Automatic runner concurrency |
+| **Dependency Management** | Repo-scoped integrated dependencies | Runner-managed dependencies |
+| **Stagnation Detection** | Lease recovery, revision safety, and manager health | Automatic runner progress detection |
+| **Auto-Ingestion** | `ralph watch --auto-ingest-ez4ielts` | `ralph-runner --watch-prds` |
 | **Notifications** | None | Windows Toast |
-| **Best For** | CLI users, Codex support | Claude Desktop integration |
+| **Best For** | Terminal-first automation, Codex-first workflows, finalizer/integration worktree safety | MCP-native Claude Code workflows |
 
 ## Troubleshooting
 
@@ -614,5 +617,6 @@ MIT
 ## Credits
 
 - Based on [Geoffrey Huntley's Ralph pattern](https://ghuntley.com/ralph/)
-- Inspired by [ralph-mcp](https://github.com/G0d2i11a/ralph-mcp)
+- Companion to [ralph-mcp](https://github.com/G0d2i11a/ralph-mcp)
+- Maintained by [G0d2i11a](https://github.com/G0d2i11a)
 - Built with [Commander.js](https://github.com/tj/commander.js)

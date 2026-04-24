@@ -2,6 +2,8 @@
 
 Ralph CLI 是一个面向 PRD 驱动开发的轻量命令行工具：`PRD -> ralph start -> 自动执行 -> finalize`。
 
+配套项目：[Ralph MCP](https://github.com/G0d2i11a/ralph-mcp) 把同一套 Ralph 工作流暴露成 Claude Code 里的 MCP 工具。需要独立命令行 manager、launchd 重启、lease/revision 恢复和独立 integration worktree 时，用 Ralph CLI；需要在 Claude Code/MCP 对话里执行 `ralph_start` / `ralph_status` 时，用 Ralph MCP。
+
 ## 快速开始
 
 ```bash
@@ -47,5 +49,6 @@ ralph finalize <task-id>
 - `runner.pollInterval` 在配置文件里按秒读取；CLI 的 `--interval` 仍然使用毫秒
 - `runner.stagnationTimeout` 现在按秒生效，用于把长时间没有进展的 worker 标记为 stagnant
 - 当前还没有内建通知发送能力，因此生成的配置里不会包含 `notification` 配置块
+- Ralph MCP 也支持 Codex/Claude provider 和 PRD watch；两边机制独立，建议按入口选择一个控制面管理同一批任务
 
 更完整的英文文档见 `README.md`。

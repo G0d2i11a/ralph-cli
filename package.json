@@ -18,7 +18,7 @@
     "automation",
     "development"
   ],
-  "author": "",
+  "author": "G0d2i11a <130071715+G0d2i11a@users.noreply.github.com>",
   "license": "MIT",
   "dependencies": {
     "commander": "^11.1.0",
