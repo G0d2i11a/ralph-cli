@@ -1,18 +1,26 @@
 import * as fs from 'fs';
 import * as path from 'path';
-import * as os from 'os';
 import { Task, TaskStatus } from '../types/task';
 import { parsePRD } from '../utils/helpers';
+import { getRalphPaths, RalphHomeOptions, resolveRalphHome } from './paths';
 
 export interface SaveTaskOptions {
   allowStaleWrite?: boolean;
 }
 
+interface StateManagerOptions extends RalphHomeOptions {
+  baseDir?: string;
+}
+
 export class StateManager {
   private baseDir: string;
+  private readonly ralphHome: string;
 
-  constructor() {
-    this.baseDir = path.join(os.homedir(), '.ralph', 'tasks');
+  constructor(options: StateManagerOptions = {}) {
+    this.ralphHome = resolveRalphHome(options);
+    this.baseDir = options.baseDir
+      ? path.resolve(options.baseDir)
+      : getRalphPaths(options).tasksDir;
     this.ensureBaseDir();
   }
 
@@ -24,6 +32,14 @@ export class StateManager {
 
   private getTaskDir(taskId: string): string {
     return path.join(this.baseDir, taskId);
+  }
+
+  getRalphHome(): string {
+    return this.ralphHome;
+  }
+
+  getTaskDirPath(taskId: string): string {
+    return this.getTaskDir(taskId);
   }
 
   private getStatePath(taskId: string): string {

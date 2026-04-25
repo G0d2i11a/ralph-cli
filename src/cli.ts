@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 import { Command } from 'commander';
+import * as path from 'path';
 import { startCommand } from './commands/start';
 import { batchStartCommand } from './commands/batch-start';
 import { statusCommand } from './commands/status';
@@ -27,7 +28,15 @@ const program = new Command();
 program
   .name('ralph')
   .description('PRD-driven autonomous development CLI')
-  .version('0.2.0');
+  .version('0.2.0')
+  .option('--home <path>', 'Ralph home directory (overrides RALPH_HOME)');
+
+program.hook('preAction', (_thisCommand, actionCommand) => {
+  const home = actionCommand.optsWithGlobals().home;
+  if (typeof home === 'string' && home.trim()) {
+    process.env.RALPH_HOME = path.resolve(home);
+  }
+});
 
 program
   .command('start <prd-path>')
@@ -231,7 +240,7 @@ Examples:
 program
   .command('manager-install')
   .description('Install a macOS launchd service that keeps the Ralph manager running')
-  .option('--label <label>', 'launchd label', 'com.ralph.manager')
+  .option('--label <label>', 'launchd label')
   .option('--plist <path>', 'Path to write the launchd plist')
   .option('--interval <ms>', 'Polling interval in milliseconds')
   .option('--repo <path>', 'Repository path for auto-ingested tasks')
@@ -252,7 +261,7 @@ Examples:
 program
   .command('manager-uninstall')
   .description('Unload and remove the macOS launchd service for the Ralph manager')
-  .option('--label <label>', 'launchd label', 'com.ralph.manager')
+  .option('--label <label>', 'launchd label')
   .option('--plist <path>', 'Path to the launchd plist')
   .option('--dry-run', 'Print what would be removed without unloading or deleting')
   .addHelpText('after', `

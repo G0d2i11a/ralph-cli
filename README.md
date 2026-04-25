@@ -21,6 +21,9 @@ npm link
 # Start a task (defaults to Codex on the `cli` backend)
 ralph start ./my-prd.json
 
+# Use an isolated Ralph home for a specific project
+ralph --home ~/.ralph-homes/my-project start ./my-prd.json
+
 # Check status
 ralph status
 
@@ -73,10 +76,27 @@ npm link
 
 ## Usage
 
+### Global Ralph Home
+
+Ralph now supports an explicit control-plane home directory:
+
+```bash
+ralph --home ~/.ralph-homes/app-a queue
+RALPH_HOME=~/.ralph-homes/app-b ralph manager
+```
+
+Resolution order is:
+
+1. `--home <path>`
+2. `RALPH_HOME`
+3. default `~/.ralph`
+
+Each Ralph home has its own `config.json`, `tasks/`, `manager/state.json`, `manager.lock`, `scheduler.lock`, `locks/`, `logs/`, queue view, and `runner.maxConcurrent`. This is the supported way to run two different repos on one machine with clean isolation while still sharing one Ralph CLI binary.
+
 ### Start a new task
 
 ```bash
-ralph start <prd-path> [options]
+ralph [--home <path>] start <prd-path> [options]
 
 Options:
   --repo <path>        Repository path (defaults to current directory)
@@ -131,10 +151,10 @@ When `--auto-ingest-ez4ielts` is enabled, Ralph polls the configured ez4ielts PR
 - Auto-ingested tasks default to Codex unless `--agent claude` is passed.
 - Auto-ingested tasks default to the `cli` backend unless `--backend agent-runners` is passed.
 - Auto-ingested tasks default to the watched docs directory parent as their repo unless `--repo` is passed.
-- Auto-ingest requires an explicit watch directory via `--ez4ielts-dir`, `RALPH_EZ4IELTS_WATCH_DIR`, or `ingestion.ez4ielts.watchDir`.
+- Auto-ingest requires an explicit watch directory via `--ez4ielts-dir`, `RALPH_EZ4IELTS_WATCH_DIR`, or `ingestion.ez4ielts.watchDir` in `RALPH_HOME/config.json`.
 - New files still respect dependency checks and the configured concurrency limit.
 
-You can also enable the same mode through `~/.ralph/config.json` and then run plain `ralph watch`.
+You can also enable the same mode through `RALPH_HOME/config.json` (default: `~/.ralph/config.json`) and then run plain `ralph watch`.
 
 ### Run the manager loop
 
@@ -145,24 +165,35 @@ ralph manager-status
 
 `ralph manager` is the named always-on control-plane entry point. It performs queue movement, stale lease recovery, ready-to-finalize processing, optional auto-merge, and optional ez4ielts auto-ingestion. It writes a heartbeat to `~/.ralph/manager/state.json` and holds `~/.ralph/manager.lock` so a second manager does not accidentally run the same queue.
 
+When you run multiple repos, point each one at a different Ralph home:
+
+```bash
+ralph --home ~/.ralph-homes/app-a manager --repo ~/Code/app-a
+ralph --home ~/.ralph-homes/app-b manager --repo ~/Code/app-b
+```
+
+Each home gets its own manager state and lock, so those two managers can run concurrently.
+
 Use `ralph manager-status` to inspect the current manager PID, heartbeat age, loop timing, and stale status. `ralph doctor` includes the same manager health signal in its JSON output.
 
 ### Keep the manager running with launchd
 
 ```bash
 # Inspect the launchd config that would be generated
-ralph manager-install --dry-run --repo ~/Project/atta --disable-auto-ingest-ez4ielts
+ralph --home ~/.ralph-homes/atta manager-install --dry-run --repo ~/Project/atta --disable-auto-ingest-ez4ielts
 
 # Install and start the always-on manager for the current macOS user
-ralph manager-install --repo ~/Project/atta --disable-auto-ingest-ez4ielts --load
+ralph --home ~/.ralph-homes/atta manager-install --repo ~/Project/atta --disable-auto-ingest-ez4ielts --load
 
 # Remove the launchd service
-ralph manager-uninstall
+ralph --home ~/.ralph-homes/atta manager-uninstall
 ```
 
 Ralph intentionally does not self-daemonize. The CLI owns internal health, heartbeat, lock, queue recovery, and status reporting; macOS `launchd` owns process restart via `KeepAlive`. This keeps restart behavior inspectable with normal OS tooling while avoiding duplicate manager loops.
 
-Use `--disable-auto-ingest-ez4ielts` when you want the manager to process only the existing Ralph queue and not inherit a global `ingestion.ez4ielts.enabled=true` setting from `~/.ralph/config.json`.
+Use `--disable-auto-ingest-ez4ielts` when you want the manager to process only the existing Ralph queue and not inherit a `ingestion.ez4ielts.enabled=true` setting from `RALPH_HOME/config.json`.
+
+For the default home, launchd still uses the legacy label `com.ralph.manager`. For custom Ralph homes, `manager-install` derives a stable home-specific label such as `com.ralph.manager.<hash>` and writes logs under `<RALPH_HOME>/logs/`.
 
 ### Inspect the active queue
 

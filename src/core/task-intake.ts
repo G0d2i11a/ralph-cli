@@ -1,5 +1,4 @@
 import * as fs from 'fs';
-import * as os from 'os';
 import * as path from 'path';
 import { createHash } from 'crypto';
 import { execFileSync } from 'child_process';
@@ -10,14 +9,17 @@ import { StateManager } from './state';
 import { generateTaskId, parsePRD, saveTaskPRD } from '../utils/helpers';
 import { Task, TaskStatus } from '../types/task';
 import { appendTaskEvent } from './events';
+import { getRalphPaths, RalphHomeOptions } from './paths';
 
-export interface EnqueueTaskOptions {
+type TaskStateStore = Pick<StateManager, 'saveTask' | 'loadTask' | 'listTasks'> & Partial<Pick<StateManager, 'getTaskDirPath'>>;
+
+export interface EnqueueTaskOptions extends RalphHomeOptions {
   repoPath?: string;
   agent?: string;
   backend?: string;
   dedupeByPrdPath?: boolean;
   allowDuplicate?: boolean;
-  stateManager?: StateManager;
+  stateManager?: TaskStateStore;
   scheduler?: TaskScheduler;
   configManager?: Pick<ConfigManager, 'get'> & Partial<Pick<ConfigManager, 'has'>>;
   now?: () => number;
@@ -72,7 +74,7 @@ function resolveIntendedMergeTarget(configManager: Pick<ConfigManager, 'get'>): 
 }
 
 async function findActiveDuplicateTask(input: {
-  stateManager: StateManager;
+  stateManager: TaskStateStore;
   repoPath: string;
   prdId: string;
   prdPath: string;
@@ -105,12 +107,19 @@ export async function enqueueTaskFromPrd(
   const resolvedPrdPath = path.resolve(prdPath);
   const repoPath = path.resolve(options.repoPath || process.cwd());
   const agent = resolveAgentType(options.agent);
-  const configManager = options.configManager ?? new ConfigManager();
+  const configManager = options.configManager ?? new ConfigManager(options);
   const backend = options.backend
     ? resolveAgentBackend(options.backend)
     : resolveConfiguredBackend(configManager);
-  const stateManager = options.stateManager ?? new StateManager();
-  const scheduler = options.scheduler ?? new TaskScheduler({ stateManager });
+  const stateManager = options.stateManager ?? new StateManager(options);
+  const schedulerStateManager = stateManager instanceof StateManager
+    ? stateManager
+    : new StateManager(options);
+  const scheduler = options.scheduler ?? new TaskScheduler({
+    stateManager: schedulerStateManager,
+    ralphHome: options.ralphHome,
+    homeDir: options.homeDir,
+  });
   const now = options.now ?? (() => Date.now());
 
   const prd = parsePRD(resolvedPrdPath);
@@ -139,7 +148,9 @@ export async function enqueueTaskFromPrd(
   }
 
   const taskId = generateTaskId();
-  const logDir = path.join(os.homedir(), '.ralph', 'tasks', taskId);
+  const logDir = typeof stateManager.getTaskDirPath === 'function'
+    ? stateManager.getTaskDirPath(taskId)
+    : path.join(getRalphPaths(options).tasksDir, taskId);
   const logPath = path.join(logDir, 'agent.log');
   const eventLogPath = path.join(logDir, 'events.jsonl');
 

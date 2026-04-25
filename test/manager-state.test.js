@@ -123,3 +123,36 @@ test('getManagerStatus distinguishes dead manager PIDs from active managers', ()
     fs.rmSync(homeDir, { recursive: true, force: true });
   }
 });
+
+test('manager state paths use RALPH_HOME directly when provided', () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-manager-custom-home-'));
+  const ralphHome = path.join(tempDir, 'custom-home');
+
+  try {
+    writeManagerState({
+      pid: 777,
+      status: 'running',
+      startedAt: 1000,
+      updatedAt: 1000,
+      lastHeartbeatAt: 1000,
+      pollIntervalMs: 1000,
+      autoIngestEnabled: false,
+      hostname: 'test-host',
+      argv: ['ralph', 'manager'],
+    }, { ralphHome });
+
+    const status = getManagerStatus({
+      ralphHome,
+      now: () => 2000,
+      isProcessRunning: () => false,
+    });
+
+    assert.equal(status.ralphHome, ralphHome);
+    assert.equal(status.statePath, path.join(ralphHome, 'manager', 'state.json'));
+    assert.equal(status.lockDir, path.join(ralphHome, 'manager.lock'));
+    assert.equal(fs.existsSync(getManagerStatePath({ ralphHome })), true);
+    assert.equal(fs.existsSync(path.join(ralphHome, '.ralph', 'manager', 'state.json')), false);
+  } finally {
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+});

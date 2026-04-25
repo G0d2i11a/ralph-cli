@@ -30,9 +30,11 @@ function createTask(overrides = {}) {
 test('StateManager rejects stale full-object writes and accepts patch updates', async () => {
   const homeDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-state-revision-'));
   const previousHome = process.env.HOME;
+  const previousRalphHome = process.env.RALPH_HOME;
 
   try {
     process.env.HOME = homeDir;
+    delete process.env.RALPH_HOME;
     const stateManager = new StateManager();
 
     const originalTask = createTask();
@@ -63,6 +65,42 @@ test('StateManager rejects stale full-object writes and accepts patch updates', 
     assert.equal(latestTask.revision, 3);
   } finally {
     process.env.HOME = previousHome;
+    if (previousRalphHome === undefined) {
+      delete process.env.RALPH_HOME;
+    } else {
+      process.env.RALPH_HOME = previousRalphHome;
+    }
+    fs.rmSync(homeDir, { recursive: true, force: true });
+  }
+});
+
+test('StateManager isolates task storage by RALPH_HOME', async () => {
+  const homeDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-state-home-'));
+  const customHomeA = path.join(homeDir, 'ralph-a');
+  const customHomeB = path.join(homeDir, 'ralph-b');
+  const previousHome = process.env.HOME;
+  const previousRalphHome = process.env.RALPH_HOME;
+
+  try {
+    process.env.HOME = homeDir;
+    process.env.RALPH_HOME = customHomeA;
+    const stateManagerA = new StateManager();
+    await stateManagerA.saveTask(createTask({ id: 'task-a' }));
+
+    process.env.RALPH_HOME = customHomeB;
+    const stateManagerB = new StateManager();
+
+    assert.equal((await stateManagerA.listTasks()).length, 1);
+    assert.equal((await stateManagerB.listTasks()).length, 0);
+    assert.equal(fs.existsSync(path.join(customHomeA, 'tasks', 'task-a', 'state.json')), true);
+    assert.equal(fs.existsSync(path.join(customHomeB, 'tasks', 'task-a', 'state.json')), false);
+  } finally {
+    process.env.HOME = previousHome;
+    if (previousRalphHome === undefined) {
+      delete process.env.RALPH_HOME;
+    } else {
+      process.env.RALPH_HOME = previousRalphHome;
+    }
     fs.rmSync(homeDir, { recursive: true, force: true });
   }
 });

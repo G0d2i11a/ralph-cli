@@ -136,6 +136,7 @@ function createScheduler(tasks, prds, options = {}) {
   );
 
   const scheduler = new TaskScheduler({
+    ralphHome: options.ralphHome,
     stateManager,
     configManager: {
       get: (key) => {
@@ -159,7 +160,8 @@ function createScheduler(tasks, prds, options = {}) {
     isProcessRunning: options.isProcessRunning || (() => true),
     lockDir,
     now: options.now,
-    forkProcess: (_modulePath, args) => {
+    forkProcess: (_modulePath, args, forkOptions) => {
+      options.onFork?.(forkOptions);
       forkCalls.push(args[0]);
       return {
         pid: nextPid++,
@@ -175,6 +177,35 @@ function createScheduler(tasks, prds, options = {}) {
     forkCalls,
   };
 }
+
+test('schedulePendingTasks passes RALPH_HOME to worker processes', async () => {
+  const ralphHome = path.join(os.tmpdir(), `ralph-worker-home-${process.pid}-${Date.now()}`);
+  let capturedEnv;
+  const pendingTask = createTask({
+    id: 'pending-env-task',
+    prdId: 'pending-env-task',
+    prdPath: '/pending-env-task.json',
+    startTime: 100,
+  });
+
+  const { scheduler } = createScheduler(
+    [pendingTask],
+    {
+      '/pending-env-task.json': { id: 'pending-env-task', dependencies: [] },
+    },
+    {
+      maxConcurrent: 1,
+      ralphHome,
+      onFork: (forkOptions) => {
+        capturedEnv = forkOptions.env;
+      },
+    }
+  );
+
+  await scheduler.schedulePendingTasks();
+
+  assert.equal(capturedEnv.RALPH_HOME, ralphHome);
+});
 
 test('schedulePendingTasks respects maxConcurrent and starts oldest queued task first', async () => {
   const runningTask = createTask({

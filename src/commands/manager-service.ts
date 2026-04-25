@@ -3,6 +3,7 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import { WatchCommandOptions } from '../core/dependency-watcher';
+import { getRalphPaths, hashRalphHome, isDefaultRalphHome, resolveRalphHome } from '../core/paths';
 
 interface ManagerInstallOptions extends WatchCommandOptions {
   label?: string;
@@ -26,6 +27,17 @@ function resolveLaunchAgentDir(): string {
 
 function resolvePlistPath(label: string, plistPath?: string): string {
   return path.resolve(plistPath || path.join(resolveLaunchAgentDir(), `${label}.plist`));
+}
+
+function resolveManagerLabel(label?: string): string {
+  if (typeof label === 'string' && label.trim()) {
+    return label.trim();
+  }
+
+  const ralphHome = resolveRalphHome();
+  return isDefaultRalphHome(ralphHome)
+    ? DEFAULT_LABEL
+    : `${DEFAULT_LABEL}.${hashRalphHome(ralphHome)}`;
 }
 
 function resolveCliPath(): string {
@@ -54,6 +66,7 @@ function envEntries(): string {
   const envKeys = [
     'PATH',
     'HOME',
+    'RALPH_HOME',
     'SHELL',
     'HTTP_PROXY',
     'HTTPS_PROXY',
@@ -166,9 +179,10 @@ function ensureParentDir(filePath: string): void {
 }
 
 export async function managerInstallCommand(options: ManagerInstallOptions = {}): Promise<void> {
-  const label = options.label || DEFAULT_LABEL;
+  const ralphHome = resolveRalphHome();
+  const label = resolveManagerLabel(options.label);
   const plistPath = resolvePlistPath(label, options.plist);
-  const logDir = path.join(os.homedir(), '.ralph', 'logs');
+  const logDir = getRalphPaths({ ralphHome }).logsDir;
   const stdoutPath = path.join(logDir, 'manager.out.log');
   const stderrPath = path.join(logDir, 'manager.err.log');
   const cliPath = resolveCliPath();
@@ -200,6 +214,7 @@ export async function managerInstallCommand(options: ManagerInstallOptions = {})
     ok: true,
     dryRun: Boolean(options.dryRun),
     loaded: Boolean(options.load && !options.dryRun),
+    ralphHome,
     label,
     plistPath,
     cliPath,
@@ -210,7 +225,8 @@ export async function managerInstallCommand(options: ManagerInstallOptions = {})
 }
 
 export async function managerUninstallCommand(options: ManagerUninstallOptions = {}): Promise<void> {
-  const label = options.label || DEFAULT_LABEL;
+  const ralphHome = resolveRalphHome();
+  const label = resolveManagerLabel(options.label);
   const plistPath = resolvePlistPath(label, options.plist);
   let unloaded = false;
   let removed = false;
@@ -234,6 +250,7 @@ export async function managerUninstallCommand(options: ManagerUninstallOptions =
   console.log(JSON.stringify({
     ok: true,
     dryRun: Boolean(options.dryRun),
+    ralphHome,
     label,
     plistPath,
     unloaded,

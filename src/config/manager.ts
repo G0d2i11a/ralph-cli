@@ -1,6 +1,6 @@
 import * as fs from 'fs';
 import * as path from 'path';
-import * as os from 'os';
+import { getRalphPaths, RalphHomeOptions } from '../core/paths';
 
 export type RalphMergeStrategy = 'manual' | 'ours' | 'theirs';
 
@@ -45,6 +45,10 @@ export interface RalphConfig {
     qualityGates: string[];
     maxRepairAttempts: number;
   };
+}
+
+interface ConfigManagerOptions extends RalphHomeOptions {
+  configPath?: string;
 }
 
 const DEFAULT_CONFIG: RalphConfig = {
@@ -125,12 +129,15 @@ export class ConfigManager {
   private config: RalphConfig;
   private rawConfig: Record<string, unknown> = {};
 
-  constructor() {
-    const ralphDir = path.join(os.homedir(), '.ralph');
+  constructor(options: ConfigManagerOptions = {}) {
+    const paths = getRalphPaths(options);
+    const ralphDir = paths.ralphHome;
     if (!fs.existsSync(ralphDir)) {
       fs.mkdirSync(ralphDir, { recursive: true });
     }
-    this.configPath = path.join(ralphDir, 'config.json');
+    this.configPath = options.configPath
+      ? path.resolve(options.configPath)
+      : paths.configPath;
     this.config = this.load();
   }
 

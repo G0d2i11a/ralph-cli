@@ -53,6 +53,44 @@ test('queue command reports active queue state', () => {
   }
 });
 
+test('queue command honors the global --home option', () => {
+  const homeDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-queue-global-home-'));
+  const customHome = path.join(homeDir, 'custom-ralph-home');
+
+  try {
+    const taskDir = path.join(customHome, 'tasks', 'pending-task');
+    fs.mkdirSync(taskDir, { recursive: true });
+    fs.writeFileSync(path.join(taskDir, 'state.json'), JSON.stringify({
+      id: 'pending-task',
+      prdPath: '/tmp/prd.json',
+      prdId: 'pending-prd',
+      prdDependencies: [],
+      status: 'pending',
+      startTime: Date.now(),
+      completedUS: [],
+      worktree: '',
+      logPath: path.join(taskDir, 'agent.log'),
+      agent: 'codex',
+      repoPath: '/tmp/repo',
+      loopCount: 0,
+      consecutiveNoProgress: 0,
+      consecutiveErrors: 0,
+      lastProgressTime: Date.now(),
+      lastFilesChanged: 0,
+    }, null, 2));
+
+    const result = runCli(['--home', customHome, 'queue'], { HOME: homeDir });
+    const output = JSON.parse(result.stdout);
+
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(output.ralphHome, customHome);
+    assert.equal(output.tasks.length, 1);
+    assert.equal(output.tasks[0].id, 'pending-task');
+  } finally {
+    fs.rmSync(homeDir, { recursive: true, force: true });
+  }
+});
+
 test('doctor command returns preflight JSON', () => {
   const homeDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-doctor-home-'));
   const repoDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-doctor-repo-'));
@@ -142,6 +180,34 @@ test('manager-install dry-run resolves launchd manager config without writing pl
     ]);
     assert.ok(output.managerArgs.includes('--disable-auto-ingest-ez4ielts'));
     assert.equal(fs.existsSync(plistPath), false);
+  } finally {
+    fs.rmSync(homeDir, { recursive: true, force: true });
+    fs.rmSync(repoDir, { recursive: true, force: true });
+  }
+});
+
+test('manager-install defaults to a home-specific label and log paths for custom Ralph homes', () => {
+  const homeDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-manager-install-custom-home-'));
+  const customHome = path.join(homeDir, 'custom-ralph-home');
+  const repoDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-manager-install-custom-repo-'));
+
+  try {
+    const result = runCli([
+      '--home',
+      customHome,
+      'manager-install',
+      '--dry-run',
+      '--repo',
+      repoDir,
+      '--disable-auto-ingest-ez4ielts',
+    ], { HOME: homeDir });
+    const output = JSON.parse(result.stdout);
+
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(output.ralphHome, customHome);
+    assert.match(output.label, /^com\.ralph\.manager\.[0-9a-f]{8}$/);
+    assert.equal(output.stdoutPath, path.join(customHome, 'logs', 'manager.out.log'));
+    assert.equal(output.stderrPath, path.join(customHome, 'logs', 'manager.err.log'));
   } finally {
     fs.rmSync(homeDir, { recursive: true, force: true });
     fs.rmSync(repoDir, { recursive: true, force: true });

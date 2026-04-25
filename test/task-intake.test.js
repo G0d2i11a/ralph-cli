@@ -165,3 +165,37 @@ test('enqueueTaskFromPrd records the repo base ref before a queued task starts',
     fs.rmSync(tempDir, { recursive: true, force: true });
   }
 });
+
+test('enqueueTaskFromPrd writes task artifacts under RALPH_HOME', async () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-intake-home-'));
+  const customHome = path.join(tempDir, 'custom-ralph-home');
+  const previousHome = process.env.HOME;
+  const previousRalphHome = process.env.RALPH_HOME;
+
+  try {
+    process.env.HOME = tempDir;
+    process.env.RALPH_HOME = customHome;
+    const prdPath = createPrdFile(tempDir, 'home-prd');
+    const stateManager = new FakeStateManager();
+    const scheduler = new NoopScheduler();
+
+    const result = await enqueueTaskFromPrd(prdPath, {
+      repoPath: tempDir,
+      stateManager,
+      scheduler,
+      configManager: { get: () => undefined },
+    });
+
+    assert.equal(fs.existsSync(path.join(customHome, 'tasks', result.taskId, 'agent.log')), false);
+    assert.equal(fs.existsSync(path.join(customHome, 'tasks', result.taskId)), true);
+    assert.equal(fs.existsSync(path.join(tempDir, '.ralph', 'tasks', result.taskId)), false);
+  } finally {
+    process.env.HOME = previousHome;
+    if (previousRalphHome === undefined) {
+      delete process.env.RALPH_HOME;
+    } else {
+      process.env.RALPH_HOME = previousRalphHome;
+    }
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+});

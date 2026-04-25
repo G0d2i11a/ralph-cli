@@ -1,5 +1,4 @@
 import * as fs from 'fs';
-import * as os from 'os';
 import * as path from 'path';
 import { ChildProcess, execFileSync, fork, ForkOptions } from 'child_process';
 import { ConfigManager } from '../config/manager';
@@ -8,6 +7,7 @@ import { Task, TaskStatus } from '../types/task';
 import { checkDependencies, isProcessRunning, parsePRD } from '../utils/helpers';
 import { bootstrapWorktreeDeps } from './bootstrap';
 import { appendTaskEvent } from './events';
+import { getRalphPaths, RalphHomeOptions, resolveRalphHome } from './paths';
 import { StateManager } from './state';
 import { WorktreeManager } from './worktree';
 
@@ -28,7 +28,7 @@ type DependencyChecker = (
 ) => Promise<DependencyResult>;
 type ProcessChecker = (pid: number) => boolean;
 
-export interface SchedulerDeps {
+export interface SchedulerDeps extends RalphHomeOptions {
   stateManager?: StateManager;
   worktreeManager?: Pick<WorktreeManager, 'createWorktree'>;
   configManager?: Pick<ConfigManager, 'get'>;
@@ -106,11 +106,13 @@ export class TaskScheduler {
   private readonly sleep: (ms: number) => Promise<void>;
   private readonly lockDir: string;
   private readonly lockInfoPath: string;
+  private readonly ralphHome: string;
 
   constructor(deps: SchedulerDeps = {}) {
-    this.stateManager = deps.stateManager ?? new StateManager();
+    this.ralphHome = resolveRalphHome(deps);
+    this.stateManager = deps.stateManager ?? new StateManager(deps);
     this.worktreeManager = deps.worktreeManager ?? new WorktreeManager();
-    this.configManager = deps.configManager ?? new ConfigManager();
+    this.configManager = deps.configManager ?? new ConfigManager(deps);
     this.bootstrapWorktreeDepsFn = deps.bootstrapWorktreeDeps ?? bootstrapWorktreeDeps;
     this.parsePRDFn = deps.parsePRD ?? parsePRD;
     this.checkDependenciesFn = deps.checkDependencies ?? checkDependencies;
@@ -118,7 +120,7 @@ export class TaskScheduler {
     this.isProcessRunningFn = deps.isProcessRunning ?? isProcessRunning;
     this.now = deps.now ?? (() => Date.now());
     this.sleep = deps.sleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
-    this.lockDir = deps.lockDir ?? path.join(os.homedir(), '.ralph', 'scheduler.lock');
+    this.lockDir = deps.lockDir ?? getRalphPaths(deps).schedulerLockDir;
     this.lockInfoPath = path.join(this.lockDir, 'owner.json');
   }
 
@@ -401,6 +403,10 @@ export class TaskScheduler {
       const child = this.forkProcessFn(workerPath, [currentTask.id], {
         detached: true,
         stdio: 'ignore',
+        env: {
+          ...process.env,
+          RALPH_HOME: this.ralphHome,
+        },
       });
 
       child.unref?.();

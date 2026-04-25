@@ -2,6 +2,7 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import { isProcessRunning } from '../utils/helpers';
+import { getRalphPaths, resolveRalphHome } from './paths';
 
 export type ManagerStateStatus = 'running' | 'stopping' | 'stopped' | 'error';
 
@@ -26,6 +27,7 @@ export interface ManagerRuntimeState {
 }
 
 export interface ManagerStatus {
+  ralphHome: string;
   statePath: string;
   lockDir: string;
   state: ManagerRuntimeState | null;
@@ -41,21 +43,24 @@ export interface ManagerStatus {
 
 export interface ManagerStatePaths {
   homeDir?: string;
+  ralphHome?: string;
   managerDir?: string;
 }
 
 export const DEFAULT_MANAGER_HEARTBEAT_STALE_MS = 15 * 60 * 1000;
 
 export function getManagerDir(options: ManagerStatePaths = {}): string {
-  return options.managerDir || path.join(options.homeDir || os.homedir(), '.ralph', 'manager');
+  return options.managerDir || getRalphPaths(options).managerDir;
 }
 
 export function getManagerStatePath(options: ManagerStatePaths = {}): string {
-  return path.join(getManagerDir(options), 'state.json');
+  return options.managerDir
+    ? path.join(getManagerDir(options), 'state.json')
+    : getRalphPaths(options).managerStatePath;
 }
 
 export function getManagerLockDir(options: ManagerStatePaths = {}): string {
-  return path.join(options.homeDir || os.homedir(), '.ralph', 'manager.lock');
+  return getRalphPaths(options).managerLockDir;
 }
 
 function ensureParentDir(filePath: string): void {
@@ -227,6 +232,7 @@ export function getManagerStatus(options: ManagerStatePaths & {
     return {
       statePath: getManagerStatePath(options),
       lockDir: getManagerLockDir(options),
+      ralphHome: resolveRalphHome(options),
       state: null,
       stateExists: false,
       processRunning: false,
@@ -259,6 +265,7 @@ export function getManagerStatus(options: ManagerStatePaths & {
   return {
     statePath: getManagerStatePath(options),
     lockDir: getManagerLockDir(options),
+    ralphHome: resolveRalphHome(options),
     stateExists: true,
     state,
     processRunning,

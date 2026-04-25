@@ -1,7 +1,7 @@
 import { createHash } from 'crypto';
 import * as fs from 'fs';
-import * as os from 'os';
 import * as path from 'path';
+import { getRalphPaths, RalphHomeOptions } from './paths';
 
 const LOCK_RETRY_MS = 50;
 const LOCK_TIMEOUT_MS = 30000;
@@ -13,6 +13,8 @@ interface LockOptions {
   timeoutMs?: number;
   staleMs?: number;
 }
+
+export interface RalphLockOptions extends LockOptions, RalphHomeOptions {}
 
 function sanitizeSegment(value: string): string {
   const sanitized = value.replace(/[^a-zA-Z0-9._-]+/g, '-');
@@ -109,29 +111,31 @@ export async function withDirectoryLock<T>(
   }
 }
 
-export function getTaskFinalizeLockDir(taskId: string): string {
-  return path.join(os.homedir(), '.ralph', 'locks', 'finalize', sanitizeSegment(taskId));
+export function getTaskFinalizeLockDir(taskId: string, options: RalphHomeOptions = {}): string {
+  return path.join(getRalphPaths(options).locksDir, 'finalize', sanitizeSegment(taskId));
 }
 
-export function getRepoMergeLockDir(repoPath: string): string {
+export function getRepoMergeLockDir(repoPath: string, options: RalphHomeOptions = {}): string {
   const resolvedRepoPath = path.resolve(repoPath);
   const repoSlug = sanitizeSegment(path.basename(resolvedRepoPath));
   const repoHash = createHash('sha1').update(resolvedRepoPath).digest('hex');
-  return path.join(os.homedir(), '.ralph', 'locks', 'merge', `${repoSlug}-${repoHash}`);
+  return path.join(getRalphPaths(options).locksDir, 'merge', `${repoSlug}-${repoHash}`);
 }
 
 export async function withTaskFinalizeLock<T>(
   taskId: string,
   operation: () => Promise<T>,
-  options: LockOptions = {}
+  options: RalphLockOptions = {}
 ): Promise<T> {
-  return withDirectoryLock(getTaskFinalizeLockDir(taskId), operation, options);
+  const { ralphHome, homeDir, ...lockOptions } = options;
+  return withDirectoryLock(getTaskFinalizeLockDir(taskId, { ralphHome, homeDir }), operation, lockOptions);
 }
 
 export async function withRepoMergeLock<T>(
   repoPath: string,
   operation: () => Promise<T>,
-  options: LockOptions = {}
+  options: RalphLockOptions = {}
 ): Promise<T> {
-  return withDirectoryLock(getRepoMergeLockDir(repoPath), operation, options);
+  const { ralphHome, homeDir, ...lockOptions } = options;
+  return withDirectoryLock(getRepoMergeLockDir(repoPath, { ralphHome, homeDir }), operation, lockOptions);
 }

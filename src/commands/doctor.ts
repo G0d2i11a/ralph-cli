@@ -4,6 +4,7 @@ import * as path from 'path';
 import { ConfigManager } from '../config/manager';
 import { resolveCodexCliCommand, resolveConfiguredBackend } from '../core/agent';
 import { getManagerStatus } from '../core/manager-state';
+import { resolveRalphHome } from '../core/paths';
 
 interface DoctorCheck {
   name: string;
@@ -69,15 +70,27 @@ function hasDirtyWorktree(repoPath: string): boolean {
   }
 }
 
+function hasWritableRalphHome(ralphHome: string): boolean {
+  try {
+    fs.mkdirSync(ralphHome, { recursive: true });
+    fs.accessSync(ralphHome, fs.constants.W_OK);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 export async function doctorCommand(options: { repo?: string } = {}): Promise<void> {
   const repoPath = path.resolve(options.repo || process.cwd());
-  const configManager = new ConfigManager();
+  const ralphHome = resolveRalphHome();
+  const configManager = new ConfigManager({ ralphHome });
   const backend = resolveConfiguredBackend(configManager);
   const codexCommand = resolveCodexCliCommand(configManager);
   const repoIsGit = isGitRepo(repoPath);
   const repoIsDirty = repoIsGit && hasDirtyWorktree(repoPath);
   const usesIntegrationWorktree = configManager.get('merge.useIntegrationWorktree') !== false;
-  const managerStatus = getManagerStatus();
+  const managerStatus = getManagerStatus({ ralphHome });
+  const ralphHomeWritable = hasWritableRalphHome(ralphHome);
   const managerCheckOk = !managerStatus.stateExists
     || managerStatus.state?.status !== 'running'
     || (managerStatus.processRunning && !managerStatus.heartbeatStale);
@@ -87,6 +100,13 @@ export async function doctorCommand(options: { repo?: string } = {}): Promise<vo
     || resolveFile(process.env.RALPH_SDK_RUNNER_CLI);
 
   const checks: DoctorCheck[] = [
+    {
+      name: 'ralph.home',
+      ok: ralphHomeWritable,
+      message: ralphHomeWritable
+        ? `Ralph home is writable: ${ralphHome}`
+        : `Ralph home is not writable: ${ralphHome}`,
+    },
     {
       name: 'git',
       ok: commandExists('git'),
@@ -139,6 +159,7 @@ export async function doctorCommand(options: { repo?: string } = {}): Promise<vo
   const ok = checks.every((check) => check.ok);
   console.log(JSON.stringify({
     ok,
+    ralphHome,
     repoPath,
     backend,
     manager: managerStatus,

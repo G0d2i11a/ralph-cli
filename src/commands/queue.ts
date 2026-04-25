@@ -1,6 +1,7 @@
 import { StateManager } from '../core/state';
 import { TaskScheduler } from '../core/scheduler';
 import { Task } from '../types/task';
+import { resolveRalphHome } from '../core/paths';
 
 interface PendingSummary {
   reason: 'dependencies' | 'queued';
@@ -77,6 +78,7 @@ function resolveNextAction(task: Task, pendingState?: PendingSummary): string {
 export async function queueCommand(): Promise<void> {
   const stateManager = new StateManager();
   const scheduler = new TaskScheduler({ stateManager });
+  const ralphHome = resolveRalphHome();
   await scheduler.recoverStaleTasks();
 
   const tasks = await stateManager.listTasks();
@@ -97,6 +99,7 @@ export async function queueCommand(): Promise<void> {
   }
 
   console.log(JSON.stringify({
+    ralphHome,
     tasks: output,
   }));
 }

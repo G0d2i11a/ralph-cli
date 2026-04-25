@@ -118,7 +118,7 @@ function resolveAgentRunnersCli(config: Pick<ConfigManager, 'get'>): string {
     }
   }
 
-  throw new Error('Unable to find agent-runners CLI. Set `RALPH_AGENT_RUNNERS_CLI` or `agent.agentRunnersPath` in `~/.ralph/config.json`. Legacy `RALPH_SDK_RUNNER_CLI` and `agent.sdkRunnerPath` are also supported.');
+  throw new Error('Unable to find agent-runners CLI. Set `RALPH_AGENT_RUNNERS_CLI` or `agent.agentRunnersPath` in `RALPH_HOME/config.json` (default: `~/.ralph/config.json`). Legacy `RALPH_SDK_RUNNER_CLI` and `agent.sdkRunnerPath` are also supported.');
 }
 
 function resolveAgentTimeoutMs(config: Pick<ConfigManager, 'get'>): number {

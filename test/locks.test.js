@@ -1,7 +1,12 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const os = require('node:os');
+const path = require('node:path');
 
 const {
+  getRepoMergeLockDir,
+  getTaskFinalizeLockDir,
   withRepoMergeLock,
   withTaskFinalizeLock,
 } = require('../dist/core/locks.js');
@@ -75,4 +80,28 @@ test('withRepoMergeLock serializes concurrent callers for the same repository', 
     'second-start',
     'second-end',
   ]);
+});
+
+test('lock directories are isolated across different Ralph homes', async () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-lock-home-'));
+  const homeA = path.join(tempDir, 'ralph-a');
+  const homeB = path.join(tempDir, 'ralph-b');
+  const taskLockA = getTaskFinalizeLockDir('shared-task', { ralphHome: homeA });
+  const taskLockB = getTaskFinalizeLockDir('shared-task', { ralphHome: homeB });
+  const mergeLockA = getRepoMergeLockDir('/tmp/repo', { ralphHome: homeA });
+  const mergeLockB = getRepoMergeLockDir('/tmp/repo', { ralphHome: homeB });
+
+  try {
+    assert.notEqual(taskLockA, taskLockB);
+    assert.notEqual(mergeLockA, mergeLockB);
+
+    await Promise.all([
+      withTaskFinalizeLock('shared-task', async () => {}, { ralphHome: homeA }),
+      withTaskFinalizeLock('shared-task', async () => {}, { ralphHome: homeB }),
+      withRepoMergeLock('/tmp/repo', async () => {}, { ralphHome: homeA }),
+      withRepoMergeLock('/tmp/repo', async () => {}, { ralphHome: homeB }),
+    ]);
+  } finally {
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
 });

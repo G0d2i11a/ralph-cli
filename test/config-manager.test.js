@@ -7,13 +7,20 @@ const path = require('node:path');
 function withTempHome(testFn) {
   return async () => {
     const previousHome = process.env.HOME;
+    const previousRalphHome = process.env.RALPH_HOME;
     const homeDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-config-home-'));
 
     try {
       process.env.HOME = homeDir;
+      delete process.env.RALPH_HOME;
       await testFn(homeDir);
     } finally {
       process.env.HOME = previousHome;
+      if (previousRalphHome === undefined) {
+        delete process.env.RALPH_HOME;
+      } else {
+        process.env.RALPH_HOME = previousRalphHome;
+      }
       fs.rmSync(homeDir, { recursive: true, force: true });
       delete require.cache[require.resolve('../dist/config/manager.js')];
       delete require.cache[require.resolve('../dist/core/agent.js')];
@@ -60,6 +67,18 @@ test('ConfigManager defaults agent.backend to cli', withTempHome(async () => {
   assert.equal(manager.get('merge.integrationWorktreeDir'), '.ralph-integration');
   assert.equal(manager.get('merge.syncTargetBranch'), true);
   assert.equal(manager.get('finalizer.qualityGateTimeout'), 600);
+}));
+
+test('ConfigManager uses RALPH_HOME without appending an extra .ralph segment', withTempHome(async (homeDir) => {
+  const customHome = path.join(homeDir, 'custom-home');
+  process.env.RALPH_HOME = customHome;
+
+  const { ConfigManager } = require('../dist/config/manager.js');
+  const manager = new ConfigManager();
+
+  assert.equal(fs.existsSync(path.join(customHome, 'config.json')), true);
+  assert.equal(fs.existsSync(path.join(customHome, '.ralph', 'config.json')), false);
+  assert.equal(manager.get('agent.backend'), 'cli');
 }));
 
 test('ConfigManager loads auto-merge settings from config', withTempHome(async (homeDir) => {
