@@ -1,11 +1,23 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
+const { execFileSync } = require('node:child_process');
+const fs = require('node:fs');
+const os = require('node:os');
+const path = require('node:path');
 
 const {
   detectCompletionSignals,
+  detectCurrentWorktreeEvidence,
   hasObjectiveProgressEvidence,
   shouldTreatNonZeroExitAsSuccess,
 } = require('../dist/core/soft-success.js');
+
+function git(cwd, args) {
+  execFileSync('git', args, {
+    cwd,
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+}
 
 test('detectCompletionSignals recognizes completion summary, validation, and commit message', () => {
   const output = `
@@ -78,6 +90,57 @@ Suggested commit message: feat(api): continue event bus rollout
   assert.equal(signals.hasCompletionSummary, true);
   assert.equal(signals.hasValidationSignal, true);
   assert.equal(signals.hasSuggestedCommitMessage, true);
+});
+
+test('detectCompletionSignals recognizes result and verification in large logs', () => {
+  const output = `
+**Result**
+The worktree now enforces the topology approval boundaries in code and tests.
+
+**Verification**
+\`npm test\` at the repo root passed.
+
+${'x'.repeat(60000)}
+
+Suggested commit message: feat: recover finalizer repair
+`;
+
+  const signals = detectCompletionSignals(output);
+  assert.equal(signals.hasCompletionSummary, true);
+  assert.equal(signals.hasValidationSignal, true);
+  assert.equal(signals.hasSuggestedCommitMessage, true);
+});
+
+test('detectCurrentWorktreeEvidence detects dirty worktree relative to base commit', () => {
+  const repoPath = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-soft-success-worktree-'));
+
+  try {
+    git(repoPath, ['init']);
+    git(repoPath, ['config', 'user.email', 'test@example.com']);
+    git(repoPath, ['config', 'user.name', 'Test User']);
+
+    const filePath = path.join(repoPath, 'tracked.txt');
+    fs.writeFileSync(filePath, 'base\n');
+    git(repoPath, ['add', 'tracked.txt']);
+    git(repoPath, ['commit', '-m', 'initial']);
+
+    const baseCommitSha = execFileSync('git', ['rev-parse', 'HEAD'], {
+      cwd: repoPath,
+      encoding: 'utf8',
+    }).trim();
+
+    fs.writeFileSync(filePath, 'changed after finalize failure\n');
+
+    const evidence = detectCurrentWorktreeEvidence({
+      worktreePath: repoPath,
+      baseCommitSha,
+    });
+
+    assert.equal(evidence.hasProgress, true);
+    assert.equal(evidence.filesChanged > 0, true);
+  } finally {
+    fs.rmSync(repoPath, { recursive: true, force: true });
+  }
 });
 
 test('hasObjectiveProgressEvidence rejects zero-diff completion claims', () => {

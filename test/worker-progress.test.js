@@ -43,3 +43,34 @@ test('detectProgress notices changed diff content when changed file count stays 
     fs.rmSync(repoPath, { recursive: true, force: true });
   }
 });
+
+test('detectProgress notices HEAD changes even when commit count stays constant', () => {
+  const repoPath = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-worker-head-change-'));
+
+  try {
+    git(repoPath, ['init']);
+    git(repoPath, ['config', 'user.email', 'test@example.com']);
+    git(repoPath, ['config', 'user.name', 'Test User']);
+
+    const filePath = path.join(repoPath, 'tracked.txt');
+    fs.writeFileSync(filePath, 'base\n');
+    git(repoPath, ['add', 'tracked.txt']);
+    git(repoPath, ['commit', '-m', 'initial']);
+
+    fs.writeFileSync(filePath, 'first committed change\n');
+    git(repoPath, ['add', 'tracked.txt']);
+    git(repoPath, ['commit', '-m', 'change']);
+    const baseline = captureProgressBaseline(repoPath);
+
+    fs.writeFileSync(filePath, 'amended committed change\n');
+    git(repoPath, ['add', 'tracked.txt']);
+    git(repoPath, ['commit', '--amend', '-m', 'change amended']);
+
+    const progress = detectProgress(repoPath, path.join(repoPath, 'agent.log'), baseline);
+
+    assert.equal(progress.hasProgress, true);
+    assert.equal(progress.reason, 'HEAD commit changed');
+  } finally {
+    fs.rmSync(repoPath, { recursive: true, force: true });
+  }
+});

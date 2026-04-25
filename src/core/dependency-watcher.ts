@@ -296,24 +296,60 @@ export class DependencyWatcher {
     for (const task of failedTasks) {
       const decision = evaluateFailedTaskForFinalizeRecovery({
         logPath: task.logPath,
-        completedUS: task.completedUS,
+        worktreePath: task.worktree,
+        baseCommitSha: task.baseCommitSha,
         lastFilesChanged: task.lastFilesChanged,
+        storyProgress: task.storyProgress,
+        lastError: task.lastError,
       });
 
       if (!decision.shouldTreatAsSuccess) {
         continue;
       }
 
+      const updatedAt = Date.now();
+      const completedUS = decision.recoverableStoryId && !task.completedUS.includes(decision.recoverableStoryId)
+        ? [...task.completedUS, decision.recoverableStoryId]
+        : task.completedUS;
+      const storyProgress = decision.recoverableStoryId
+        ? (task.storyProgress || []).map((story) => story.id === decision.recoverableStoryId
+          ? {
+              ...story,
+              status: 'passed' as const,
+              lastError: undefined,
+              lastEvidence: story.lastEvidence || decision.reason,
+              updatedAt,
+              history: [
+                ...(story.history || []),
+                {
+                  attempt: story.attempts,
+                  status: 'passed' as const,
+                  message: `Soft-recovered for finalization: ${decision.reason}`,
+                  evidence: story.lastEvidence || decision.reason,
+                  updatedAt,
+                },
+              ],
+            }
+          : story)
+        : task.storyProgress;
+
       await this.stateManager.updateTask(task.id, {
         status: 'ready_to_finalize',
+        completedUS,
+        storyProgress,
         currentUS: undefined,
         pid: undefined,
         endTime: undefined,
+        lastError: undefined,
+        mergeError: undefined,
       });
       appendTaskEvent(task, {
         type: 'task_recovered_soft_failed',
         status: 'ready_to_finalize',
         message: decision.reason,
+        data: {
+          recoveredStoryId: decision.recoverableStoryId,
+        },
       });
       this.logger.log(`Task ${task.id} recovered into ready_to_finalize (${decision.reason})`);
     }
@@ -354,7 +390,7 @@ export class DependencyWatcher {
         ? {
             ...story,
             status: 'needs_repair' as const,
-            attempts: mergeConflict ? 0 : story.attempts,
+            attempts: 0,
             lastError: repairMessage,
             updatedAt: Date.now(),
             history: [

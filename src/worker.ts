@@ -4,7 +4,12 @@ import { appendTaskEvent } from './core/events';
 import { ConfigManager } from './config/manager';
 import { bootstrapWorktreeDeps } from './core/bootstrap';
 import { finalizeTask, markTaskReadyToFinalize } from './core/scheduler';
-import { hasObjectiveProgressEvidence, shouldTreatNonZeroExitAsSuccess } from './core/soft-success';
+import {
+  detectCompletionSignals,
+  detectCurrentWorktreeEvidence,
+  hasObjectiveProgressEvidence,
+  shouldTreatNonZeroExitAsSuccess,
+} from './core/soft-success';
 import { createWorkerLeaseUpdate, startWorkerLeaseHeartbeat } from './core/worker-heartbeat';
 import { detectStagnation, loadTaskPRD, saveTaskPRD } from './utils/helpers';
 import { execSync } from 'child_process';
@@ -86,6 +91,7 @@ async function runWorker(taskId: string) {
       let lastStoryError = getStoryProgress(task, us.id)?.lastError;
 
       while (!storyPassed && getStoryAttempts(task, us.id) < maxStoryAttempts) {
+        const previousStoryProgress = getStoryProgress(task, us.id);
         task.currentUS = us.id;
         const storyStartedAt = Date.now();
         const attempt = getStoryAttempts(task, us.id) + 1;
@@ -147,12 +153,27 @@ async function runWorker(taskId: string) {
           });
         }
 
-        const progressDetected = detectProgress(
+        let progressDetected = detectProgress(
           task.worktree,
           task.logPath,
           baselineState
         );
-        const hasObjectiveEvidence = hasObjectiveProgressEvidence(progressDetected);
+        let hasObjectiveEvidence = hasObjectiveProgressEvidence(progressDetected);
+        const reusedRepairProgress = !hasObjectiveEvidence
+          ? reuseExistingStoryEvidenceForRepair({
+              task,
+              storyId: us.id,
+              previousStoryProgress,
+              lastStoryError,
+              resultSuccess: result.success,
+              output: result.output,
+            })
+          : null;
+
+        if (reusedRepairProgress) {
+          progressDetected = reusedRepairProgress;
+          hasObjectiveEvidence = true;
+        }
 
         task.loopCount++;
         task.lastFilesChanged = progressDetected.filesChanged;
@@ -314,6 +335,7 @@ async function runWorker(taskId: string) {
           data: {
             filesChanged: progressDetected.filesChanged,
             newCommits: progressDetected.newCommits,
+            reusedExistingEvidence: Boolean(reusedRepairProgress),
           },
         });
         storyPassed = true;
@@ -383,6 +405,53 @@ function getStoryProgress(task: Task, storyId: string): StoryProgress | undefine
   return task.storyProgress?.find((story) => story.id === storyId);
 }
 
+function isFinalizerRepairAttempt(task: Pick<Task, 'finalizerAttempts' | 'mergeRepairAttempts' | 'mergeError'>, lastStoryError?: string): boolean {
+  return Boolean(
+    (task.finalizerAttempts ?? 0) > 0
+    || (task.mergeRepairAttempts ?? 0) > 0
+    || task.mergeError
+    || /quality gate|finalizer|merge repair/i.test(lastStoryError || '')
+  );
+}
+
+function reuseExistingStoryEvidenceForRepair(input: {
+  task: Pick<Task, 'worktree' | 'baseCommitSha' | 'finalizerAttempts' | 'mergeRepairAttempts' | 'mergeError'>;
+  storyId: string;
+  previousStoryProgress?: Pick<StoryProgress, 'lastEvidence'>;
+  lastStoryError?: string;
+  resultSuccess: boolean;
+  output: string;
+}): ProgressResult | null {
+  if (!input.resultSuccess || !input.previousStoryProgress?.lastEvidence) {
+    return null;
+  }
+
+  if (!isFinalizerRepairAttempt(input.task, input.lastStoryError)) {
+    return null;
+  }
+
+  const completionSignals = detectCompletionSignals(input.output);
+  if (!completionSignals.hasValidationSignal) {
+    return null;
+  }
+
+  const currentEvidence = detectCurrentWorktreeEvidence({
+    worktreePath: input.task.worktree,
+    baseCommitSha: input.task.baseCommitSha,
+  });
+
+  if (!currentEvidence.hasProgress) {
+    return null;
+  }
+
+  return {
+    hasProgress: true,
+    reason: `Existing worktree evidence retained from prior ${input.storyId} pass; ${currentEvidence.reason}`,
+    filesChanged: currentEvidence.filesChanged,
+    newCommits: currentEvidence.newCommits,
+  };
+}
+
 function upsertStoryProgress(
   task: Task,
   storyId: string,
@@ -432,6 +501,16 @@ export function detectProgress(
       reason: `${newCommits} new commit(s)`,
       filesChanged: 0,
       newCommits
+    };
+  }
+
+  const currentCommitSHA = getLatestCommitSHA(worktreePath);
+  if (currentCommitSHA && baseline.commitSHA && currentCommitSHA !== baseline.commitSHA) {
+    return {
+      hasProgress: true,
+      reason: 'HEAD commit changed',
+      filesChanged: 0,
+      newCommits: 0,
     };
   }
 
@@ -559,7 +638,7 @@ function checkAgentLogForSuccess(logPath: string): boolean {
     }
 
     const stats = fs.statSync(logPath);
-    const readSize = Math.min(50 * 1024, stats.size);
+    const readSize = Math.min(250 * 1024, stats.size);
     const buffer = Buffer.alloc(readSize);
 
     const fd = fs.openSync(logPath, 'r');
@@ -567,6 +646,9 @@ function checkAgentLogForSuccess(logPath: string): boolean {
     fs.closeSync(fd);
 
     const logTail = buffer.toString('utf-8');
+    if (detectCompletionSignals(logTail).matchedSignals.length > 0) {
+      return true;
+    }
     const successPatterns = [
       /user story.*completed/i,
       /successfully.*implemented/i,
