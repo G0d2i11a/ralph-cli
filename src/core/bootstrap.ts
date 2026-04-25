@@ -1,6 +1,7 @@
 import { execFileSync, spawnSync } from 'child_process';
 import * as fs from 'fs';
 import * as path from 'path';
+import { resolveWorkspacePackageDirs } from './workspaces';
 
 export type PackageManager = 'pnpm' | 'yarn' | 'bun' | 'npm';
 
@@ -296,52 +297,12 @@ function createDirSymlink(targetPath: string, linkPath: string): void {
   fs.symlinkSync(targetPath, linkPath, symlinkType);
 }
 
-function getWorkspacePatterns(manifest: PackageManifest | null): string[] {
-  const workspaces = manifest?.workspaces;
-  if (Array.isArray(workspaces)) {
-    return workspaces;
-  }
-
-  if (workspaces && Array.isArray(workspaces.packages)) {
-    return workspaces.packages;
-  }
-
-  return [];
-}
-
-function expandSimpleWorkspacePattern(rootPath: string, pattern: string): string[] {
-  if (!pattern.endsWith('/*') || pattern.includes('**')) {
-    return [];
-  }
-
-  const parent = path.join(rootPath, pattern.slice(0, -2));
-  try {
-    return fs.readdirSync(parent, { withFileTypes: true })
-      .filter((entry) => entry.isDirectory())
-      .map((entry) => path.join(parent, entry.name))
-      .filter((candidate) => fs.existsSync(path.join(candidate, 'package.json')));
-  } catch {
-    return [];
-  }
-}
-
-function resolveWorkspacePackageDirs(rootPath: string, manifest: PackageManifest | null): string[] {
-  const dirs = new Set<string>();
-
-  for (const pattern of getWorkspacePatterns(manifest)) {
-    for (const workspaceDir of expandSimpleWorkspacePattern(rootPath, pattern)) {
-      dirs.add(path.resolve(workspaceDir));
-    }
-  }
-
-  return [...dirs];
-}
-
 function maybeReuseWorkspaceInstallArtifacts(
   repoInstallRoot: string,
   worktreeInstallRoot: string,
   logger: BootstrapLogger,
-): void {
+): number {
+  let reusedCount = 0;
   const repoManifest = readManifest(repoInstallRoot);
   const worktreeManifest = readManifest(worktreeInstallRoot);
   const repoWorkspaceDirs = resolveWorkspacePackageDirs(repoInstallRoot, repoManifest);
@@ -382,6 +343,7 @@ function maybeReuseWorkspaceInstallArtifacts(
 
       createDirSymlink(repoNodeModulesPath, worktreeNodeModulesPath);
       logger(`Reused workspace install artifacts for ${relativePath}`);
+      reusedCount += 1;
     } catch (error) {
       logger(
         `Workspace install reuse failed for ${relativePath}: ${error instanceof Error ? error.message : String(error)}`,
@@ -389,6 +351,8 @@ function maybeReuseWorkspaceInstallArtifacts(
       );
     }
   }
+
+  return reusedCount;
 }
 
 function maybeReuseRepoInstallArtifacts(
@@ -429,7 +393,14 @@ function maybeReuseRepoInstallArtifacts(
       if (existingStats.isSymbolicLink()) {
         const linkedTarget = fs.realpathSync.native(worktreeNodeModulesPath);
         if (linkedTarget === fs.realpathSync.native(repoNodeModulesPath)) {
-          return `Reusing repo install artifacts from ${resolvedRepoInstallRoot}`;
+          const reusedWorkspaceCount = maybeReuseWorkspaceInstallArtifacts(
+            resolvedRepoInstallRoot,
+            resolvedWorktreeInstallRoot,
+            logger,
+          );
+          return reusedWorkspaceCount > 0
+            ? `Reused workspace install artifacts from ${resolvedRepoInstallRoot}`
+            : null;
         }
       }
 
@@ -713,7 +684,6 @@ export function bootstrapWorktreeDeps(
 
   if (
     !options.commandRunner &&
-    inspection.needsInstall &&
     inspection.installRoot &&
     inspection.packageManager
   ) {

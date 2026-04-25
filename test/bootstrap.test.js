@@ -170,3 +170,92 @@ test('bootstrapWorktreeDeps reuses workspace-level node_modules from repo artifa
     fs.realpathSync.native(path.join(repoPath, 'apps', 'web', 'node_modules')),
   );
 });
+
+test('bootstrapWorktreeDeps reuses workspace node_modules from pnpm-workspace.yaml patterns', (t) => {
+  const worktreePath = makeTempDir(t);
+  const repoPath = makeTempDir(t);
+  const manifest = {
+    private: true,
+  };
+  const workspaceYaml = 'packages:\n  - "packages/*"\n';
+
+  writeJson(path.join(repoPath, 'package.json'), manifest);
+  writeFile(path.join(repoPath, 'pnpm-lock.yaml'));
+  writeFile(path.join(repoPath, 'pnpm-workspace.yaml'), workspaceYaml);
+  fs.mkdirSync(path.join(repoPath, 'node_modules', '.pnpm'), { recursive: true });
+  fs.mkdirSync(path.join(repoPath, 'packages', 'eslint-config', 'node_modules', '.bin'), { recursive: true });
+  writeJson(path.join(repoPath, 'packages', 'eslint-config', 'package.json'), {
+    name: '@repo/eslint-config',
+    devDependencies: { globals: '^16.5.0' },
+  });
+
+  writeJson(path.join(worktreePath, 'package.json'), manifest);
+  writeFile(path.join(worktreePath, 'pnpm-lock.yaml'));
+  writeFile(path.join(worktreePath, 'pnpm-workspace.yaml'), workspaceYaml);
+  writeJson(path.join(worktreePath, 'packages', 'eslint-config', 'package.json'), {
+    name: '@repo/eslint-config',
+    devDependencies: { globals: '^16.5.0' },
+  });
+
+  const result = bootstrapWorktreeDeps(worktreePath, {
+    repoPath,
+    logger: () => {},
+  });
+
+  assert.equal(result.bootstrapped, false);
+  assert.equal(
+    fs.lstatSync(path.join(worktreePath, 'packages', 'eslint-config', 'node_modules')).isSymbolicLink(),
+    true,
+  );
+  assert.equal(
+    fs.realpathSync.native(path.join(worktreePath, 'packages', 'eslint-config', 'node_modules')),
+    fs.realpathSync.native(path.join(repoPath, 'packages', 'eslint-config', 'node_modules')),
+  );
+});
+
+test('bootstrapWorktreeDeps repairs missing workspace node_modules when root install is already reused', (t) => {
+  const worktreePath = makeTempDir(t);
+  const repoPath = makeTempDir(t);
+  const manifest = {
+    private: true,
+  };
+  const workspaceYaml = 'packages:\n  - "packages/*"\n';
+
+  writeJson(path.join(repoPath, 'package.json'), manifest);
+  writeFile(path.join(repoPath, 'pnpm-lock.yaml'));
+  writeFile(path.join(repoPath, 'pnpm-workspace.yaml'), workspaceYaml);
+  fs.mkdirSync(path.join(repoPath, 'node_modules', '.pnpm'), { recursive: true });
+  fs.mkdirSync(path.join(repoPath, 'packages', 'eslint-config', 'node_modules', '.bin'), { recursive: true });
+  writeJson(path.join(repoPath, 'packages', 'eslint-config', 'package.json'), {
+    name: '@repo/eslint-config',
+    devDependencies: { globals: '^16.5.0' },
+  });
+
+  writeJson(path.join(worktreePath, 'package.json'), manifest);
+  writeFile(path.join(worktreePath, 'pnpm-lock.yaml'));
+  writeFile(path.join(worktreePath, 'pnpm-workspace.yaml'), workspaceYaml);
+  writeJson(path.join(worktreePath, 'packages', 'eslint-config', 'package.json'), {
+    name: '@repo/eslint-config',
+    devDependencies: { globals: '^16.5.0' },
+  });
+  fs.symlinkSync(
+    path.join(repoPath, 'node_modules'),
+    path.join(worktreePath, 'node_modules'),
+    'dir',
+  );
+
+  const result = bootstrapWorktreeDeps(worktreePath, {
+    repoPath,
+    logger: () => {},
+  });
+
+  assert.equal(result.bootstrapped, false);
+  assert.equal(
+    fs.lstatSync(path.join(worktreePath, 'packages', 'eslint-config', 'node_modules')).isSymbolicLink(),
+    true,
+  );
+  assert.equal(
+    fs.realpathSync.native(path.join(worktreePath, 'packages', 'eslint-config', 'node_modules')),
+    fs.realpathSync.native(path.join(repoPath, 'packages', 'eslint-config', 'node_modules')),
+  );
+});

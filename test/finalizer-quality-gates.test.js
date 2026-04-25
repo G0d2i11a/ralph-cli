@@ -317,3 +317,84 @@ test('finalizeTaskOutput scopes quality gates to changed workspace packages', ()
     fs.rmSync(repoDir, { recursive: true, force: true });
   }
 });
+
+test('finalizeTaskOutput scopes quality gates using pnpm-workspace.yaml patterns', () => {
+  const repoDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-finalizer-pnpm-workspace-'));
+  const prdPath = path.join(repoDir, 'prd.json');
+
+  try {
+    git(['init'], repoDir);
+    git(['checkout', '-b', 'main'], repoDir);
+    git(['config', 'user.name', 'Ralph Test'], repoDir);
+    git(['config', 'user.email', 'ralph@example.com'], repoDir);
+
+    fs.writeFileSync(prdPath, JSON.stringify({
+      id: 'prd-pnpm-workspace',
+      title: 'Workspace Gate Task',
+      description: 'Scope gates to changed pnpm workspaces',
+      userStories: [],
+      dependencies: [],
+    }, null, 2));
+
+    fs.writeFileSync(path.join(repoDir, 'package.json'), JSON.stringify({
+      name: 'workspace-fixture',
+      private: true,
+      scripts: {
+        test: `node -e "process.exit(9)"`,
+      },
+    }, null, 2));
+    fs.writeFileSync(path.join(repoDir, 'pnpm-lock.yaml'), '\n');
+    fs.writeFileSync(path.join(repoDir, 'pnpm-workspace.yaml'), 'packages:\n  - "packages/*"\n');
+    fs.mkdirSync(path.join(repoDir, 'packages', 'changed'), { recursive: true });
+    fs.mkdirSync(path.join(repoDir, 'packages', 'unchanged'), { recursive: true });
+    fs.writeFileSync(path.join(repoDir, 'packages', 'changed', 'package.json'), JSON.stringify({
+      name: 'changed',
+      scripts: {
+        test: `node -e "require('fs').writeFileSync('changed-test.txt','ok')"`,
+      },
+    }, null, 2));
+    fs.writeFileSync(path.join(repoDir, 'packages', 'unchanged', 'package.json'), JSON.stringify({
+      name: 'unchanged',
+      scripts: {
+        test: `node -e "process.exit(8)"`,
+      },
+    }, null, 2));
+    fs.writeFileSync(path.join(repoDir, 'packages', 'changed', 'feature.txt'), 'base\n');
+    fs.writeFileSync(path.join(repoDir, 'packages', 'unchanged', 'feature.txt'), 'base\n');
+    git(['add', '.'], repoDir);
+    git(['commit', '-m', 'feat: initial'], repoDir);
+
+    const worktreePath = path.join(repoDir, '.ralph-worktrees', 'task-pnpm-workspace');
+    fs.mkdirSync(path.dirname(worktreePath), { recursive: true });
+    git(['worktree', 'add', '-b', 'ralph/task-pnpm-workspace', worktreePath, 'main'], repoDir);
+
+    fs.appendFileSync(path.join(worktreePath, 'packages', 'changed', 'feature.txt'), 'change\n');
+
+    const task = {
+      id: 'task-pnpm-workspace',
+      prdPath,
+      status: 'ready_to_finalize',
+      startTime: Date.now(),
+      completedUS: [],
+      worktree: worktreePath,
+      logPath: path.join(repoDir, '.ralph', 'tasks', 'task-pnpm-workspace', 'agent.log'),
+      agent: 'codex',
+      repoPath: repoDir,
+      loopCount: 0,
+      consecutiveNoProgress: 0,
+      consecutiveErrors: 0,
+      lastProgressTime: Date.now(),
+      lastFilesChanged: 1,
+    };
+
+    const result = finalizeTaskOutput(task);
+
+    assert.equal(result.success, true);
+    assert.equal(result.committed, true);
+    assert.equal(fs.existsSync(path.join(worktreePath, 'packages', 'changed', 'changed-test.txt')), true);
+    assert.equal(fs.existsSync(path.join(worktreePath, 'packages', 'unchanged', 'changed-test.txt')), false);
+    assert.match(result.message, /packages\/changed:test/);
+  } finally {
+    fs.rmSync(repoDir, { recursive: true, force: true });
+  }
+});

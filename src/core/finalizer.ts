@@ -4,6 +4,7 @@ import * as path from 'path';
 import { ConfigManager } from '../config/manager';
 import { Task } from '../types/task';
 import { detectPackageManager, findInstallRoot } from './bootstrap';
+import { resolveWorkspacePackageDirs } from './workspaces';
 import { parsePRD } from '../utils/helpers';
 
 export interface FinalizeResult {
@@ -116,47 +117,6 @@ function readPackageManifest(installRoot: string): PackageManifest | null {
   }
 
   return JSON.parse(fs.readFileSync(packageJsonPath, 'utf-8')) as PackageManifest;
-}
-
-function getWorkspacePatterns(manifest: PackageManifest | null): string[] {
-  const workspaces = manifest?.workspaces;
-  if (Array.isArray(workspaces)) {
-    return workspaces;
-  }
-
-  if (workspaces && Array.isArray(workspaces.packages)) {
-    return workspaces.packages;
-  }
-
-  return [];
-}
-
-function expandSimpleWorkspacePattern(rootPath: string, pattern: string): string[] {
-  if (!pattern.endsWith('/*') || pattern.includes('**')) {
-    return [];
-  }
-
-  const parent = path.join(rootPath, pattern.slice(0, -2));
-  try {
-    return fs.readdirSync(parent, { withFileTypes: true })
-      .filter((entry) => entry.isDirectory())
-      .map((entry) => path.join(parent, entry.name))
-      .filter((candidate) => fs.existsSync(path.join(candidate, 'package.json')));
-  } catch {
-    return [];
-  }
-}
-
-function resolveWorkspacePackageDirs(rootPath: string, manifest: PackageManifest | null): string[] {
-  const dirs = new Set<string>();
-
-  for (const pattern of getWorkspacePatterns(manifest)) {
-    for (const workspaceDir of expandSimpleWorkspacePattern(rootPath, pattern)) {
-      dirs.add(path.resolve(workspaceDir));
-    }
-  }
-
-  return [...dirs];
 }
 
 function listChangedFiles(worktreePath: string): string[] {
