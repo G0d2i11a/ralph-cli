@@ -37,6 +37,11 @@ function createConfigManager(overrides = {}) {
     'merge.targetBranch': 'main',
     'merge.strategy': 'manual',
     'merge.pullLatest': true,
+    'finalizer.repairPolicy': 'progress',
+    'finalizer.maxRepairAttempts': 1,
+    'finalizer.maxNoProgressRepairRounds': 2,
+    'finalizer.repairDeadlineSeconds': 7200,
+    'finalizer.repairHardCap': 20,
     ...overrides,
   };
 
@@ -460,4 +465,240 @@ test('dependency watcher requeues unrun merge repair without consuming another r
   assert.equal(task.storyProgress[1].status, 'needs_repair');
   assert.equal(task.storyProgress[1].attempts, 0);
   assert.equal(task.mergeRepairAttempts, 1);
+  assert.equal(task.finalizeRepairTotalRequeues, 1);
+});
+
+test('dependency watcher keeps progress-based finalize repair alive beyond legacy repair limits', async () => {
+  const now = Date.now();
+  const stateManager = new FakeStateManager([
+    {
+      id: 'progress-repair-task',
+      prdPath: '/tmp/prd.json',
+      status: 'failed_finalize',
+      startTime: 100,
+      completedUS: ['US-001'],
+      storyProgress: [
+        {
+          id: 'US-001',
+          status: 'passed',
+          attempts: 1,
+          updatedAt: 100,
+        },
+      ],
+      worktree: '/repo/.ralph-worktrees/progress-repair-task',
+      logPath: '/tmp/progress-repair.log',
+      agent: 'codex',
+      repoPath: '/repo',
+      loopCount: 1,
+      consecutiveNoProgress: 0,
+      consecutiveErrors: 0,
+      lastProgressTime: 100,
+      lastFilesChanged: 1,
+      finalizerAttempts: 6,
+      lastError: 'Quality gate "test" failed',
+      finalizeRepairStartedAt: now - 1_000,
+      finalizeRepairDeadlineAt: now + 60_000,
+      finalizeRepairLastProgressReason: 'HEAD changed',
+      finalizeRepairConsecutiveNoProgress: 0,
+      finalizeRepairTotalRequeues: 5,
+    },
+  ]);
+
+  const watcher = new DependencyWatcher(
+    {},
+    {
+      stateManager,
+      configManager: createConfigManager({
+        'finalizer.repairPolicy': 'progress',
+        'finalizer.maxRepairAttempts': 1,
+      }),
+      scheduler: {
+        schedulePendingTasks: async () => [],
+      },
+      sleep: async () => undefined,
+      logger: { log() {}, error() {} },
+    }
+  );
+
+  await watcher.recoverFailedFinalizeTasks();
+
+  const task = stateManager.tasks.get('progress-repair-task');
+  assert.equal(task.status, 'pending');
+  assert.deepEqual(task.completedUS, []);
+  assert.equal(task.storyProgress[0].status, 'needs_repair');
+  assert.equal(task.finalizeRepairTotalRequeues, 6);
+});
+
+test('dependency watcher stops progress-based finalize repair after repeated no-progress failures', async () => {
+  const now = Date.now();
+  const stateManager = new FakeStateManager([
+    {
+      id: 'stalled-repair-task',
+      prdPath: '/tmp/prd.json',
+      status: 'failed_finalize',
+      startTime: 100,
+      completedUS: ['US-001'],
+      storyProgress: [
+        {
+          id: 'US-001',
+          status: 'passed',
+          attempts: 1,
+          updatedAt: 100,
+        },
+      ],
+      worktree: '/repo/.ralph-worktrees/stalled-repair-task',
+      logPath: '/tmp/stalled-repair.log',
+      agent: 'codex',
+      repoPath: '/repo',
+      loopCount: 1,
+      consecutiveNoProgress: 0,
+      consecutiveErrors: 0,
+      lastProgressTime: 100,
+      lastFilesChanged: 1,
+      finalizerAttempts: 4,
+      lastError: 'Quality gate "test" failed',
+      finalizeRepairStartedAt: now - 1_000,
+      finalizeRepairDeadlineAt: now + 60_000,
+      finalizeRepairConsecutiveNoProgress: 2,
+      finalizeRepairTotalRequeues: 2,
+    },
+  ]);
+
+  const watcher = new DependencyWatcher(
+    {},
+    {
+      stateManager,
+      configManager: createConfigManager({
+        'finalizer.repairPolicy': 'progress',
+        'finalizer.maxNoProgressRepairRounds': 2,
+      }),
+      scheduler: {
+        schedulePendingTasks: async () => [],
+      },
+      sleep: async () => undefined,
+      logger: { log() {}, error() {} },
+    }
+  );
+
+  await watcher.recoverFailedFinalizeTasks();
+
+  const task = stateManager.tasks.get('stalled-repair-task');
+  assert.equal(task.status, 'failed_finalize');
+  assert.equal(typeof task.finalizeRepairStoppedAt, 'number');
+  assert.equal(task.finalizeRepairStopReason, 'repair_no_progress');
+});
+
+test('dependency watcher stops progress-based finalize repair when deadline expires', async () => {
+  const now = Date.now();
+  const stateManager = new FakeStateManager([
+    {
+      id: 'deadline-repair-task',
+      prdPath: '/tmp/prd.json',
+      status: 'failed_finalize',
+      startTime: 100,
+      completedUS: ['US-001'],
+      storyProgress: [
+        {
+          id: 'US-001',
+          status: 'passed',
+          attempts: 1,
+          updatedAt: 100,
+        },
+      ],
+      worktree: '/repo/.ralph-worktrees/deadline-repair-task',
+      logPath: '/tmp/deadline-repair.log',
+      agent: 'codex',
+      repoPath: '/repo',
+      loopCount: 1,
+      consecutiveNoProgress: 0,
+      consecutiveErrors: 0,
+      lastProgressTime: 100,
+      lastFilesChanged: 1,
+      finalizerAttempts: 2,
+      lastError: 'Quality gate "test" failed',
+      finalizeRepairStartedAt: now - 120_000,
+      finalizeRepairDeadlineAt: now - 1,
+      finalizeRepairConsecutiveNoProgress: 0,
+      finalizeRepairTotalRequeues: 1,
+    },
+  ]);
+
+  const watcher = new DependencyWatcher(
+    {},
+    {
+      stateManager,
+      configManager: createConfigManager({
+        'finalizer.repairPolicy': 'progress',
+      }),
+      scheduler: {
+        schedulePendingTasks: async () => [],
+      },
+      sleep: async () => undefined,
+      logger: { log() {}, error() {} },
+    }
+  );
+
+  await watcher.recoverFailedFinalizeTasks();
+
+  const task = stateManager.tasks.get('deadline-repair-task');
+  assert.equal(task.status, 'failed_finalize');
+  assert.equal(task.finalizeRepairStopReason, 'repair_deadline_exhausted');
+});
+
+test('dependency watcher stops progress-based finalize repair when hard cap is reached', async () => {
+  const now = Date.now();
+  const stateManager = new FakeStateManager([
+    {
+      id: 'hard-cap-repair-task',
+      prdPath: '/tmp/prd.json',
+      status: 'failed_finalize',
+      startTime: 100,
+      completedUS: ['US-001'],
+      storyProgress: [
+        {
+          id: 'US-001',
+          status: 'passed',
+          attempts: 1,
+          updatedAt: 100,
+        },
+      ],
+      worktree: '/repo/.ralph-worktrees/hard-cap-repair-task',
+      logPath: '/tmp/hard-cap-repair.log',
+      agent: 'codex',
+      repoPath: '/repo',
+      loopCount: 1,
+      consecutiveNoProgress: 0,
+      consecutiveErrors: 0,
+      lastProgressTime: 100,
+      lastFilesChanged: 1,
+      finalizerAttempts: 2,
+      lastError: 'Quality gate "test" failed',
+      finalizeRepairStartedAt: now - 1_000,
+      finalizeRepairDeadlineAt: now + 60_000,
+      finalizeRepairConsecutiveNoProgress: 0,
+      finalizeRepairTotalRequeues: 3,
+    },
+  ]);
+
+  const watcher = new DependencyWatcher(
+    {},
+    {
+      stateManager,
+      configManager: createConfigManager({
+        'finalizer.repairPolicy': 'progress',
+        'finalizer.repairHardCap': 3,
+      }),
+      scheduler: {
+        schedulePendingTasks: async () => [],
+      },
+      sleep: async () => undefined,
+      logger: { log() {}, error() {} },
+    }
+  );
+
+  await watcher.recoverFailedFinalizeTasks();
+
+  const task = stateManager.tasks.get('hard-cap-repair-task');
+  assert.equal(task.status, 'failed_finalize');
+  assert.equal(task.finalizeRepairStopReason, 'repair_hard_cap_reached');
 });

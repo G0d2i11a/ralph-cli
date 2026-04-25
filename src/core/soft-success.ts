@@ -1,5 +1,6 @@
 import { execFileSync } from 'child_process';
 import * as fs from 'fs';
+import { getLatestCommitSHA } from './worktree-progress';
 
 const COMPLETION_SIGNAL_SCAN_CHARS = 250_000;
 const REPAIR_EVIDENCE_ERROR_PATTERN = /no objective diff or commit evidence/i;
@@ -9,6 +10,7 @@ export interface ProgressLike {
   hasProgress: boolean;
   filesChanged: number;
   newCommits: number;
+  headChanged?: boolean;
 }
 
 export interface CompletionSignals {
@@ -115,7 +117,7 @@ export function shouldTreatNonZeroExitAsSuccess(input: {
 }
 
 export function hasObjectiveProgressEvidence(progress: ProgressLike): boolean {
-  return progress.filesChanged > 0 || progress.newCommits > 0;
+  return progress.filesChanged > 0 || progress.newCommits > 0 || Boolean(progress.headChanged);
 }
 
 export interface CurrentWorktreeEvidence extends ProgressLike {
@@ -172,14 +174,19 @@ export function detectCurrentWorktreeEvidence(input: {
   const parsedCommitsAhead = Number(commitsAheadRaw);
   const commitsAhead = Number.isFinite(parsedCommitsAhead) ? parsedCommitsAhead : 0;
   const filesChanged = Math.max(statusFiles, baseDiffFiles);
-  const hasProgress = filesChanged > 0 || commitsAhead > 0;
+  const currentHeadSha = getLatestCommitSHA(input.worktreePath);
+  const headChanged = Boolean(currentHeadSha && currentHeadSha !== input.baseCommitSha);
+  const hasProgress = filesChanged > 0 || commitsAhead > 0 || headChanged;
 
   return {
     hasProgress,
     filesChanged,
     newCommits: commitsAhead,
+    headChanged,
     reason: hasProgress
-      ? `${filesChanged} current changed file(s), ${commitsAhead} commit(s) ahead of base`
+      ? headChanged && filesChanged === 0 && commitsAhead === 0
+        ? 'HEAD changed relative to base'
+        : `${filesChanged} current changed file(s), ${commitsAhead} commit(s) ahead of base`
       : 'No current worktree changes or commits ahead of base',
   };
 }

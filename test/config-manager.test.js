@@ -67,6 +67,10 @@ test('ConfigManager defaults agent.backend to cli', withTempHome(async () => {
   assert.equal(manager.get('merge.integrationWorktreeDir'), '.ralph-integration');
   assert.equal(manager.get('merge.syncTargetBranch'), true);
   assert.equal(manager.get('finalizer.qualityGateTimeout'), 600);
+  assert.equal(manager.get('finalizer.repairPolicy'), 'progress');
+  assert.equal(manager.get('finalizer.maxNoProgressRepairRounds'), 2);
+  assert.equal(manager.get('finalizer.repairDeadlineSeconds'), 7200);
+  assert.equal(manager.get('finalizer.repairHardCap'), 20);
 }));
 
 test('ConfigManager uses RALPH_HOME without appending an extra .ralph segment', withTempHome(async (homeDir) => {
@@ -99,6 +103,10 @@ test('ConfigManager loads auto-merge settings from config', withTempHome(async (
       },
       finalizer: {
         qualityGateTimeout: 45,
+        repairPolicy: 'fixed',
+        maxNoProgressRepairRounds: 4,
+        repairDeadlineSeconds: 90,
+        repairHardCap: 8,
       },
     }, null, 2),
   );
@@ -115,6 +123,10 @@ test('ConfigManager loads auto-merge settings from config', withTempHome(async (
   assert.equal(manager.get('merge.integrationWorktreeDir'), '.custom-integration');
   assert.equal(manager.get('merge.syncTargetBranch'), false);
   assert.equal(manager.get('finalizer.qualityGateTimeout'), 45);
+  assert.equal(manager.get('finalizer.repairPolicy'), 'fixed');
+  assert.equal(manager.get('finalizer.maxNoProgressRepairRounds'), 4);
+  assert.equal(manager.get('finalizer.repairDeadlineSeconds'), 90);
+  assert.equal(manager.get('finalizer.repairHardCap'), 8);
 }));
 
 test('resolveConfiguredBackend maps legacy sdk-runner configs to agent-runners', withTempHome(async (homeDir) => {

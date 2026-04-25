@@ -1,6 +1,7 @@
 export type TaskStatus = 'pending' | 'running' | 'ready_to_finalize' | 'finalizing' | 'completed' | 'failed' | 'failed_finalize' | 'stagnant';
 export type TaskMergeStrategy = 'manual' | 'ours' | 'theirs';
 export type StoryStatus = 'pending' | 'in_progress' | 'needs_repair' | 'passed' | 'failed';
+export type FinalizeRepairFailureKind = 'merge_conflict' | 'quality_gate' | 'finalizer_error';
 
 export interface StoryProgress {
   id: string;
@@ -16,6 +17,17 @@ export interface StoryProgress {
   lastEvidence?: string;
   lastError?: string;
   updatedAt: number;
+}
+
+export interface FinalizeRepairSnapshot {
+  headSha?: string;
+  commitsAheadOfBase: number;
+  changedFiles: number;
+  worktreeDiffSignature: string;
+  failureKind: FinalizeRepairFailureKind;
+  failureSignature: string;
+  conflictSignature?: string;
+  capturedAt: number;
 }
 
 export interface Task {
@@ -57,8 +69,18 @@ export interface Task {
   lastError?: string;
   lastFilesChanged: number;
   finalizerCommitMessage?: string;
+  finalizerCommitSha?: string;
   finalizerCommittedAt?: number;
   finalizerAttempts?: number;
+  finalizeRepairStartedAt?: number;
+  finalizeRepairDeadlineAt?: number;
+  finalizeRepairLastFailureSnapshot?: FinalizeRepairSnapshot;
+  finalizeRepairLastProgressAt?: number;
+  finalizeRepairLastProgressReason?: string;
+  finalizeRepairConsecutiveNoProgress?: number;
+  finalizeRepairTotalRequeues?: number;
+  finalizeRepairStoppedAt?: number;
+  finalizeRepairStopReason?: string;
   mergedAt?: number;
   integratedAt?: number;
   integrationCommitSha?: string;

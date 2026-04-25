@@ -12,6 +12,11 @@ import {
   getTaskUpdatesFromError,
   isDestructiveMergeStrategy,
 } from './merge-policy';
+import {
+  decideFinalizeRepairRequeue,
+  evaluateFinalizeRepairFailure,
+  resolveFinalizeRepairConfig,
+} from './finalize-repair-policy';
 import { evaluateFailedTaskForFinalizeRecovery } from './soft-success';
 import { DEFAULT_AGENT, resolveAgentBackend, resolveAgentType, resolveConfiguredBackend } from './agent';
 import {
@@ -356,17 +361,13 @@ export class DependencyWatcher {
   }
 
   async recoverFailedFinalizeTasks(): Promise<void> {
-    const maxRepairAttempts = Number(this.configManager.get('finalizer.maxRepairAttempts'));
-    const repairLimit = Number.isFinite(maxRepairAttempts) && maxRepairAttempts >= 0
-      ? Math.floor(maxRepairAttempts)
-      : 1;
+    const repairConfig = resolveFinalizeRepairConfig(this.configManager);
     const failedFinalizeTasks = (await this.stateManager.listTasks('failed_finalize'))
       .slice()
       .sort((a: Task, b: Task) => a.startTime - b.startTime);
 
     for (const task of failedFinalizeTasks) {
       const mergeConflict = hasMergeConflict(task);
-      const attempts = mergeConflict ? (task.mergeRepairAttempts ?? 0) : (task.finalizerAttempts ?? 0);
       const repairStoryId = selectFinalizeRepairStoryId(task, mergeConflict);
       if (!repairStoryId) {
         continue;
@@ -378,10 +379,43 @@ export class DependencyWatcher {
         && repairStory?.status === 'needs_repair'
         && !task.completedUS.includes(repairStoryId)
       );
-      if ((mergeConflict ? attempts >= repairLimit : attempts > repairLimit) && !hasUnrunMergeRepair) {
+      const decision = decideFinalizeRepairRequeue({
+        task,
+        config: repairConfig,
+        mergeConflict,
+        hasUnrunMergeRepair,
+      });
+
+      if (!decision.shouldRequeue) {
+        if (
+          repairConfig.repairPolicy === 'progress'
+          && decision.stopReason
+          && !task.finalizeRepairStoppedAt
+        ) {
+          const stoppedAt = Date.now();
+          await this.stateManager.updateTask(task.id, {
+            finalizeRepairStoppedAt: stoppedAt,
+            finalizeRepairStopReason: decision.stopReason,
+          });
+          appendTaskEvent(task, {
+            type: 'finalize_repair_stopped',
+            status: 'failed_finalize',
+            storyId: repairStoryId,
+            message: decision.reason,
+            data: {
+              stopReason: decision.stopReason,
+              consecutiveNoProgress: task.finalizeRepairConsecutiveNoProgress,
+              totalRequeues: task.finalizeRepairTotalRequeues,
+              deadlineAt: task.finalizeRepairDeadlineAt,
+              conflictFiles: task.mergeConflictFiles,
+            },
+          });
+          this.logger.log(`Task ${task.id} stopped finalize repair recovery (${decision.reason})`);
+        }
         continue;
       }
 
+      const updatedAt = Date.now();
       const repairMessage = mergeConflict
         ? buildMergeRepairContext(task)
         : task.lastError || task.mergeError || 'Finalizer failed; repair required';
@@ -392,18 +426,24 @@ export class DependencyWatcher {
             status: 'needs_repair' as const,
             attempts: 0,
             lastError: repairMessage,
-            updatedAt: Date.now(),
+            updatedAt,
             history: [
               ...(story.history || []),
               {
                 attempt: story.attempts,
                 status: 'needs_repair' as const,
                 message: repairMessage,
-                updatedAt: Date.now(),
+                updatedAt,
               },
             ],
           }
         : story);
+      const nextMergeRepairAttempts = mergeConflict
+        ? (hasUnrunMergeRepair ? (task.mergeRepairAttempts ?? 0) : (task.mergeRepairAttempts ?? 0) + 1)
+        : undefined;
+      const nextTotalRequeues = repairConfig.repairPolicy === 'progress'
+        ? (task.finalizeRepairTotalRequeues ?? 0) + 1
+        : task.finalizeRepairTotalRequeues;
 
       await this.stateManager.updateTask(task.id, {
         status: 'pending',
@@ -415,7 +455,14 @@ export class DependencyWatcher {
         leaseOwner: undefined,
         leaseHeartbeatAt: undefined,
         leaseExpiresAt: undefined,
-        ...(mergeConflict ? { mergeRepairAttempts: hasUnrunMergeRepair ? attempts : attempts + 1 } : {}),
+        ...(mergeConflict ? { mergeRepairAttempts: nextMergeRepairAttempts } : {}),
+        ...(repairConfig.repairPolicy === 'progress'
+          ? {
+              finalizeRepairTotalRequeues: nextTotalRequeues,
+              finalizeRepairStoppedAt: undefined,
+              finalizeRepairStopReason: undefined,
+            }
+          : {}),
       });
       appendTaskEvent(task, {
         type: mergeConflict ? 'merge_repair_started' : 'task_recovered_failed_finalize',
@@ -428,8 +475,15 @@ export class DependencyWatcher {
           : `Returned ${repairStoryId} to repair after failed finalizer attempt`,
         data: {
           finalizerAttempts: task.finalizerAttempts,
-          mergeRepairAttempts: mergeConflict ? (hasUnrunMergeRepair ? attempts : attempts + 1) : undefined,
-          repairLimit,
+          mergeRepairAttempts: nextMergeRepairAttempts,
+          repairPolicy: repairConfig.repairPolicy,
+          repairLimit: repairConfig.maxRepairAttempts,
+          maxNoProgressRepairRounds: repairConfig.maxNoProgressRepairRounds,
+          repairHardCap: repairConfig.repairHardCap,
+          totalRequeues: nextTotalRequeues,
+          consecutiveNoProgress: task.finalizeRepairConsecutiveNoProgress,
+          deadlineAt: task.finalizeRepairDeadlineAt,
+          progressReason: decision.reason,
           conflictFiles: task.mergeConflictFiles,
         },
       });
@@ -567,8 +621,13 @@ export class DependencyWatcher {
           await this.stateManager.updateTask(task.id, {
             status: 'completed',
             endTime: Date.now(),
+            lastError: undefined,
             finalizerCommitMessage: finalizeResult.commitMessage,
+            finalizerCommitSha: finalizeResult.commitSha,
             finalizerCommittedAt,
+            mergeError: undefined,
+            mergeConflictFiles: undefined,
+            mergeConflictAt: undefined,
             leaseOwner: undefined,
             leaseHeartbeatAt: undefined,
             leaseExpiresAt: undefined,
@@ -593,27 +652,45 @@ export class DependencyWatcher {
           const latestTask = await this.stateManager.loadTask(task.id);
           const finalizerAttempts = (latestTask?.finalizerAttempts ?? task.finalizerAttempts ?? 0) + 1;
           const failureUpdates = getTaskUpdatesFromError(error);
+          const failureMessage = error instanceof Error ? error.message : String(error);
+          const repairConfig = resolveFinalizeRepairConfig(this.configManager);
+          const repairFailureState = evaluateFinalizeRepairFailure({
+            ...(latestTask ?? task),
+            lastError: failureMessage,
+            mergeError: failureMessage,
+            ...failureUpdates,
+          }, repairConfig);
           await this.stateManager.updateTask(task.id, {
             status: 'failed_finalize',
             endTime: Date.now(),
-            lastError: error instanceof Error ? error.message : String(error),
+            lastError: failureMessage,
             finalizerCommitMessage: finalizeResult?.commitMessage,
+            finalizerCommitSha: finalizeResult?.commitSha,
             finalizerCommittedAt,
             finalizerAttempts,
-            mergeError: error instanceof Error ? error.message : String(error),
+            mergeError: failureMessage,
             pid: undefined,
             currentUS: undefined,
             leaseOwner: undefined,
             leaseHeartbeatAt: undefined,
             leaseExpiresAt: undefined,
+            finalizeRepairStartedAt: repairFailureState.startedAt,
+            finalizeRepairDeadlineAt: repairFailureState.deadlineAt,
+            finalizeRepairLastFailureSnapshot: repairFailureState.snapshot,
+            finalizeRepairLastProgressAt: repairFailureState.lastProgressAt,
+            finalizeRepairLastProgressReason: repairFailureState.lastProgressReason,
+            finalizeRepairConsecutiveNoProgress: repairFailureState.consecutiveNoProgress,
             ...failureUpdates,
           });
           appendTaskEvent(task, {
             type: 'finalizer_failed',
             status: 'failed_finalize',
-            message: error instanceof Error ? error.message : String(error),
+            message: failureMessage,
             data: {
               finalizerAttempts,
+              repairPolicy: repairConfig.repairPolicy,
+              consecutiveNoProgress: repairFailureState.consecutiveNoProgress,
+              progressReason: repairFailureState.lastProgressReason,
               conflictFiles: failureUpdates.mergeConflictFiles,
             },
           });

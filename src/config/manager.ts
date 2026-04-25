@@ -43,7 +43,11 @@ export interface RalphConfig {
     qualityGateTimeout: number;
     leaseTimeout: number;
     qualityGates: string[];
+    repairPolicy: 'fixed' | 'progress';
     maxRepairAttempts: number;
+    maxNoProgressRepairRounds: number;
+    repairDeadlineSeconds: number;
+    repairHardCap: number;
   };
 }
 
@@ -90,7 +94,11 @@ const DEFAULT_CONFIG: RalphConfig = {
     qualityGateTimeout: 600,
     leaseTimeout: 1800,
     qualityGates: ['typecheck', 'lint', 'test', 'build'],
+    repairPolicy: 'progress',
     maxRepairAttempts: 1,
+    maxNoProgressRepairRounds: 2,
+    repairDeadlineSeconds: 7200,
+    repairHardCap: 20,
   },
 };
 

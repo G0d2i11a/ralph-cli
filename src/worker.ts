@@ -12,11 +12,12 @@ import {
 } from './core/soft-success';
 import { createWorkerLeaseUpdate, startWorkerLeaseHeartbeat } from './core/worker-heartbeat';
 import { detectStagnation, loadTaskPRD, saveTaskPRD } from './utils/helpers';
-import { execSync } from 'child_process';
-import { createHash } from 'crypto';
-import * as fs from 'fs';
-import * as path from 'path';
 import { StoryProgress, StoryStatus, Task } from './types/task';
+import {
+  captureProgressBaseline,
+  detectProgress,
+  ProgressResult,
+} from './core/worktree-progress';
 
 async function runWorker(taskId: string) {
   console.log(`[Worker] Starting worker for task ${taskId}`);
@@ -362,31 +363,6 @@ async function runWorker(taskId: string) {
   }
 }
 
-interface ProgressBaseline {
-  commitSHA: string;
-  commitCount: number;
-  workingTreeFiles: number;
-  worktreeSignature: string;
-  logSize: number;
-}
-
-export function captureProgressBaseline(worktreePath: string): ProgressBaseline {
-  return {
-    commitSHA: getLatestCommitSHA(worktreePath),
-    commitCount: getCommitCount(worktreePath),
-    workingTreeFiles: getChangedFilesCount(worktreePath),
-    worktreeSignature: getWorktreeDiffSignature(worktreePath),
-    logSize: 0,
-  };
-}
-
-interface ProgressResult {
-  hasProgress: boolean;
-  reason: string;
-  filesChanged: number;
-  newCommits: number;
-}
-
 function resolveMaxStoryAttempts(configManager: ConfigManager): number {
   const rawValue = Number(configManager.get('runner.maxStoryAttempts'));
 
@@ -449,6 +425,7 @@ function reuseExistingStoryEvidenceForRepair(input: {
     reason: `Existing worktree evidence retained from prior ${input.storyId} pass; ${currentEvidence.reason}`,
     filesChanged: currentEvidence.filesChanged,
     newCommits: currentEvidence.newCommits,
+    headChanged: currentEvidence.headChanged,
   };
 }
 
@@ -487,183 +464,14 @@ function upsertStoryProgress(
   return existingProgress.map((story) => story.id === storyId ? nextStory : story);
 }
 
-export function detectProgress(
-  worktreePath: string,
-  logPath: string,
-  baseline: ProgressBaseline
-): ProgressResult {
-  const currentCommitCount = getCommitCount(worktreePath);
-  const newCommits = currentCommitCount - baseline.commitCount;
-
-  if (newCommits > 0) {
-    return {
-      hasProgress: true,
-      reason: `${newCommits} new commit(s)`,
-      filesChanged: 0,
-      newCommits
-    };
-  }
-
-  const currentCommitSHA = getLatestCommitSHA(worktreePath);
-  if (currentCommitSHA && baseline.commitSHA && currentCommitSHA !== baseline.commitSHA) {
-    return {
-      hasProgress: true,
-      reason: 'HEAD commit changed',
-      filesChanged: 0,
-      newCommits: 0,
-    };
-  }
-
-  const currentFiles = getChangedFilesCount(worktreePath);
-  const filesChanged = Math.abs(currentFiles - baseline.workingTreeFiles);
-
-  if (filesChanged > 0) {
-    return {
-      hasProgress: true,
-      reason: `${filesChanged} file(s) changed in working tree`,
-      filesChanged,
-      newCommits: 0
-    };
-  }
-
-  const currentWorktreeSignature = getWorktreeDiffSignature(worktreePath);
-  if (currentWorktreeSignature && currentWorktreeSignature !== baseline.worktreeSignature) {
-    return {
-      hasProgress: true,
-      reason: 'working tree diff content changed',
-      filesChanged: currentFiles,
-      newCommits: 0,
-    };
-  }
-
-  const hasSuccessMessage = checkAgentLogForSuccess(logPath);
-
-  if (hasSuccessMessage) {
-    return {
-      hasProgress: false,
-      reason: 'Agent reported success in log, but no objective file or commit evidence was found',
-      filesChanged: 0,
-      newCommits: 0
-    };
-  }
-
-  return {
-    hasProgress: false,
-    reason: 'No commits, no file changes, no success messages',
-    filesChanged: 0,
-    newCommits: 0
-  };
-}
-
-export function getWorktreeDiffSignature(worktreePath: string): string {
-  try {
-    const hash = createHash('sha256');
-    hash.update(runGit(worktreePath, 'status --porcelain=v1 -z'));
-    hash.update('\0diff\0');
-    hash.update(runGit(worktreePath, 'diff --binary HEAD --'));
-
-    const untrackedFiles = runGit(worktreePath, 'ls-files --others --exclude-standard -z')
-      .split('\0')
-      .filter(Boolean)
-      .sort();
-
-    for (const relativePath of untrackedFiles) {
-      const absolutePath = path.join(worktreePath, relativePath);
-      hash.update('\0untracked\0');
-      hash.update(relativePath);
-      try {
-        const stats = fs.statSync(absolutePath);
-        if (stats.isFile()) {
-          hash.update(fs.readFileSync(absolutePath));
-        }
-      } catch {
-        hash.update('\0missing\0');
-      }
-    }
-
-    return hash.digest('hex');
-  } catch {
-    return '';
-  }
-}
-
-function runGit(worktreePath: string, args: string): string {
-  return execSync(`git ${args}`, {
-    cwd: worktreePath,
-    encoding: 'utf-8',
-    maxBuffer: 20 * 1024 * 1024,
-  });
-}
-
-function getLatestCommitSHA(worktreePath: string): string {
-  try {
-    const sha = execSync('git rev-parse HEAD', {
-      cwd: worktreePath,
-      encoding: 'utf-8'
-    });
-    return sha.trim();
-  } catch {
-    return '';
-  }
-}
-
-function getCommitCount(worktreePath: string): number {
-  try {
-    const count = execSync('git rev-list --count HEAD', {
-      cwd: worktreePath,
-      encoding: 'utf-8'
-    });
-    return parseInt(count.trim(), 10);
-  } catch {
-    return 0;
-  }
-}
-
-function getChangedFilesCount(worktreePath: string): number {
-  try {
-    const output = execSync('git status --porcelain', {
-      cwd: worktreePath,
-      encoding: 'utf-8'
-    });
-    return output.trim().split('\n').filter((line: string) => line.length > 0).length;
-  } catch {
-    return 0;
-  }
-}
-
-function checkAgentLogForSuccess(logPath: string): boolean {
-  try {
-    if (!fs.existsSync(logPath)) {
-      return false;
-    }
-
-    const stats = fs.statSync(logPath);
-    const readSize = Math.min(250 * 1024, stats.size);
-    const buffer = Buffer.alloc(readSize);
-
-    const fd = fs.openSync(logPath, 'r');
-    fs.readSync(fd, buffer, 0, readSize, Math.max(0, stats.size - readSize));
-    fs.closeSync(fd);
-
-    const logTail = buffer.toString('utf-8');
-    if (detectCompletionSignals(logTail).matchedSignals.length > 0) {
-      return true;
-    }
-    const successPatterns = [
-      /user story.*completed/i,
-      /successfully.*implemented/i,
-      /all.*tests.*pass/i,
-      /implementation.*complete/i,
-      /task.*done/i,
-      /✓.*success/i,
-      /✅/
-    ];
-
-    return successPatterns.some((pattern) => pattern.test(logTail));
-  } catch {
-    return false;
-  }
-}
+export {
+  captureProgressBaseline,
+  detectProgress,
+  getChangedFilesCount,
+  getCommitCount,
+  getLatestCommitSHA,
+  getWorktreeDiffSignature,
+} from './core/worktree-progress';
 
 if (require.main === module) {
   const taskId = process.argv[2];

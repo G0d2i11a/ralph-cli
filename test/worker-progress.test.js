@@ -70,6 +70,7 @@ test('detectProgress notices HEAD changes even when commit count stays constant'
 
     assert.equal(progress.hasProgress, true);
     assert.equal(progress.reason, 'HEAD commit changed');
+    assert.equal(progress.headChanged, true);
   } finally {
     fs.rmSync(repoPath, { recursive: true, force: true });
   }

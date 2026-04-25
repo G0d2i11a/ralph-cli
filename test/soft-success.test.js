@@ -156,3 +156,12 @@ test('hasObjectiveProgressEvidence rejects zero-diff completion claims', () => {
     newCommits: 0,
   }), true);
 });
+
+test('hasObjectiveProgressEvidence accepts HEAD-only progress', () => {
+  assert.equal(hasObjectiveProgressEvidence({
+    hasProgress: true,
+    filesChanged: 0,
+    newCommits: 0,
+    headChanged: true,
+  }), true);
+});

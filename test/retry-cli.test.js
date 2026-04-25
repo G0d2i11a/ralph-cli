@@ -54,8 +54,26 @@ test('retry resets failed_finalize tasks and exhausted story attempts', () => {
       consecutiveErrors: 1,
       lastProgressTime: 1,
       lastFilesChanged: 1,
+      finalizerCommitSha: 'abc123',
       finalizerAttempts: 2,
       mergeError: 'quality gate failed',
+      finalizeRepairStartedAt: 10,
+      finalizeRepairDeadlineAt: 20,
+      finalizeRepairLastFailureSnapshot: {
+        headSha: 'abc123',
+        commitsAheadOfBase: 1,
+        changedFiles: 1,
+        worktreeDiffSignature: 'sig-1',
+        failureKind: 'quality_gate',
+        failureSignature: 'quality gate failed',
+        capturedAt: 10,
+      },
+      finalizeRepairLastProgressAt: 11,
+      finalizeRepairLastProgressReason: 'HEAD changed',
+      finalizeRepairConsecutiveNoProgress: 1,
+      finalizeRepairTotalRequeues: 3,
+      finalizeRepairStoppedAt: 12,
+      finalizeRepairStopReason: 'repair_no_progress',
       storyProgress: [
         { id: 'US-001', status: 'failed', attempts: 2, lastError: 'network failed', updatedAt: 1 },
         { id: 'US-002', status: 'passed', attempts: 1, updatedAt: 1 },
@@ -72,8 +90,18 @@ test('retry resets failed_finalize tasks and exhausted story attempts', () => {
     assert.equal(output.currentStatus, 'pending');
     assert.deepEqual(output.resetStoryIds, ['US-001', 'US-003']);
     assert.deepEqual(state.completedUS, ['US-002']);
+    assert.equal(state.finalizerCommitSha, undefined);
     assert.equal(state.finalizerAttempts, 0);
     assert.equal(state.mergeError, undefined);
+    assert.equal(state.finalizeRepairStartedAt, undefined);
+    assert.equal(state.finalizeRepairDeadlineAt, undefined);
+    assert.equal(state.finalizeRepairLastFailureSnapshot, undefined);
+    assert.equal(state.finalizeRepairLastProgressAt, undefined);
+    assert.equal(state.finalizeRepairLastProgressReason, undefined);
+    assert.equal(state.finalizeRepairConsecutiveNoProgress, 0);
+    assert.equal(state.finalizeRepairTotalRequeues, 0);
+    assert.equal(state.finalizeRepairStoppedAt, undefined);
+    assert.equal(state.finalizeRepairStopReason, undefined);
     assert.equal(state.storyProgress[0].status, 'pending');
     assert.equal(state.storyProgress[0].attempts, 0);
     assert.equal(state.storyProgress[2].status, 'pending');

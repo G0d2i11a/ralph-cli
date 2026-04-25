@@ -81,11 +81,21 @@ export async function retryCommand(taskId: string) {
       consecutiveErrors: 0,
       lastProgressTime: Date.now(),
       lastError: undefined,
+      finalizerCommitSha: previousStatus === 'failed_finalize' ? undefined : task.finalizerCommitSha,
       finalizerAttempts: previousStatus === 'failed_finalize' ? 0 : task.finalizerAttempts,
       mergeError: previousStatus === 'failed_finalize' ? undefined : task.mergeError,
       mergeConflictFiles: previousStatus === 'failed_finalize' ? undefined : task.mergeConflictFiles,
       mergeConflictAt: previousStatus === 'failed_finalize' ? undefined : task.mergeConflictAt,
       mergeRepairAttempts: previousStatus === 'failed_finalize' ? 0 : task.mergeRepairAttempts,
+      finalizeRepairStartedAt: previousStatus === 'failed_finalize' ? undefined : task.finalizeRepairStartedAt,
+      finalizeRepairDeadlineAt: previousStatus === 'failed_finalize' ? undefined : task.finalizeRepairDeadlineAt,
+      finalizeRepairLastFailureSnapshot: previousStatus === 'failed_finalize' ? undefined : task.finalizeRepairLastFailureSnapshot,
+      finalizeRepairLastProgressAt: previousStatus === 'failed_finalize' ? undefined : task.finalizeRepairLastProgressAt,
+      finalizeRepairLastProgressReason: previousStatus === 'failed_finalize' ? undefined : task.finalizeRepairLastProgressReason,
+      finalizeRepairConsecutiveNoProgress: previousStatus === 'failed_finalize' ? 0 : task.finalizeRepairConsecutiveNoProgress,
+      finalizeRepairTotalRequeues: previousStatus === 'failed_finalize' ? 0 : task.finalizeRepairTotalRequeues,
+      finalizeRepairStoppedAt: previousStatus === 'failed_finalize' ? undefined : task.finalizeRepairStoppedAt,
+      finalizeRepairStopReason: previousStatus === 'failed_finalize' ? undefined : task.finalizeRepairStopReason,
     });
     await scheduler.schedulePendingTasks();
 
