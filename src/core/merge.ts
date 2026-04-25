@@ -73,9 +73,25 @@ function runGit(cwd: string, args: string[]): string {
   }).trim();
 }
 
+function runGitRaw(cwd: string, args: string[]): string {
+  return execFileSync('git', args, {
+    cwd,
+    encoding: 'utf-8',
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+}
+
 function tryRunGit(cwd: string, args: string[]): string | null {
   try {
     return runGit(cwd, args);
+  } catch {
+    return null;
+  }
+}
+
+function tryRunGitRaw(cwd: string, args: string[]): string | null {
+  try {
+    return runGitRaw(cwd, args);
   } catch {
     return null;
   }
@@ -98,7 +114,7 @@ function getCurrentBranch(repoPath: string): string | undefined {
 }
 
 function getPorcelainStatus(repoPath: string): string {
-  const status = tryRunGit(repoPath, ['status', '--porcelain']) || '';
+  const status = tryRunGitRaw(repoPath, ['status', '--porcelain']) || '';
   return status
     .split('\n')
     .filter((line) => {
@@ -109,6 +125,14 @@ function getPorcelainStatus(repoPath: string): string {
         && !filePath.startsWith('.ralph/');
     })
     .join('\n');
+}
+
+function summarizeDirtyStatus(status: string, limit = 10): string[] {
+  return status
+    .split('\n')
+    .map((line) => line.trimEnd())
+    .filter((line) => line.length > 0)
+    .slice(0, limit);
 }
 
 function hasUpstream(repoPath: string): boolean {
@@ -231,9 +255,22 @@ function syncTargetBranchIfSafe(
 
   const dirtyCheckout = targetCheckouts.find((worktree) => getPorcelainStatus(worktree.path));
   if (dirtyCheckout) {
+    const dirtyStatus = getPorcelainStatus(dirtyCheckout.path);
+    const summary = summarizeDirtyStatus(dirtyStatus);
+    const lines = [
+      `${normalizedTarget} sync deferred: checkout ${dirtyCheckout.path} has uncommitted changes`,
+      ...summary.map((line) => `  ${line}`),
+    ];
+    const totalDirtyPaths = dirtyStatus
+      .split('\n')
+      .map((line) => line.trim())
+      .filter((line) => line.length > 0).length;
+    if (totalDirtyPaths > summary.length) {
+      lines.push(`  ... ${totalDirtyPaths - summary.length} more`);
+    }
     return {
       synced: false,
-      message: `${normalizedTarget} sync deferred: checkout ${dirtyCheckout.path} has uncommitted changes`,
+      message: lines.join('\n'),
     };
   }
 

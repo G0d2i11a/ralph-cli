@@ -66,6 +66,7 @@ test('mergeBranch integrates through dedicated worktree when live checkout is di
     assert.equal(result.integrationBranch, 'ralph/integration/main');
     assert.equal(result.targetSynced, false);
     assert.match(result.targetSyncMessage, /sync deferred/);
+    assert.match(result.targetSyncMessage, /\?\? dirty\.txt/);
     assert.equal(git(['rev-parse', 'main'], repoDir), originalMain);
     assert.match(git(['show', 'ralph/integration/main:feature.txt'], repoDir), /task change/);
     assert.equal(git(['rev-parse', '--abbrev-ref', 'HEAD'], repoDir), 'main');
