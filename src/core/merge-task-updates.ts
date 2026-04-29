@@ -1,5 +1,6 @@
 import { createHash } from 'crypto';
 import {
+  MergeFailurePhase,
   MergeProofSourceKind,
   MergeResult,
   MergeabilityProbeResult,
@@ -51,7 +52,7 @@ export function deriveMergeRepairDisplayStatus(
 export function buildMergeRepairProof(
   probeResult: Pick<
     MergeabilityProbeResult,
-    'message' | 'conflictFiles' | 'integrationBranch' | 'sourceKind' | 'worktreeMergeState'
+    'message' | 'conflictFiles' | 'failurePhase' | 'integrationBranch' | 'sourceKind' | 'worktreeMergeState'
   >,
   observedAt = Date.now(),
 ): TaskMergeRepairProof {
@@ -59,6 +60,7 @@ export function buildMergeRepairProof(
     observedAt,
     sourceKind: probeResult.sourceKind,
     worktreeMergeKind: probeResult.worktreeMergeState?.kind,
+    failurePhase: probeResult.failurePhase,
     message: probeResult.message,
     conflictFiles: probeResult.conflictFiles,
     changedFiles: probeResult.worktreeMergeState?.changedFiles,
@@ -69,7 +71,7 @@ export function buildMergeRepairProof(
 export function buildMergeRepairObservationSignature(
   probeResult: Pick<
     MergeabilityProbeResult,
-    'mergeable' | 'alreadyIntegrated' | 'message' | 'conflictFiles' | 'integrationBranch' | 'sourceKind' | 'worktreeMergeState'
+    'mergeable' | 'alreadyIntegrated' | 'message' | 'conflictFiles' | 'failurePhase' | 'integrationBranch' | 'sourceKind' | 'worktreeMergeState'
   >,
 ): string {
   const payload = {
@@ -79,6 +81,7 @@ export function buildMergeRepairObservationSignature(
     integrationBranch: probeResult.integrationBranch || '',
     message: probeResult.message || '',
     conflictFiles: [...new Set(probeResult.conflictFiles || [])].sort(),
+    failurePhase: (probeResult.failurePhase || '') as MergeFailurePhase | '',
     worktreeMergeKind: (probeResult.worktreeMergeState?.kind || 'none') as WorktreeMergeStateKind,
     headSha: probeResult.worktreeMergeState?.headSha || '',
     statusSignature: probeResult.worktreeMergeState?.statusSignature || '',
@@ -109,6 +112,7 @@ export function buildSuccessfulMergeTaskUpdates(
     mergeMessage: result.message,
     mergeError: undefined,
     mergeConflictFiles: undefined,
+    mergeConflictPhase: result.failurePhase,
     mergeConflictAt: undefined,
     postFinalizeMergeProbeRequired: undefined,
     targetSyncedAt: result.targetSynced ? Date.now() : undefined,
@@ -117,6 +121,7 @@ export function buildSuccessfulMergeTaskUpdates(
     coordinationStatus: undefined,
     coordinationPhase: undefined,
     coordinationBlockers: undefined,
+    coordinationConflicts: undefined,
     coordinationReason: undefined,
     mergeRepairDisplayStatus: undefined,
     mergeRepairProof: undefined,
@@ -146,10 +151,12 @@ export function buildFailedMergeTaskUpdates(
     targetSyncStatus: 'not_requested' as const,
     targetSyncDeferredReason: undefined,
     mergeConflictFiles: result.conflictFiles,
+    mergeConflictPhase: undefined,
     mergeConflictAt: result.hasConflicts ? Date.now() : undefined,
     coordinationStatus: undefined,
     coordinationPhase: undefined,
     coordinationBlockers: undefined,
+    coordinationConflicts: undefined,
     coordinationReason: undefined,
     mergeRepairDisplayStatus: result.hasConflicts ? 'unresolved' as const : undefined,
   };

@@ -399,7 +399,7 @@ test('stop command releases running merge-repair quarantine with a queue reason'
 
     assert.equal(result.status, 0, result.stderr);
     assert.equal(output.quarantineReleased, true);
-    assert.equal(state.status, 'failed');
+    assert.equal(state.status, 'stopped');
     assert.equal(state.pid, undefined);
     assert.equal(state.quarantineExitKind, 'stop');
     assert.equal(state.quarantineReleaseReason, 'operator stopped stale repair');
@@ -597,6 +597,12 @@ test('queue command compact mode trims heavy task payload fields', () => {
       coordinationStatus: 'blocked_observed_overlap',
       coordinationPhase: 'finalize',
       coordinationBlockers: ['task-a'],
+      coordinationConflicts: [{
+        taskId: 'task-a',
+        overlapKinds: ['write_surface'],
+        overlappingDomains: [],
+        overlappingPaths: ['packages/app/src/index.ts'],
+      }],
       coordinationReason: 'shared writes',
       integrationLane: 'main',
       declaredWriteSurface: ['packages/app/src'],
@@ -632,8 +638,17 @@ test('queue command compact mode trims heavy task payload fields', () => {
     });
     assert.equal(task.integrationStatus, 'not_started');
     assert.equal(task.coordination.status, 'blocked_observed_overlap');
+    assert.equal(task.coordination.owner, 'task-a');
+    assert.equal(task.coordination.phase, 'finalize');
+    assert.equal(task.coordination.lane, 'main');
     assert.equal(task.coordination.reason, 'shared writes');
     assert.deepEqual(task.coordination.blockers, ['task-a']);
+    assert.deepEqual(task.coordination.conflicts, [{
+      taskId: 'task-a',
+      overlapKinds: ['write_surface'],
+      overlappingDomains: [],
+      overlappingPaths: ['packages/app/src/index.ts'],
+    }]);
     assert.equal(task.coordination.observedWriteSurface, undefined);
     assert.equal(task.coordination.declaredConflictDomains, undefined);
     assert.equal(task.storyProgress[0].history, undefined);

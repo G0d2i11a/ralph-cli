@@ -1,7 +1,11 @@
 import { ConfigManager } from '../config/manager';
 import { resolveAutoIntegrate } from '../core/integration-policy';
-import { getManagerStatus } from '../core/manager-state';
-import { buildCoordinationState, isHotConflictQuarantineOwner } from '../core/task-coordination';
+import { getManagerStatus, ManagerStatus } from '../core/manager-state';
+import {
+  buildCoordinationState,
+  CoordinationOverlapMatch,
+  formatCoordinationConflictSurface,
+} from '../core/task-coordination';
 import { summarizeActiveRepoPaths } from '../core/task-home-summary';
 import { buildAutoRecoveryState, buildDeliveryState, buildTransientRetryState, resolveTaskIntegrationStatus } from '../core/task-delivery';
 import { evaluateAutoRecovery } from '../core/auto-recovery-state';
@@ -27,6 +31,7 @@ interface PendingSummary {
   failedBlockers?: string[];
   recoveringBlockers?: string[];
   coordinationReason?: string;
+  coordinationConflicts?: CoordinationOverlapMatch[];
   integrationLane?: string;
   maxConcurrent: number;
   running: number;
@@ -41,6 +46,19 @@ interface QueueCommandOptions {
   compact?: boolean;
 }
 
+const MAX_HUMAN_COORDINATION_BLOCKERS = 2;
+
+interface QueueManagerStatus extends ManagerStatus {
+  heartbeatStaleSuppressed?: boolean;
+  heartbeatStaleSuppressedReason?: string;
+  finalizerLease?: {
+    taskId: string;
+    owner?: string;
+    heartbeatAt?: string;
+    expiresAt: string;
+  };
+}
+
 function parsePositiveNumber(value: string | number | undefined): number | undefined {
   if (value === undefined) {
     return undefined;
@@ -48,6 +66,45 @@ function parsePositiveNumber(value: string | number | undefined): number | undef
 
   const numericValue = Number(value);
   return Number.isFinite(numericValue) && numericValue > 0 ? numericValue : undefined;
+}
+
+export function findFreshFinalizerLease(tasks: Task[], now: number): Task | undefined {
+  return tasks
+    .filter((task) => (
+      task.status === 'finalizing'
+      && typeof task.leaseExpiresAt === 'number'
+      && task.leaseExpiresAt > now
+    ))
+    .sort((left, right) => (right.leaseExpiresAt ?? 0) - (left.leaseExpiresAt ?? 0))[0];
+}
+
+export function adjustManagerStatusForFinalizerLease(
+  manager: ManagerStatus,
+  finalizerTask: Task | undefined,
+): QueueManagerStatus {
+  if (
+    !finalizerTask
+    || !manager.heartbeatStale
+    || manager.processRunning === false
+  ) {
+    return manager;
+  }
+
+  return {
+    ...manager,
+    heartbeatStale: false,
+    heartbeatStaleSuppressed: true,
+    heartbeatStaleSuppressedReason: 'active_finalizer_lease',
+    message: `manager heartbeat is stale, but task ${finalizerTask.id} has an active finalizer lease`,
+    finalizerLease: {
+      taskId: finalizerTask.id,
+      owner: finalizerTask.leaseOwner,
+      heartbeatAt: finalizerTask.leaseHeartbeatAt
+        ? new Date(finalizerTask.leaseHeartbeatAt).toISOString()
+        : undefined,
+      expiresAt: new Date(finalizerTask.leaseExpiresAt as number).toISOString(),
+    },
+  };
 }
 
 function hasResolvedMergeRepair(task: Task): boolean {
@@ -75,6 +132,10 @@ function stoppedFailedReason(task: Task): string {
     return 'merge_repair_quarantine_released';
   }
 
+  if (task.mergeConflictPhase === 'integration_sync') {
+    return 'integration_sync_conflict';
+  }
+
   if (task.mergeRepairRecoveryStoppedAt || task.mergeRepairDisplayStatus === 'stopped') {
     return 'merge_repair_stopped';
   }
@@ -96,6 +157,48 @@ function stoppedFailedReason(task: Task): string {
   }
 
   return 'task_failed';
+}
+
+function hasHotConflictReservation(task: Task): boolean {
+  if (task.repairContext?.mode === 'merge') {
+    return true;
+  }
+
+  if (task.integrationStatus === 'blocked_conflict') {
+    return true;
+  }
+
+  if (task.postFinalizeMergeProbeRequired === true) {
+    return true;
+  }
+
+  if (Boolean(task.mergeRepairAttempts && task.mergeRepairAttempts > 0)) {
+    return true;
+  }
+
+  if (task.mergeConflictFiles && task.mergeConflictFiles.length > 0) {
+    return true;
+  }
+
+  return /Merge conflicts detected/i.test(task.mergeError || task.lastError || '');
+}
+
+function isHotConflictQuarantineOwner(task: Task): boolean {
+  if (isQuarantineOwnershipReleased(task)) {
+    return false;
+  }
+
+  if (!hasHotConflictReservation(task)) {
+    return false;
+  }
+
+  if (task.status === 'completed') {
+    return task.integrationStatus === 'blocked_conflict';
+  }
+
+  return task.status === 'failed'
+    || task.status === 'stagnant'
+    || task.status === 'failed_finalize';
 }
 
 export function deriveAttention(task: Task, pendingState?: PendingSummary): { needed: boolean; reason?: string } {
@@ -142,6 +245,10 @@ export function deriveAttention(task: Task, pendingState?: PendingSummary): { ne
     return autoRecoveryActive
       ? { needed: false }
       : { needed: true, reason: hasStoppedRecoveryState(task) ? 'stagnant_recovery_stopped' : 'task_stagnant' };
+  }
+
+  if (task.status === 'stopped' && quarantineReleased) {
+    return { needed: true, reason: 'merge_repair_quarantine_released' };
   }
 
   if (task.status === 'failed_finalize') {
@@ -223,7 +330,9 @@ function compactCoordinationState(coordination: ReturnType<typeof buildCoordinat
   return {
     status: coordination.status,
     phase: coordination.phase,
+    owner: coordination.owner,
     blockers: coordination.blockers,
+    conflicts: coordination.conflicts,
     reason: coordination.reason,
     lane: coordination.lane,
   };
@@ -247,6 +356,8 @@ function compactTaskSummary(taskSummary: Record<string, any>) {
     errorMessage: taskSummary.errorMessage,
     mergeError: taskSummary.mergeError,
     reason: taskSummary.reason,
+    coordinationReason: taskSummary.coordinationReason,
+    coordinationConflicts: taskSummary.coordinationConflicts,
     blockers: taskSummary.blockers,
     failedDependencies: taskSummary.failedDependencies,
     recoveringDependencies: taskSummary.recoveringDependencies,
@@ -267,14 +378,26 @@ function compactTaskSummary(taskSummary: Record<string, any>) {
   };
 }
 
-function summarizeTask(
+export function summarizeTask(
   task: Task,
   pendingState?: PendingSummary,
   autoIntegrateEnabled: boolean = false,
   compact: boolean = false,
 ) {
   const delivery = buildDeliveryState(task);
-  const coordination = buildCoordinationState(task);
+  const persistedCoordination = buildCoordinationState(task);
+  const coordination = pendingState?.reason === 'coordination'
+    ? {
+        ...persistedCoordination,
+        status: persistedCoordination?.status ?? ('blocked_predicted_overlap' as const),
+        phase: persistedCoordination?.phase ?? ('start' as const),
+        owner: pendingState.blockers[0] ?? persistedCoordination?.owner,
+        blockers: pendingState.blockers,
+        conflicts: pendingState.coordinationConflicts ?? persistedCoordination?.conflicts,
+        reason: pendingState.coordinationReason ?? persistedCoordination?.reason,
+        lane: pendingState.integrationLane ?? persistedCoordination?.lane,
+      }
+    : persistedCoordination;
   const transientRetry = buildTransientRetryState(task);
   const autoRecovery = buildAutoRecoveryState(task);
   const quarantine = buildQuarantineQueueState(task);
@@ -296,6 +419,8 @@ function summarizeTask(
     errorMessage: task.lastError,
     mergeError: task.mergeError,
     reason: pendingState?.reason,
+    coordinationReason: pendingState?.coordinationReason ?? coordination?.reason,
+    coordinationConflicts: pendingState?.coordinationConflicts ?? coordination?.conflicts,
     dependencyBlockers: pendingState?.dependencyBlockers,
     failedDependencies: pendingState?.failedDependencies,
     recoveringDependencies: pendingState?.recoveringDependencies,
@@ -361,6 +486,21 @@ function summarizeTask(
   return compact ? compactTaskSummary(taskSummary) : taskSummary;
 }
 
+function formatPendingCoordinationBlockers(pendingState: PendingSummary): string {
+  if (!pendingState.coordinationConflicts?.length) {
+    return pendingState.blockers.join(', ');
+  }
+
+  const visibleConflicts = pendingState.coordinationConflicts.slice(0, MAX_HUMAN_COORDINATION_BLOCKERS);
+  const suffix = pendingState.coordinationConflicts.length > visibleConflicts.length
+    ? `, +${pendingState.coordinationConflicts.length - visibleConflicts.length} more`
+    : '';
+
+  return `${visibleConflicts
+    .map((conflict) => `${conflict.taskId} (${formatCoordinationConflictSurface(conflict)})`)
+    .join(', ')}${suffix}`;
+}
+
 export function resolveNextAction(task: Task, pendingState?: PendingSummary, autoIntegrateEnabled: boolean = false): string {
   const integrationStatus = resolveTaskIntegrationStatus(task);
   const quarantineReleased = isQuarantineOwnershipReleased(task);
@@ -395,7 +535,7 @@ export function resolveNextAction(task: Task, pendingState?: PendingSummary, aut
         return `wait for overlapping task auto-recovery: ${pendingState.recoveringBlockers.join(', ')}`;
       }
 
-      return `wait for earlier overlapping task(s) to integrate: ${pendingState.blockers.join(', ')}`;
+      return `wait for earlier overlapping task(s) to integrate: ${formatPendingCoordinationBlockers(pendingState)}`;
     }
 
     if (task.repairContext?.mode === 'merge') {
@@ -435,6 +575,10 @@ export function resolveNextAction(task: Task, pendingState?: PendingSummary, aut
   }
 
   if (task.status === 'failed') {
+    if (task.mergeConflictPhase === 'integration_sync') {
+      return 'resolve the integration branch sync conflict, then retry the blocked task';
+    }
+
     if (task.mergeRepairRecoveryStoppedAt || task.mergeRepairDisplayStatus === 'stopped') {
       return 'manual merge repair required; resolve conflicts in the task worktree or explicitly reset/requeue the repair story';
     }
@@ -527,9 +671,12 @@ async function buildQueueSnapshot(
   const configManager = new ConfigManager();
   const ralphHome = resolveRalphHome();
   const autoIntegrateEnabled = resolveAutoIntegrate(configManager);
-  const manager = getManagerStatus({ ralphHome, staleAfterMs });
-
+  const snapshotNow = Date.now();
   const tasks = await stateManager.listTasks();
+  const manager = adjustManagerStatusForFinalizerLease(
+    getManagerStatus({ ralphHome, staleAfterMs, now: () => snapshotNow }),
+    findFreshFinalizerLease(tasks, snapshotNow),
+  );
   const activeTasks = tasks.filter((task) => (
     task.status === 'pending'
     || task.status === 'running'
@@ -545,6 +692,7 @@ async function buildQueueSnapshot(
       )
     )
     || (task.status === 'completed' && resolveTaskIntegrationStatus(task) !== 'integrated')
+    || (task.status === 'stopped' && deriveAttention(task).needed)
   ));
 
   const output = [];
@@ -555,7 +703,7 @@ async function buildQueueSnapshot(
     output.push(summarizeTask(task, pendingState, autoIntegrateEnabled, compact));
   }
   const repoSummary = summarizeActiveRepoPaths(activeTasks);
-  const recentCompletedThreshold = Date.now() - (recentCompletedWindowSeconds * 1000);
+  const recentCompletedThreshold = snapshotNow - (recentCompletedWindowSeconds * 1000);
   const recentCompleted = tasks
     .filter((task) => isIntegratedCompletion(task) && (task.updatedAt ?? 0) >= recentCompletedThreshold)
     .sort((left, right) => (right.updatedAt ?? 0) - (left.updatedAt ?? 0))

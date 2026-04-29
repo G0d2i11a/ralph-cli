@@ -44,7 +44,7 @@ _ralph_completion() {
       return 0
       ;;
     --status)
-      COMPREPLY=( $(compgen -W "pending running ready_to_finalize finalizing completed failed failed_finalize stagnant" -- \${cur}) )
+      COMPREPLY=( $(compgen -W "pending running ready_to_finalize finalizing completed failed failed_finalize stagnant stopped" -- \${cur}) )
       return 0
       ;;
     --strategy)
@@ -146,7 +146,7 @@ _ralph() {
           ;;
         list)
           _arguments \\
-            '--status[Filter by status]:status:(pending running ready_to_finalize finalizing completed failed failed_finalize stagnant)'
+            '--status[Filter by status]:status:(pending running ready_to_finalize finalizing completed failed failed_finalize stagnant stopped)'
           ;;
         watch)
           _arguments \\

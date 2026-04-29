@@ -341,6 +341,7 @@ export async function finalizeCommand(taskId: string): Promise<void> {
               coordinationStatus: undefined,
               coordinationPhase: undefined,
               coordinationBlockers: undefined,
+              coordinationConflicts: undefined,
               coordinationReason: undefined,
             };
             await stateManager.updateTask(taskId, failureUpdates);

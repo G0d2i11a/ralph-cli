@@ -947,6 +947,7 @@ export class DependencyWatcher {
         lastErrorHadObjectiveProgress: false,
         mergeError: mergeProbeResult.mergeable ? undefined : mergeProbeResult.message,
         mergeConflictFiles: mergeProbeResult.mergeable ? undefined : mergeProbeResult.conflictFiles,
+        mergeConflictPhase: mergeProbeResult.mergeable ? undefined : mergeProbeResult.failurePhase,
         mergeConflictAt: mergeProbeResult.mergeable ? undefined : now,
         integrationBranch: mergeProbeResult.integrationBranch,
         integrationWorktree: mergeProbeResult.integrationWorktree,
@@ -1086,10 +1087,14 @@ export class DependencyWatcher {
 
       const currentTotalRequeues = hasProgress ? 0 : (task.mergeRepairRecoveryTotalRequeues ?? 0);
       const currentAutoRequeues = task.autoRecoveryTotalRequeues ?? 0;
+      const integrationSyncConflict = mergeProbeResult.failurePhase === 'integration_sync';
       let stopReason: string | undefined;
       let stopMessage: string | undefined;
 
-      if (deadlineAt <= now) {
+      if (integrationSyncConflict) {
+        stopReason = 'merge_repair_integration_sync_conflict';
+        stopMessage = 'Integration branch sync conflict must be resolved before task merge repair can continue';
+      } else if (deadlineAt <= now) {
         stopReason = 'merge_repair_deadline_exhausted';
         stopMessage = 'Worker merge repair deadline exhausted';
       } else if (currentTotalRequeues >= repairConfig.repairHardCap || currentAutoRequeues >= repairConfig.repairHardCap) {
@@ -1122,6 +1127,7 @@ export class DependencyWatcher {
           message: stopMessage,
           data: {
             stopReason,
+            failurePhase: mergeProbeResult.failurePhase,
             exactProbeMessage: mergeProbeResult.message,
             conflictFiles: mergeProbeResult.conflictFiles,
             consecutiveNoProgress: nextConsecutiveNoProgress,
@@ -1979,6 +1985,7 @@ export class DependencyWatcher {
             coordinationStatus: undefined,
             coordinationPhase: undefined,
             coordinationBlockers: undefined,
+            coordinationConflicts: undefined,
             coordinationReason: undefined,
             mergeRepairDisplayStatus: undefined,
             mergeRepairProof: undefined,
@@ -2045,6 +2052,7 @@ export class DependencyWatcher {
               coordinationStatus: undefined,
               coordinationPhase: undefined,
               coordinationBlockers: undefined,
+              coordinationConflicts: undefined,
               coordinationReason: undefined,
               mergeRepairDisplayStatus: undefined,
               mergeRepairProof: undefined,
@@ -2268,6 +2276,7 @@ export class DependencyWatcher {
       coordinationStatus: undefined,
       coordinationPhase: undefined,
       coordinationBlockers: undefined,
+      coordinationConflicts: undefined,
       coordinationReason: undefined,
     };
   }
@@ -2856,6 +2865,7 @@ export class DependencyWatcher {
         coordinationStatus: undefined,
         coordinationPhase: undefined,
         coordinationBlockers: undefined,
+        coordinationConflicts: undefined,
         coordinationReason: undefined,
         failedBlockerRecoveryStartedAt: startedAt,
         failedBlockerRecoveryDeadlineAt: deadlineAt,

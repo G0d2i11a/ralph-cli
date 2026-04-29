@@ -1,7 +1,5 @@
 import { StateManager } from '../core/state';
-import { finalizeTask, TaskScheduler } from '../core/scheduler';
-import { appendTaskEvent } from '../core/events';
-import { buildQuarantineReleaseUpdates } from '../core/quarantine';
+import { finalizeTask } from '../core/scheduler';
 import { hasHotConflictReservation } from '../core/task-coordination';
 import { isProcessRunning } from '../utils/helpers';
 
@@ -31,31 +29,6 @@ function signalTaskProcess(pid: number, signal: NodeJS.Signals): boolean {
 
 type StopCommandOptions = { reason?: string };
 
-async function releaseStoppedQuarantine(
-  stateManager: StateManager,
-  taskId: string,
-  reason: string,
-): Promise<void> {
-  const latestTask = await stateManager.loadTask(taskId);
-  if (!latestTask) {
-    return;
-  }
-
-  await stateManager.updateTask(taskId, buildQuarantineReleaseUpdates('stop', reason));
-  const releasedTask = await stateManager.loadTask(taskId);
-  appendTaskEvent(releasedTask || latestTask, {
-    type: 'merge_repair_quarantine_released',
-    status: releasedTask?.status || latestTask.status,
-    message: reason,
-    data: {
-      exitKind: 'stop',
-      conflictFiles: latestTask.mergeConflictFiles,
-    },
-  });
-
-  await new TaskScheduler({ stateManager }).schedulePendingTasks();
-}
-
 export async function stopCommand(taskId: string, options: StopCommandOptions = {}): Promise<void> {
   try {
     const stateManager = new StateManager();
@@ -74,19 +47,17 @@ export async function stopCommand(taskId: string, options: StopCommandOptions = 
     const releaseQuarantine = hasHotConflictReservation(task);
     const releaseReason = options.reason?.trim()
       || 'Task stopped by explicit user request';
+    if (releaseQuarantine) {
+      task.quarantineReleaseReason = releaseReason;
+    }
     
     if (!isProcessRunning(task.pid)) {
-      await finalizeTask(task, 'failed', { stateManager });
-      if (releaseQuarantine) {
-        await releaseStoppedQuarantine(stateManager, taskId, releaseReason);
-      }
-
       console.log(JSON.stringify({ 
         message: 'Process already stopped',
         taskId,
         quarantineReleased: releaseQuarantine,
-        quarantineReleaseReason: releaseQuarantine ? releaseReason : undefined,
       }));
+      await finalizeTask(task, 'stopped', { stateManager });
       return;
     }
     
@@ -102,16 +73,12 @@ export async function stopCommand(taskId: string, options: StopCommandOptions = 
         signalTaskProcess(task.pid, 'SIGKILL');
       }
       
-      await finalizeTask(task, 'failed', { stateManager });
-      if (releaseQuarantine) {
-        await releaseStoppedQuarantine(stateManager, taskId, releaseReason);
-      }
+      await finalizeTask(task, 'stopped', { stateManager });
       
       console.log(JSON.stringify({
         message: 'Task stopped',
         taskId,
         quarantineReleased: releaseQuarantine,
-        quarantineReleaseReason: releaseQuarantine ? releaseReason : undefined,
       }));
       
     } catch (error) {

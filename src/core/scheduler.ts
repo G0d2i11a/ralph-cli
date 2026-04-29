@@ -8,8 +8,10 @@ import { checkDependencies, DependencyBlocker, DependencyCheckResult, isProcessR
 import { bootstrapWorktreeDeps } from './bootstrap';
 import { appendTaskEvent } from './events';
 import { evaluateAutoRecovery } from './auto-recovery-state';
+import { buildQuarantineReleaseUpdates } from './quarantine';
 import {
   captureObservedTaskSurface,
+  CoordinationOverlapMatch,
   findCoordinationBlockers,
   hasHotConflictReservation,
   isHotConflictQuarantineOwner,
@@ -69,6 +71,7 @@ export interface PendingTaskState {
   failedBlockers?: string[];
   recoveringBlockers?: string[];
   coordinationReason?: string;
+  coordinationConflicts?: CoordinationOverlapMatch[];
   integrationLane?: string;
   maxConcurrent: number;
   running: number;
@@ -476,6 +479,7 @@ export class TaskScheduler {
         failedBlockers: coordinationState.failedBlockers,
         recoveringBlockers: coordinationState.recoveringBlockers,
         coordinationReason: coordinationState.reason,
+        coordinationConflicts: coordinationState.conflicts,
         integrationLane: coordinationState.lane,
         maxConcurrent,
         running,
@@ -497,6 +501,7 @@ export class TaskScheduler {
     failedBlockers: string[];
     recoveringBlockers: string[];
     reason?: string;
+    conflicts: CoordinationOverlapMatch[];
     lane: string;
   } | null> {
     const tasks = await this.stateManager.listTasks();
@@ -534,9 +539,14 @@ export class TaskScheduler {
           failedBlockers,
           recoveringBlockers,
           reason: result.reason,
+          conflicts: result.matches,
           lane: result.lane,
         }
       : null;
+  }
+
+  private serializeCoordinationConflicts(conflicts?: CoordinationOverlapMatch[]): string {
+    return JSON.stringify(conflicts ?? []);
   }
 
   private coordinationUpdatesChanged(task: Task, updates: Partial<Task>): boolean {
@@ -549,7 +559,8 @@ export class TaskScheduler {
       || task.coordinationReason !== updates.coordinationReason
       || task.declaredWriteSurface?.join('\n') !== updates.declaredWriteSurface?.join('\n')
       || task.declaredConflictDomains?.join('\n') !== updates.declaredConflictDomains?.join('\n')
-      || currentBlockers.join('\n') !== nextBlockers.join('\n');
+      || currentBlockers.join('\n') !== nextBlockers.join('\n')
+      || this.serializeCoordinationConflicts(task.coordinationConflicts) !== this.serializeCoordinationConflicts(updates.coordinationConflicts);
   }
 
   async schedulePendingTasks(): Promise<Task[]> {
@@ -599,6 +610,7 @@ export class TaskScheduler {
                 data: {
                   phase: coordinationState.phase,
                   blockers: coordinationState.blockers,
+                  conflicts: coordinationState.matches,
                   lane: coordinationState.lane,
                 },
               });
@@ -676,6 +688,7 @@ export class TaskScheduler {
         coordinationStatus: undefined,
         coordinationPhase: undefined,
         coordinationBlockers: undefined,
+        coordinationConflicts: undefined,
         coordinationReason: undefined,
       });
       currentTask = {
@@ -831,6 +844,11 @@ export async function finalizeTask(
   const conflictReservationSurface = status === 'failed' && task.worktree && hasHotConflictReservation(task)
     ? captureObservedTaskSurface(task)
     : {};
+  const quarantineReleaseReason = task.quarantineReleaseReason
+    || 'Task stopped by explicit user request';
+  const quarantineRelease = status === 'stopped' && hasHotConflictReservation(task)
+    ? buildQuarantineReleaseUpdates('stop', quarantineReleaseReason, now())
+    : {};
 
   task.status = status;
   task.endTime = now();
@@ -849,6 +867,7 @@ export async function finalizeTask(
     leaseHeartbeatAt: undefined,
     leaseExpiresAt: undefined,
     ...conflictReservationSurface,
+    ...quarantineRelease,
   });
   appendTaskEvent(task, {
     type: 'task_terminal',
