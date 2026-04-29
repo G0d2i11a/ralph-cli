@@ -8,7 +8,7 @@ import {
   formatStoryCompletionInvariantMessage,
 } from '../core/story-completion';
 
-const RETRYABLE_STATUSES = new Set(['failed', 'stagnant', 'failed_finalize']);
+const RETRYABLE_STATUSES = new Set(['failed', 'stagnant', 'failed_finalize', 'stopped']);
 type RetryCommandOptions = { finalizeOnly?: boolean };
 
 function hasMergeConflict(task: Pick<Task, 'mergeConflictFiles' | 'mergeError' | 'lastError'>): boolean {
@@ -154,7 +154,7 @@ export async function retryCommand(taskId: string, options: RetryCommandOptions 
 
     if (!RETRYABLE_STATUSES.has(previousStatus) && !retryableCompletedConflict) {
       console.error(JSON.stringify({
-        error: `Cannot retry task with status '${previousStatus}'. Only 'failed', 'stagnant', 'failed_finalize', or 'completed' tasks blocked by merge conflicts can be retried.`,
+        error: `Cannot retry task with status '${previousStatus}'. Only 'failed', 'stagnant', 'failed_finalize', 'stopped', or 'completed' tasks blocked by merge conflicts can be retried.`,
         taskId,
         currentStatus: previousStatus
       }));
@@ -232,6 +232,7 @@ export async function retryCommand(taskId: string, options: RetryCommandOptions 
       || previousStatus === 'failed_finalize'
       || retryableCompletedConflict
       || previousStatus === 'stagnant'
+      || previousStatus === 'stopped'
     ) && hasMergeConflict(task);
     const retryProgress = retryFromMergeConflict
       ? resetFailedFinalizeMergeRepair(task)

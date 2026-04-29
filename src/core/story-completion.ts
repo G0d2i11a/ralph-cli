@@ -82,6 +82,7 @@ export function buildStoryCompletionInvariantFailureUpdates(
     coordinationStatus: undefined,
     coordinationPhase: undefined,
     coordinationBlockers: undefined,
+    coordinationConflicts: undefined,
     coordinationReason: undefined,
     lastError: message,
     lastErrorKind: 'story_incomplete',

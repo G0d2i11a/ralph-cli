@@ -122,6 +122,102 @@ test('findCoordinationBlockers keeps failed merge-conflict owners blocking later
   assert.equal(result.phase, 'start');
 });
 
+for (const ownerStatus of ['pending', 'running', 'ready_to_finalize', 'finalizing']) {
+  test(`findCoordinationBlockers blocks start behind earlier ${ownerStatus} observed write surface`, () => {
+    const earlierTask = createTask({
+      id: `${ownerStatus}-owner`,
+      status: ownerStatus,
+      observedWriteSurface: ['packages/contracts/src/index.ts'],
+      startTime: 100,
+      enqueuedAt: 100,
+    });
+    const laterTask = createTask({
+      id: 'later-task',
+      status: 'pending',
+      declaredWriteSurface: ['packages/contracts/src/index.ts'],
+      startTime: 200,
+      enqueuedAt: 200,
+    });
+
+    const result = findCoordinationBlockers(laterTask, [earlierTask, laterTask], 'start', { targetBranch: 'main' });
+
+    assert.equal(result.blocked, true);
+    assert.equal(result.status, 'blocked_predicted_overlap');
+    assert.deepEqual(result.blockers, [`${ownerStatus}-owner`]);
+    assert.deepEqual(result.matches, [{
+      taskId: `${ownerStatus}-owner`,
+      overlapKinds: ['write_surface'],
+      overlappingDomains: [],
+      overlappingPaths: ['packages/contracts/src/index.ts'],
+    }]);
+    assert.deepEqual(result.taskUpdates.coordinationConflicts, result.matches);
+    assert.match(result.reason, new RegExp(`${ownerStatus}-owner`));
+    assert.match(result.reason, /packages\/contracts\/src\/index\.ts/);
+  });
+}
+
+for (const scenario of [
+  {
+    name: 'running owner',
+    owner: { status: 'running' },
+    blocked: true,
+  },
+  {
+    name: 'ready_to_finalize owner',
+    owner: { status: 'ready_to_finalize' },
+    blocked: true,
+  },
+  {
+    name: 'completed blocked_conflict owner',
+    owner: { status: 'completed', integrationStatus: 'blocked_conflict' },
+    blocked: true,
+  },
+  {
+    name: 'failed merge-conflict owner',
+    owner: { status: 'failed' },
+    blocked: true,
+  },
+  {
+    name: 'stopped merge-conflict owner',
+    owner: { status: 'stopped' },
+    blocked: false,
+  },
+  {
+    name: 'completed integrated owner',
+    owner: { status: 'completed', integrationStatus: 'integrated', integratedAt: 123 },
+    blocked: false,
+  },
+]) {
+  test(`findCoordinationBlockers ${scenario.blocked ? 'keeps' : 'releases'} reservation for ${scenario.name}`, () => {
+    const earlierTask = createTask({
+      id: 'surface-owner',
+      observedWriteSurface: ['packages/contracts/src/index.ts'],
+      mergeConflictFiles: ['packages/contracts/src/index.ts'],
+      repairContext: {
+        mode: 'merge',
+        storyId: 'US-003',
+        createdAt: 123,
+        reason: 'Merge repair required by Ralph.',
+      },
+      startTime: 100,
+      enqueuedAt: 100,
+      ...scenario.owner,
+    });
+    const laterTask = createTask({
+      id: 'later-task',
+      status: 'pending',
+      declaredWriteSurface: ['packages/contracts/src/index.ts'],
+      startTime: 200,
+      enqueuedAt: 200,
+    });
+
+    const result = findCoordinationBlockers(laterTask, [earlierTask, laterTask], 'start', { targetBranch: 'main' });
+
+    assert.equal(result.blocked, scenario.blocked);
+    assert.deepEqual(result.blockers, scenario.blocked ? ['surface-owner'] : []);
+  });
+}
+
 test('findCoordinationBlockers conservatively blocks unknown-surface tasks behind a hot merge-repair owner', () => {
   const earlierTask = createTask({
     id: 'failed-owner',
@@ -188,6 +284,7 @@ test('buildCoordinationState exposes blocker and observed surface details', () =
 
   assert.equal(coordination.status, 'blocked_observed_overlap');
   assert.equal(coordination.phase, 'merge');
+  assert.equal(coordination.owner, 'task-a');
   assert.deepEqual(coordination.blockers, ['task-a']);
   assert.deepEqual(coordination.observedPackageSurface, ['packages/contracts']);
 });

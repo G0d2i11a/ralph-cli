@@ -75,7 +75,7 @@ Examples:
 program
   .command('list')
   .description('List all tasks')
-  .option('--status <status>', 'Filter by status (pending|running|ready_to_finalize|finalizing|completed|failed|failed_finalize|stagnant)')
+  .option('--status <status>', 'Filter by status (pending|running|ready_to_finalize|finalizing|completed|failed|failed_finalize|stagnant|stopped)')
   .addHelpText('after', `
 Examples:
   $ ralph list
