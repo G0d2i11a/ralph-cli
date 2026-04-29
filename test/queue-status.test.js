@@ -2,7 +2,9 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 
 const {
+  adjustManagerStatusForFinalizerLease,
   deriveAttention,
+  findFreshFinalizerLease,
   resolveNextAction,
 } = require('../dist/commands/queue.js');
 
@@ -72,4 +74,67 @@ test('queue does not mark active auto recovery as attention', () => {
 
   assert.equal(attention.needed, false);
   assert.match(resolveNextAction(task), /auto-recovery cooldown/);
+});
+
+test('queue suppresses stale manager heartbeat display while finalizer lease is fresh', () => {
+  const now = Date.now();
+  const task = createTask({
+    id: 'finalizing-task',
+    status: 'finalizing',
+    leaseOwner: 'finalizer:123',
+    leaseHeartbeatAt: now - 1000,
+    leaseExpiresAt: now + 60_000,
+  });
+  const manager = {
+    ralphHome: '/tmp/ralph',
+    statePath: '/tmp/ralph/manager/state.json',
+    lockDir: '/tmp/ralph/manager.lock',
+    state: null,
+    stateExists: true,
+    processRunning: true,
+    active: true,
+    heartbeatStale: true,
+    staleAfterMs: 5000,
+    codeDriftDetected: false,
+    message: 'manager process 123 is running but heartbeat is stale',
+  };
+
+  const lease = findFreshFinalizerLease([task], now);
+  const adjusted = adjustManagerStatusForFinalizerLease(manager, lease);
+
+  assert.equal(adjusted.heartbeatStale, false);
+  assert.equal(adjusted.heartbeatStaleSuppressed, true);
+  assert.equal(adjusted.heartbeatStaleSuppressedReason, 'active_finalizer_lease');
+  assert.equal(adjusted.finalizerLease.taskId, 'finalizing-task');
+});
+
+test('queue keeps stale manager heartbeat when finalizer lease is expired', () => {
+  const now = Date.now();
+  const task = createTask({
+    id: 'finalizing-task',
+    status: 'finalizing',
+    leaseOwner: 'finalizer:123',
+    leaseHeartbeatAt: now - 60_000,
+    leaseExpiresAt: now - 1,
+  });
+  const manager = {
+    ralphHome: '/tmp/ralph',
+    statePath: '/tmp/ralph/manager/state.json',
+    lockDir: '/tmp/ralph/manager.lock',
+    state: null,
+    stateExists: true,
+    processRunning: true,
+    active: true,
+    heartbeatStale: true,
+    staleAfterMs: 5000,
+    codeDriftDetected: false,
+    message: 'manager process 123 is running but heartbeat is stale',
+  };
+
+  const lease = findFreshFinalizerLease([task], now);
+  const adjusted = adjustManagerStatusForFinalizerLease(manager, lease);
+
+  assert.equal(lease, undefined);
+  assert.equal(adjusted.heartbeatStale, true);
+  assert.equal(adjusted.heartbeatStaleSuppressed, undefined);
 });

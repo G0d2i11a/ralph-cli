@@ -10,7 +10,7 @@
     "build": "tsc",
     "build:menubar": "bash ./tools/ralph-menubar/build.sh",
     "dev": "tsc --watch",
-    "test": "npm run build && node --test test/*.test.js",
+    "test": "npm run build && node test/run-tests.js",
     "prepare": "npm run build"
   },
   "keywords": [

@@ -1,6 +1,6 @@
 import { ConfigManager } from '../config/manager';
 import { resolveAutoIntegrate } from '../core/integration-policy';
-import { getManagerStatus } from '../core/manager-state';
+import { getManagerStatus, ManagerStatus } from '../core/manager-state';
 import { buildCoordinationState } from '../core/task-coordination';
 import { summarizeActiveRepoPaths } from '../core/task-home-summary';
 import { buildAutoRecoveryState, buildDeliveryState, buildTransientRetryState, resolveTaskIntegrationStatus } from '../core/task-delivery';
@@ -35,6 +35,17 @@ interface QueueCommandOptions {
   compact?: boolean;
 }
 
+interface QueueManagerStatus extends ManagerStatus {
+  heartbeatStaleSuppressed?: boolean;
+  heartbeatStaleSuppressedReason?: string;
+  finalizerLease?: {
+    taskId: string;
+    owner?: string;
+    heartbeatAt?: string;
+    expiresAt: string;
+  };
+}
+
 function parsePositiveNumber(value: string | number | undefined): number | undefined {
   if (value === undefined) {
     return undefined;
@@ -42,6 +53,45 @@ function parsePositiveNumber(value: string | number | undefined): number | undef
 
   const numericValue = Number(value);
   return Number.isFinite(numericValue) && numericValue > 0 ? numericValue : undefined;
+}
+
+export function findFreshFinalizerLease(tasks: Task[], now: number): Task | undefined {
+  return tasks
+    .filter((task) => (
+      task.status === 'finalizing'
+      && typeof task.leaseExpiresAt === 'number'
+      && task.leaseExpiresAt > now
+    ))
+    .sort((left, right) => (right.leaseExpiresAt ?? 0) - (left.leaseExpiresAt ?? 0))[0];
+}
+
+export function adjustManagerStatusForFinalizerLease(
+  manager: ManagerStatus,
+  finalizerTask: Task | undefined,
+): QueueManagerStatus {
+  if (
+    !finalizerTask
+    || !manager.heartbeatStale
+    || manager.processRunning === false
+  ) {
+    return manager;
+  }
+
+  return {
+    ...manager,
+    heartbeatStale: false,
+    heartbeatStaleSuppressed: true,
+    heartbeatStaleSuppressedReason: 'active_finalizer_lease',
+    message: `manager heartbeat is stale, but task ${finalizerTask.id} has an active finalizer lease`,
+    finalizerLease: {
+      taskId: finalizerTask.id,
+      owner: finalizerTask.leaseOwner,
+      heartbeatAt: finalizerTask.leaseHeartbeatAt
+        ? new Date(finalizerTask.leaseHeartbeatAt).toISOString()
+        : undefined,
+      expiresAt: new Date(finalizerTask.leaseExpiresAt as number).toISOString(),
+    },
+  };
 }
 
 function hasResolvedMergeRepair(task: Task): boolean {
@@ -473,9 +523,12 @@ async function buildQueueSnapshot(
   const configManager = new ConfigManager();
   const ralphHome = resolveRalphHome();
   const autoIntegrateEnabled = resolveAutoIntegrate(configManager);
-  const manager = getManagerStatus({ ralphHome, staleAfterMs });
-
+  const snapshotNow = Date.now();
   const tasks = await stateManager.listTasks();
+  const manager = adjustManagerStatusForFinalizerLease(
+    getManagerStatus({ ralphHome, staleAfterMs, now: () => snapshotNow }),
+    findFreshFinalizerLease(tasks, snapshotNow),
+  );
   const activeTasks = tasks.filter((task) => (
     task.status === 'pending'
     || task.status === 'running'
@@ -501,7 +554,7 @@ async function buildQueueSnapshot(
     output.push(summarizeTask(task, pendingState, autoIntegrateEnabled, compact));
   }
   const repoSummary = summarizeActiveRepoPaths(activeTasks);
-  const recentCompletedThreshold = Date.now() - (recentCompletedWindowSeconds * 1000);
+  const recentCompletedThreshold = snapshotNow - (recentCompletedWindowSeconds * 1000);
   const recentCompleted = tasks
     .filter((task) => isIntegratedCompletion(task) && (task.updatedAt ?? 0) >= recentCompletedThreshold)
     .sort((left, right) => (right.updatedAt ?? 0) - (left.updatedAt ?? 0))
