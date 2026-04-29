@@ -26,6 +26,7 @@ export interface MergeResult {
   targetSynced?: boolean;
   targetSyncMessage?: string;
   conflictFiles?: string[];
+  failurePhase?: MergeFailurePhase;
   sourceBranch?: string;
   targetBranch?: string;
   baseCommitSha?: string;
@@ -776,6 +777,7 @@ function mergeConflictResult(
   repoPath: string,
   conflicts: string[],
   details: Partial<Pick<MergeResult, 'sourceBranch' | 'targetBranch' | 'baseCommitSha'>> = {},
+  failurePhase: MergeFailurePhase = 'source_merge',
 ): MergeResult {
   tryAbortMerge(repoPath);
   return {
@@ -783,6 +785,7 @@ function mergeConflictResult(
     hasConflicts: true,
     message: `Merge conflicts detected: ${conflicts.join(', ')}`,
     conflictFiles: conflicts,
+    failurePhase,
     ...details,
   };
 }
@@ -927,6 +930,7 @@ async function mergeBranchInIntegrationWorktree(
         hasConflicts: true,
         message: `Task worktree still has unresolved merge entries: ${worktreeMergeState.unmergedFiles.join(', ')}`,
         conflictFiles: worktreeMergeState.unmergedFiles,
+        failurePhase: 'worktree_unresolved',
         integrationBranch: integration.integrationBranch,
         integrationWorktree: integration.integrationWorktree,
         sourceBranch: branchName,
@@ -955,7 +959,7 @@ async function mergeBranchInIntegrationWorktree(
             sourceBranch: normalizedTarget,
             targetBranch: integration.integrationBranch,
             baseCommitSha: task.baseCommitSha,
-          }),
+          }, 'integration_sync'),
           integrationBranch: integration.integrationBranch,
           integrationWorktree: integration.integrationWorktree,
         };
@@ -1043,7 +1047,7 @@ async function mergeBranchInIntegrationWorktree(
             sourceBranch: sourceLabel,
             targetBranch: integration.integrationBranch,
             baseCommitSha: task.baseCommitSha,
-          }),
+          }, 'source_merge'),
           integrationBranch: integration.integrationBranch,
           integrationWorktree: integration.integrationWorktree,
         };

@@ -177,6 +177,7 @@ function createScheduler(tasks, prds, options = {}) {
     parsePRD: createParsePrd(prds),
     checkDependencies: dependencyChecker,
     isProcessRunning: options.isProcessRunning || (() => true),
+    getProcessInfo: options.getProcessInfo,
     terminateProcess: options.terminateProcess,
     lockDir,
     now: options.now,
@@ -748,6 +749,115 @@ test('schedulePendingTasks recovers live running tasks that exceed stagnation ti
   assert.deepEqual(terminateSignals, ['SIGTERM']);
   assert.equal(startedQueuedTask.status, 'running');
   assert.deepEqual(forkCalls, ['queued-after-stagnant']);
+});
+
+test('schedulePendingTasks reclaims orphaned worker leases from a previous manager', async () => {
+  let processAlive = true;
+  let now = 100_000;
+  const terminateSignals = [];
+  const orphanedTask = createTask({
+    id: 'orphaned-running-task',
+    prdId: 'orphaned-running-task',
+    prdPath: '/orphaned-running.json',
+    status: 'running',
+    startTime: 100,
+    currentUS: 'US-002',
+    worktree: '/worktrees/orphaned-running-task',
+    pid: 5151,
+    leaseOwner: 'worker:5151',
+    leaseHeartbeatAt: now,
+    leaseExpiresAt: now + 60_000,
+    lastProgressTime: now,
+  });
+  const queuedTask = createTask({
+    id: 'queued-after-orphan',
+    prdId: 'queued-after-orphan',
+    prdPath: '/queued-after-orphan.json',
+    startTime: 200,
+  });
+
+  const { scheduler, stateManager, forkCalls } = createScheduler(
+    [orphanedTask, queuedTask],
+    {
+      '/orphaned-running.json': { id: 'orphaned-running-task', dependencies: [] },
+      '/queued-after-orphan.json': { id: 'queued-after-orphan', dependencies: [] },
+    },
+    {
+      maxConcurrent: 1,
+      now: () => now,
+      sleep: async (ms) => {
+        now += ms;
+      },
+      isProcessRunning: () => processAlive,
+      getProcessInfo: () => ({
+        ppid: 1,
+        command: 'node /repo/dist/worker.js orphaned-running-task',
+      }),
+      terminateProcess: (_pid, signal) => {
+        terminateSignals.push(signal);
+        processAlive = false;
+      },
+    }
+  );
+
+  const startedTasks = await scheduler.schedulePendingTasks();
+  const recoveredTask = await stateManager.loadTask('orphaned-running-task');
+  const queuedAfter = await stateManager.loadTask('queued-after-orphan');
+
+  assert.equal(startedTasks.length, 1);
+  assert.equal(startedTasks[0].id, 'orphaned-running-task');
+  assert.equal(recoveredTask.status, 'running');
+  assert.equal(recoveredTask.pid, 4000);
+  assert.equal(recoveredTask.currentUS, undefined);
+  assert.equal(recoveredTask.lastErrorKind, 'orphaned_worker');
+  assert.match(recoveredTask.lastError, /orphaned from the current manager/i);
+  assert.equal(queuedAfter.status, 'pending');
+  assert.deepEqual(terminateSignals, ['SIGTERM']);
+  assert.deepEqual(forkCalls, ['orphaned-running-task']);
+});
+
+test('schedulePendingTasks keeps current-manager worker leases active', async () => {
+  const runningTask = createTask({
+    id: 'current-manager-running-task',
+    prdId: 'current-manager-running-task',
+    prdPath: '/current-manager-running.json',
+    status: 'running',
+    startTime: 100,
+    worktree: '/worktrees/current-manager-running-task',
+    pid: 6161,
+    leaseOwner: 'worker:6161',
+  });
+  const queuedTask = createTask({
+    id: 'queued-behind-current-manager',
+    prdId: 'queued-behind-current-manager',
+    prdPath: '/queued-behind-current-manager.json',
+    startTime: 200,
+  });
+
+  const { scheduler, stateManager, forkCalls } = createScheduler(
+    [runningTask, queuedTask],
+    {
+      '/current-manager-running.json': { id: 'current-manager-running-task', dependencies: [] },
+      '/queued-behind-current-manager.json': { id: 'queued-behind-current-manager', dependencies: [] },
+    },
+    {
+      maxConcurrent: 1,
+      getProcessInfo: () => ({
+        ppid: process.pid,
+        command: 'node /repo/dist/worker.js current-manager-running-task',
+      }),
+    }
+  );
+
+  const startedTasks = await scheduler.schedulePendingTasks();
+  const stillRunning = await stateManager.loadTask('current-manager-running-task');
+  const queuedAfter = await stateManager.loadTask('queued-behind-current-manager');
+
+  assert.equal(startedTasks.length, 0);
+  assert.equal(stillRunning.status, 'running');
+  assert.equal(stillRunning.pid, 6161);
+  assert.equal(queuedAfter.status, 'pending');
+  assert.deepEqual(forkCalls, []);
 });
 
 test('schedulePendingTasks does not overwrite ready_to_finalize task after stale stagnant worker completes during recovery', async () => {

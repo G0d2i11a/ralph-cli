@@ -36,6 +36,10 @@ type DependencyChecker = (
   options?: { repoPath?: string; task?: Task }
 ) => Promise<DependencyResult>;
 type ProcessChecker = (pid: number) => boolean;
+interface ProcessInfo {
+  ppid?: number;
+  command?: string;
+}
 
 export interface SchedulerDeps extends RalphHomeOptions {
   stateManager?: StateManager;
@@ -50,6 +54,7 @@ export interface SchedulerDeps extends RalphHomeOptions {
     options?: ForkOptions
   ) => ChildProcess;
   isProcessRunning?: ProcessChecker;
+  getProcessInfo?: (pid: number) => ProcessInfo | undefined;
   terminateProcess?: (pid: number, signal?: NodeJS.Signals | number) => void;
   lockDir?: string;
   now?: () => number;
@@ -108,6 +113,30 @@ function toTimeoutMs(value: unknown, fallbackMs: number): number {
   return numericValue * 1000;
 }
 
+function readProcessInfo(pid: number): ProcessInfo | undefined {
+  if (process.platform === 'win32') {
+    return undefined;
+  }
+
+  try {
+    const output = execFileSync('ps', ['-p', String(pid), '-o', 'ppid=', '-o', 'command='], {
+      encoding: 'utf-8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+    }).trim();
+    const match = output.match(/^(\d+)\s+([\s\S]*)$/);
+    if (!match) {
+      return undefined;
+    }
+
+    return {
+      ppid: Number(match[1]),
+      command: match[2],
+    };
+  } catch {
+    return undefined;
+  }
+}
+
 function isFailedCoordinationBlocker(task: Task): boolean {
   if (task.status === 'failed' || task.status === 'stagnant' || task.status === 'failed_finalize') {
     return true;
@@ -134,6 +163,7 @@ export class TaskScheduler {
     options?: ForkOptions
   ) => ChildProcess;
   private readonly isProcessRunningFn: ProcessChecker;
+  private readonly getProcessInfoFn: (pid: number) => ProcessInfo | undefined;
   private readonly terminateProcessFn: (pid: number, signal?: NodeJS.Signals | number) => void;
   private readonly now: () => number;
   private readonly sleep: (ms: number) => Promise<void>;
@@ -151,6 +181,7 @@ export class TaskScheduler {
     this.checkDependenciesFn = deps.checkDependencies ?? checkDependencies;
     this.forkProcessFn = deps.forkProcess ?? fork;
     this.isProcessRunningFn = deps.isProcessRunning ?? isProcessRunning;
+    this.getProcessInfoFn = deps.getProcessInfo ?? readProcessInfo;
     this.terminateProcessFn = deps.terminateProcess ?? ((pid, signal) => process.kill(pid, signal));
     this.now = deps.now ?? (() => Date.now());
     this.sleep = deps.sleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
@@ -212,6 +243,20 @@ export class TaskScheduler {
     }
 
     return false;
+  }
+
+  private isOrphanedManagedWorker(task: Task): boolean {
+    if (typeof task.pid !== 'number' || task.leaseOwner !== `worker:${task.pid}`) {
+      return false;
+    }
+
+    const processInfo = this.getProcessInfoFn(task.pid);
+    if (typeof processInfo?.ppid !== 'number' || processInfo.ppid === process.pid) {
+      return false;
+    }
+
+    const command = processInfo.command || '';
+    return command.includes('worker.js') && command.includes(task.id);
   }
 
   private async terminateWorkerForRecovery(task: Pick<Task, 'id' | 'pid'>, reason: string): Promise<boolean> {
@@ -304,6 +349,47 @@ export class TaskScheduler {
       }
 
       if (this.isProcessRunningFn(latestTask.pid)) {
+        if (this.isOrphanedManagedWorker(latestTask)) {
+          const lastError = `Worker process ${latestTask.pid} is orphaned from the current manager; task was returned to pending for a fresh worker`;
+          console.error(`Recovering orphaned running task ${latestTask.id}: ${lastError}`);
+          const terminated = await this.terminateWorkerForRecovery(latestTask, lastError);
+
+          if (!terminated) {
+            activeTasks.push(latestTask);
+            continue;
+          }
+
+          const observedPid = latestTask.pid;
+          const observedLeaseOwner = latestTask.leaseOwner;
+          const updateResult = await this.stateManager.updateTaskIf(latestTask.id, (candidate) => (
+            candidate.status === 'running'
+            && candidate.pid === observedPid
+            && candidate.leaseOwner === observedLeaseOwner
+          ), {
+            status: 'pending',
+            endTime: undefined,
+            currentUS: undefined,
+            pid: undefined,
+            leaseOwner: undefined,
+            leaseHeartbeatAt: undefined,
+            leaseExpiresAt: undefined,
+            lastError,
+            lastErrorKind: 'orphaned_worker',
+            lastErrorClass: 'orphaned_worker',
+            lastErrorRetryable: true,
+            lastErrorObservedAt: this.now(),
+          });
+          if (updateResult.updated) {
+            appendTaskEvent(updateResult.task ?? latestTask, {
+              type: 'task_recovered_orphaned_worker',
+              status: 'pending',
+              message: lastError,
+              data: { pid: latestTask.pid },
+            });
+          }
+          continue;
+        }
+
         if (
           Number.isFinite(stagnationTimeoutMs)
           && typeof latestTask.lastProgressTime === 'number'

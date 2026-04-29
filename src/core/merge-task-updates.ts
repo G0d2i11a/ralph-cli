@@ -150,7 +150,7 @@ export function buildFailedMergeTaskUpdates(
     targetSyncStatus: 'not_requested' as const,
     targetSyncDeferredReason: undefined,
     mergeConflictFiles: result.conflictFiles,
-    mergeConflictPhase: undefined,
+    mergeConflictPhase: result.failurePhase,
     mergeConflictAt: result.hasConflicts ? Date.now() : undefined,
     coordinationStatus: undefined,
     coordinationPhase: undefined,
