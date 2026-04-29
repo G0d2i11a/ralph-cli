@@ -227,7 +227,6 @@ func resolveLocalDistCLIPath() -> String? {
     env["RALPH_MENUBAR_CLI_JS"],
     localRepoRootCandidate().map { URL(fileURLWithPath: $0).appendingPathComponent("dist/cli.js").path },
     URL(fileURLWithPath: FileManager.default.currentDirectoryPath).appendingPathComponent("dist/cli.js").path,
-    "~/Project/ralph-cli/dist/cli.js",
   ]
 
   for candidate in candidates {

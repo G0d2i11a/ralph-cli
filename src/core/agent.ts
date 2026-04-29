@@ -1,5 +1,6 @@
 import { spawn, ChildProcess } from 'child_process';
 import * as fs from 'fs';
+import * as os from 'os';
 import * as path from 'path';
 import { ConfigManager } from '../config/manager';
 import { UserStory } from '../types/prd';
@@ -20,11 +21,9 @@ export interface AgentRunResult {
 
 export const DEFAULT_AGENT: AgentType = 'codex';
 export const DEFAULT_BACKEND: AgentBackend = 'cli';
-const OPENCLAW_ROOT = '~/Workspace/openclaw';
-const DEFAULT_AGENT_RUNNERS_CLI = path.join(OPENCLAW_ROOT, 'agent-runners', 'dist', 'cli.js');
-const LEGACY_SDK_RUNNERS_CLI = path.join(OPENCLAW_ROOT, 'sdk-runners', 'dist', 'cli.js');
 const AGENT_RUNNERS_ENV = 'RALPH_AGENT_RUNNERS_CLI';
 const LEGACY_SDK_RUNNER_ENV = 'RALPH_SDK_RUNNER_CLI';
+const OPENCLAW_HOME_ENV = 'OPENCLAW_HOME';
 const FORCE_KILL_GRACE_MS = 5000;
 
 type AgentConfig = Pick<ConfigManager, 'get'> & Partial<Pick<ConfigManager, 'has'>>;
@@ -74,6 +73,19 @@ function resolveExistingFile(filePath?: string): string | null {
   return fs.existsSync(resolved) ? resolved : null;
 }
 
+function resolveOpenclawHome(): string {
+  const configuredHome = process.env[OPENCLAW_HOME_ENV]?.trim();
+  return configuredHome || path.join(os.homedir(), 'Workspace', 'openclaw');
+}
+
+function defaultAgentRunnersCli(): string {
+  return path.join(resolveOpenclawHome(), 'agent-runners', 'dist', 'cli.js');
+}
+
+function legacySdkRunnersCli(): string {
+  return path.join(resolveOpenclawHome(), 'sdk-runners', 'dist', 'cli.js');
+}
+
 export function resolveConfiguredBackend(config: AgentConfig): AgentBackend {
   const configuredBackend = config.get('agent.backend');
   const hasExplicitBackend = typeof config.has === 'function'
@@ -116,8 +128,8 @@ function resolveAgentRunnersCli(config: Pick<ConfigManager, 'get'>): string {
     process.env[LEGACY_SDK_RUNNER_ENV],
     typeof configRunnerPath === 'string' ? configRunnerPath : undefined,
     legacyCompatiblePath,
-    DEFAULT_AGENT_RUNNERS_CLI,
-    LEGACY_SDK_RUNNERS_CLI,
+    defaultAgentRunnersCli(),
+    legacySdkRunnersCli(),
   ];
 
   for (const candidate of candidates) {

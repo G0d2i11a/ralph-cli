@@ -30,14 +30,23 @@ struct RalphMenuBarConfig: Codable {
   }
 
   static func defaultProjects(primaryHome: String) -> [RalphMenuBarProject] {
-    var projects = [
-      RalphMenuBarProject(name: "atta", ralphHome: primaryHome)
+    [
+      RalphMenuBarProject(
+        name: inferredProjectName(for: primaryHome),
+        ralphHome: primaryHome
+      )
     ]
-    let ez4ieltsHome = "~/Project/ez4ielts/.ralph-cli-home"
-    if FileManager.default.fileExists(atPath: ez4ieltsHome) {
-      projects.append(RalphMenuBarProject(name: "ez4ielts", ralphHome: ez4ieltsHome))
+  }
+
+  static func inferredProjectName(for ralphHome: String) -> String {
+    let expandedHome = expandPath(ralphHome)
+    let homeURL = URL(fileURLWithPath: expandedHome)
+    let homeName = homeURL.lastPathComponent
+    if homeName == ".ralph" || homeName == ".ralph-cli-home" {
+      let parentName = homeURL.deletingLastPathComponent().lastPathComponent
+      return parentName.isEmpty ? "default" : parentName
     }
-    return projects
+    return homeName.isEmpty ? "default" : homeName
   }
 
   func resolvedProjects() -> [RalphMenuBarProject] {
