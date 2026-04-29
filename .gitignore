@@ -3,6 +3,10 @@ dist/
 *.log
 .DS_Store
 .oracle/
+.ralph/
+.ralph-cli-home/
+.ralph-integration/
+.ralph-integration-probe/
 .ralph-worktrees/
 *.tmp
 tools/ralph-menubar/build/
