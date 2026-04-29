@@ -7,11 +7,13 @@ import { batchStartCommand } from './commands/batch-start';
 import { statusCommand } from './commands/status';
 import { listCommand } from './commands/list';
 import { stopCommand } from './commands/stop';
+import { demoteCommand } from './commands/demote';
 import { mergeCommand } from './commands/merge';
 import { finalizeCommand } from './commands/finalize';
 import { statsCommand } from './commands/stats';
 import { updateCommand } from './commands/update';
 import { retryCommand } from './commands/retry';
+import { proveIntegrationCommand } from './commands/prove-integration';
 import { resetStagnationCommand } from './commands/reset-stagnation';
 import { completionCommand } from './commands/completion';
 import { watch } from './commands/watch';
@@ -75,7 +77,7 @@ Examples:
 program
   .command('list')
   .description('List all tasks')
-  .option('--status <status>', 'Filter by status (pending|running|ready_to_finalize|finalizing|completed|failed|failed_finalize|stagnant)')
+  .option('--status <status>', 'Filter by status (pending|running|ready_to_finalize|finalizing|completed|failed|failed_finalize|stagnant|stopped)')
   .addHelpText('after', `
 Examples:
   $ ralph list
@@ -86,10 +88,23 @@ Examples:
 program
   .command('stop <task-id>')
   .description('Stop a running task')
+  .option('--reason <text>', 'Reason to record if stopping releases merge-repair quarantine ownership')
   .addHelpText('after', `
 Examples:
-  $ ralph stop task-1772544497775-wdat8zyr5`)
+  $ ralph stop task-1772544497775-wdat8zyr5
+  $ ralph stop task-1772544497775-wdat8zyr5 --reason "superseded by a smaller fix"`)
   .action(stopCommand);
+
+program
+  .command('demote <task-id>')
+  .description('Release a merge-repair quarantine owner without retrying it')
+  .option('--reason <text>', 'Auditable reason for releasing quarantine ownership')
+  .option('--to <task-id>', 'Optional task that should take over the conflict surface')
+  .addHelpText('after', `
+Examples:
+  $ ralph demote task-1772544497775-wdat8zyr5 --reason "superseded by task-abc"
+  $ ralph demote task-1772544497775-wdat8zyr5 --to task-abc --reason "newer task owns the repair"`)
+  .action(demoteCommand);
 
 program
   .command('merge <task-id>')
@@ -159,6 +174,16 @@ Examples:
   $ ralph retry task-1772544497775-wdat8zyr5
   $ ralph retry task-1772544497775-wdat8zyr5 --finalize-only`)
   .action(retryCommand);
+
+program
+  .command('prove-integration <task-id>')
+  .description('Run the exact integration proof and clear merge-repair quarantine if it passes')
+  .option('--target <branch>', 'Target branch to prove against (defaults to merge.targetBranch)')
+  .addHelpText('after', `
+Examples:
+  $ ralph prove-integration task-1772544497775-wdat8zyr5
+  $ ralph prove-integration task-1772544497775-wdat8zyr5 --target main`)
+  .action(proveIntegrationCommand);
 
 program
   .command('reset-stagnation <task-id>')

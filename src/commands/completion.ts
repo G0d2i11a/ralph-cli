@@ -15,7 +15,7 @@ _ralph_completion() {
   local cur prev commands
   cur="\${COMP_WORDS[COMP_CWORD]}"
   prev="\${COMP_WORDS[COMP_CWORD-1]}"
-  commands="start batch-start status list stop merge finalize update retry reset-stagnation watch stats completion"
+  commands="start batch-start status list stop demote merge finalize update retry prove-integration reset-stagnation watch stats completion"
 
   case "\${prev}" in
     ralph)
@@ -26,7 +26,7 @@ _ralph_completion() {
       COMPREPLY=( $(compgen -f -X '!*.@(md|json)' -- \${cur}) )
       return 0
       ;;
-    status|stop|merge|finalize|stats|reset-stagnation|retry|update)
+    status|stop|demote|merge|finalize|stats|reset-stagnation|retry|prove-integration|update)
       local task_ids=$(ralph list 2>/dev/null | grep -oE 'task-[0-9]+-[a-z0-9]+' | sort -u)
       COMPREPLY=( $(compgen -W "\${task_ids}" -- \${cur}) )
       return 0
@@ -44,7 +44,7 @@ _ralph_completion() {
       return 0
       ;;
     --status)
-      COMPREPLY=( $(compgen -W "pending running ready_to_finalize finalizing completed failed failed_finalize stagnant" -- \${cur}) )
+      COMPREPLY=( $(compgen -W "pending running ready_to_finalize finalizing completed failed failed_finalize stagnant stopped" -- \${cur}) )
       return 0
       ;;
     --strategy)
@@ -59,7 +59,7 @@ _ralph_completion() {
 
   case "\${cur}" in
     -*)
-      local opts="--repo --agent --backend --status --auto --strategy --target --format --all --interval --auto-ingest-ez4ielts --ez4ielts-dir --story-id --passes --notes --detailed --help"
+      local opts="--repo --agent --backend --status --auto --strategy --target --format --all --interval --auto-ingest-ez4ielts --ez4ielts-dir --story-id --passes --notes --reason --to --detailed --help"
       COMPREPLY=( $(compgen -W "\${opts}" -- \${cur}) )
       return 0
       ;;
@@ -82,10 +82,12 @@ _ralph() {
     'status:Show status of a task or all running tasks'
     'list:List all tasks'
     'stop:Stop a running task'
+    'demote:Release a merge-repair quarantine owner'
     'merge:Merge a completed task'
     'finalize:Commit task changes using the restricted finisher flow'
     'update:Update a task or user story status'
     'retry:Retry a failed or stopped task'
+    'prove-integration:Run exact integration proof for a quarantined task'
     'reset-stagnation:Reset stagnation counters for a task'
     'watch:Poll the queue and optionally auto-ingest new PRDs'
     'stats:Show performance statistics for a task'
@@ -124,7 +126,7 @@ _ralph() {
             '1:task ID:(\${task_ids})' \\
             '--detailed[Show detailed task status]'
           ;;
-        stop|merge|finalize|retry|reset-stagnation|update)
+        stop|demote|merge|finalize|retry|prove-integration|reset-stagnation|update)
           _arguments \\
             '1:task ID:(\${task_ids})' \\
             '--auto[Auto-resolve conflicts]' \\
@@ -132,7 +134,9 @@ _ralph() {
             '--target[Target branch]:branch:' \\
             '--story-id[User story ID]:story id:' \\
             '--passes[Mark story as passing]' \\
-            '--notes[Implementation notes]:notes:'
+            '--notes[Implementation notes]:notes:' \\
+            '--reason[Auditable reason]:reason:' \\
+            '--to[Transfer quarantine ownership to task]:task ID:(\${task_ids})'
           ;;
         stats)
           _arguments \\
@@ -142,7 +146,7 @@ _ralph() {
           ;;
         list)
           _arguments \\
-            '--status[Filter by status]:status:(pending running ready_to_finalize finalizing completed failed failed_finalize stagnant)'
+            '--status[Filter by status]:status:(pending running ready_to_finalize finalizing completed failed failed_finalize stagnant stopped)'
           ;;
         watch)
           _arguments \\

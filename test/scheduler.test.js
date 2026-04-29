@@ -411,9 +411,67 @@ test('schedulePendingTasks keeps later overlap pending while an earlier failed m
     startTime: 200,
     enqueuedAt: 200,
   });
+  const nonOverlappingTask = createTask({
+    id: 'non-overlapping-task',
+    prdId: 'non-overlapping-task',
+    prdPath: '/non-overlapping-task.json',
+    declaredWriteSurface: ['docs/README.md'],
+    startTime: 300,
+    enqueuedAt: 300,
+  });
 
   const { scheduler, stateManager, forkCalls } = createScheduler(
-    [failedOwner, laterTask],
+    [failedOwner, laterTask, nonOverlappingTask],
+    {
+      '/later-task.json': { id: 'later-task', dependencies: [] },
+      '/non-overlapping-task.json': { id: 'non-overlapping-task', dependencies: [] },
+    },
+    { maxConcurrent: 2 }
+  );
+
+  const startedTasks = await scheduler.schedulePendingTasks();
+  const persistedLaterTask = await stateManager.loadTask('later-task');
+  const persistedNonOverlappingTask = await stateManager.loadTask('non-overlapping-task');
+
+  assert.equal(startedTasks.length, 1);
+  assert.equal(startedTasks[0].id, 'non-overlapping-task');
+  assert.deepEqual(forkCalls, ['non-overlapping-task']);
+  assert.equal(persistedLaterTask.status, 'pending');
+  assert.equal(persistedLaterTask.coordinationStatus, 'blocked_predicted_overlap');
+  assert.deepEqual(persistedLaterTask.coordinationBlockers, ['failed-owner']);
+  assert.equal(persistedNonOverlappingTask.status, 'running');
+});
+
+test('schedulePendingTasks starts later overlap after explicit quarantine demotion', async () => {
+  const demotedOwner = createTask({
+    id: 'demoted-owner',
+    prdId: 'demoted-owner',
+    status: 'failed',
+    observedWriteSurface: ['packages/contracts/src/index.ts'],
+    mergeConflictFiles: ['packages/contracts/src/index.ts'],
+    repairContext: {
+      mode: 'merge',
+      storyId: 'US-003',
+      createdAt: 123,
+      reason: 'Merge repair required by Ralph.',
+    },
+    quarantineExitKind: 'demote',
+    quarantineReleasedAt: 456,
+    quarantineReleaseReason: 'superseded by later-task',
+    startTime: 100,
+    enqueuedAt: 100,
+  });
+  const laterTask = createTask({
+    id: 'later-task',
+    prdId: 'later-task',
+    prdPath: '/later-task.json',
+    declaredWriteSurface: ['packages/contracts/src/index.ts'],
+    startTime: 200,
+    enqueuedAt: 200,
+  });
+
+  const { scheduler, stateManager, forkCalls } = createScheduler(
+    [demotedOwner, laterTask],
     {
       '/later-task.json': { id: 'later-task', dependencies: [] },
     },
@@ -423,11 +481,80 @@ test('schedulePendingTasks keeps later overlap pending while an earlier failed m
   const startedTasks = await scheduler.schedulePendingTasks();
   const persistedLaterTask = await stateManager.loadTask('later-task');
 
-  assert.equal(startedTasks.length, 0);
-  assert.deepEqual(forkCalls, []);
-  assert.equal(persistedLaterTask.status, 'pending');
-  assert.equal(persistedLaterTask.coordinationStatus, 'blocked_predicted_overlap');
-  assert.deepEqual(persistedLaterTask.coordinationBlockers, ['failed-owner']);
+  assert.equal(startedTasks.length, 1);
+  assert.equal(startedTasks[0].id, 'later-task');
+  assert.deepEqual(forkCalls, ['later-task']);
+  assert.equal(persistedLaterTask.status, 'running');
+  assert.equal(persistedLaterTask.coordinationStatus, undefined);
+  assert.equal(persistedLaterTask.coordinationBlockers, undefined);
+});
+
+test('schedulePendingTasks skips active observed-surface overlap but starts non-overlapping same-repo work up to concurrency', async () => {
+  const observedOwner = createTask({
+    id: 'observed-owner',
+    prdId: 'observed-owner',
+    status: 'running',
+    observedWriteSurface: ['packages/contracts/src/index.ts'],
+    startTime: 100,
+    enqueuedAt: 100,
+    worktree: '/worktrees/observed-owner',
+    pid: 4010,
+  });
+  const overlappingTask = createTask({
+    id: 'overlapping-task',
+    prdId: 'overlapping-task',
+    prdPath: '/overlapping-task.json',
+    declaredWriteSurface: ['packages/contracts/src/index.ts'],
+    startTime: 200,
+    enqueuedAt: 200,
+  });
+  const independentTaskA = createTask({
+    id: 'independent-task-a',
+    prdId: 'independent-task-a',
+    prdPath: '/independent-task-a.json',
+    declaredWriteSurface: ['apps/web/src/view.ts'],
+    startTime: 300,
+    enqueuedAt: 300,
+  });
+  const independentTaskB = createTask({
+    id: 'independent-task-b',
+    prdId: 'independent-task-b',
+    prdPath: '/independent-task-b.json',
+    declaredWriteSurface: ['docs/guide.md'],
+    startTime: 400,
+    enqueuedAt: 400,
+  });
+
+  const { scheduler, stateManager, forkCalls } = createScheduler(
+    [observedOwner, overlappingTask, independentTaskA, independentTaskB],
+    {
+      '/overlapping-task.json': { id: 'overlapping-task', dependencies: [] },
+      '/independent-task-a.json': { id: 'independent-task-a', dependencies: [] },
+      '/independent-task-b.json': { id: 'independent-task-b', dependencies: [] },
+    },
+    { maxConcurrent: 3 }
+  );
+
+  const startedTasks = await scheduler.schedulePendingTasks();
+  const persistedOverlappingTask = await stateManager.loadTask('overlapping-task');
+  const persistedIndependentTaskA = await stateManager.loadTask('independent-task-a');
+  const persistedIndependentTaskB = await stateManager.loadTask('independent-task-b');
+
+  assert.deepEqual(startedTasks.map((task) => task.id), ['independent-task-a', 'independent-task-b']);
+  assert.deepEqual(forkCalls, ['independent-task-a', 'independent-task-b']);
+  assert.equal(persistedOverlappingTask.status, 'pending');
+  assert.equal(persistedOverlappingTask.coordinationStatus, 'blocked_predicted_overlap');
+  assert.deepEqual(persistedOverlappingTask.coordinationBlockers, ['observed-owner']);
+  assert.deepEqual(persistedOverlappingTask.coordinationConflicts, [{
+    taskId: 'observed-owner',
+    overlapKinds: ['write_surface'],
+    overlappingDomains: [],
+    overlappingPaths: ['packages/contracts/src/index.ts'],
+  }]);
+  assert.match(persistedOverlappingTask.coordinationReason, /observed-owner/);
+  assert.match(persistedOverlappingTask.coordinationReason, /packages\/contracts\/src\/index\.ts/);
+  assert.equal(persistedIndependentTaskA.status, 'running');
+  assert.equal(persistedIndependentTaskB.status, 'running');
 });
 
 test('schedulePendingTasks does not block overlapping declared conflict domains across repositories', async () => {
@@ -1012,6 +1139,79 @@ test('finalizeTask releases a slot and auto-starts the next queued task', async 
   assert.equal(startedQueuedTask.status, 'running');
   assert.equal(startedQueuedTask.pid, 6000);
   assert.deepEqual(forkCalls, ['queued-task']);
+});
+
+test('finalizeTask stopped releases a hot conflict reservation and auto-starts overlapping queued work', async () => {
+  const runningTask = createTask({
+    id: 'stopped-owner',
+    prdId: 'stopped-owner',
+    prdPath: '/stopped-owner.json',
+    status: 'running',
+    startTime: 100,
+    worktree: '/worktrees/stopped-owner',
+    pid: 5001,
+    observedWriteSurface: ['packages/contracts/src/index.ts'],
+    mergeConflictFiles: ['packages/contracts/src/index.ts'],
+    repairContext: {
+      mode: 'merge',
+      storyId: 'US-003',
+      createdAt: 123,
+      reason: 'Merge repair required by Ralph.',
+    },
+  });
+  const queuedTask = createTask({
+    id: 'queued-after-stop',
+    prdId: 'queued-after-stop',
+    prdPath: '/queued-after-stop.json',
+    declaredWriteSurface: ['packages/contracts/src/index.ts'],
+    startTime: 200,
+    enqueuedAt: 200,
+  });
+
+  const { stateManager, forkCalls } = createScheduler(
+    [runningTask, queuedTask],
+    {
+      '/stopped-owner.json': { id: 'stopped-owner', dependencies: [] },
+      '/queued-after-stop.json': { id: 'queued-after-stop', dependencies: [] },
+    },
+    { maxConcurrent: 1 }
+  );
+
+  const taskToStop = await stateManager.loadTask('stopped-owner');
+  await finalizeTask(taskToStop, 'stopped', {
+    stateManager,
+    configManager: {
+      get: (key) => key === 'runner.maxConcurrent' ? 1 : undefined,
+    },
+    worktreeManager: {
+      createWorktree: async (_repoPath, taskId) => `/worktrees/${taskId}`,
+    },
+    bootstrapWorktreeDeps: () => {},
+    parsePRD: createParsePrd({
+      '/stopped-owner.json': { id: 'stopped-owner', dependencies: [] },
+      '/queued-after-stop.json': { id: 'queued-after-stop', dependencies: [] },
+    }),
+    checkDependencies: dependencyChecker,
+    lockDir: path.join(
+      os.tmpdir(),
+      `ralph-stopped-release-test-${process.pid}-${Math.random().toString(36).slice(2)}`
+    ),
+    forkProcess: (_modulePath, args) => {
+      forkCalls.push(args[0]);
+      return {
+        pid: 6300,
+        unref() {},
+      };
+    },
+  });
+
+  const stoppedTask = await stateManager.loadTask('stopped-owner');
+  const startedQueuedTask = await stateManager.loadTask('queued-after-stop');
+
+  assert.equal(stoppedTask.status, 'stopped');
+  assert.equal(startedQueuedTask.status, 'running');
+  assert.equal(startedQueuedTask.pid, 6300);
+  assert.deepEqual(forkCalls, ['queued-after-stop']);
 });
 
 test('markTaskReadyToFinalize releases a slot and auto-starts the next queued task', async () => {

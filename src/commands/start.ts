@@ -62,6 +62,7 @@ export async function startCommand(
       failedBlockers: pendingState.failedBlockers,
       recoveringBlockers: pendingState.recoveringBlockers,
       coordinationReason: pendingState.coordinationReason,
+      coordinationConflicts: pendingState.coordinationConflicts,
       integrationLane: pendingState.integrationLane,
       concurrencyLimit: pendingState.maxConcurrent,
       message: pendingState.reason === 'dependencies'

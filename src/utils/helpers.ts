@@ -438,6 +438,7 @@ export type DependencyBlockerKind =
   | 'integration_blocked_conflict'
   | 'task_failed'
   | 'task_stagnant'
+  | 'task_stopped'
   | 'finalize_failed';
 
 export interface DependencyBlocker {
@@ -505,6 +506,15 @@ function classifyDependencyBlocker(depId: string, depTask: Task | null): Depende
       kind: 'task_stagnant',
       reason: depTask.lastError || 'dependency task is stagnant',
       attentionRequired: !autoRecoveryActive,
+    };
+  }
+
+  if (depTask.status === 'stopped') {
+    return {
+      ...base,
+      kind: 'task_stopped',
+      reason: depTask.lastError || 'dependency task was stopped',
+      attentionRequired: true,
     };
   }
 
