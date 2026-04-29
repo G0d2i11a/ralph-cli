@@ -1,5 +1,8 @@
 import { StateManager } from '../core/state';
-import { finalizeTask } from '../core/scheduler';
+import { finalizeTask, TaskScheduler } from '../core/scheduler';
+import { appendTaskEvent } from '../core/events';
+import { buildQuarantineReleaseUpdates } from '../core/quarantine';
+import { hasHotConflictReservation } from '../core/task-coordination';
 import { isProcessRunning } from '../utils/helpers';
 
 function signalTaskProcess(pid: number, signal: NodeJS.Signals): boolean {
@@ -26,7 +29,34 @@ function signalTaskProcess(pid: number, signal: NodeJS.Signals): boolean {
   }
 }
 
-export async function stopCommand(taskId: string): Promise<void> {
+type StopCommandOptions = { reason?: string };
+
+async function releaseStoppedQuarantine(
+  stateManager: StateManager,
+  taskId: string,
+  reason: string,
+): Promise<void> {
+  const latestTask = await stateManager.loadTask(taskId);
+  if (!latestTask) {
+    return;
+  }
+
+  await stateManager.updateTask(taskId, buildQuarantineReleaseUpdates('stop', reason));
+  const releasedTask = await stateManager.loadTask(taskId);
+  appendTaskEvent(releasedTask || latestTask, {
+    type: 'merge_repair_quarantine_released',
+    status: releasedTask?.status || latestTask.status,
+    message: reason,
+    data: {
+      exitKind: 'stop',
+      conflictFiles: latestTask.mergeConflictFiles,
+    },
+  });
+
+  await new TaskScheduler({ stateManager }).schedulePendingTasks();
+}
+
+export async function stopCommand(taskId: string, options: StopCommandOptions = {}): Promise<void> {
   try {
     const stateManager = new StateManager();
     const task = await stateManager.loadTask(taskId);
@@ -40,13 +70,23 @@ export async function stopCommand(taskId: string): Promise<void> {
       console.error(JSON.stringify({ error: 'No PID found for task' }));
       process.exit(1);
     }
+
+    const releaseQuarantine = hasHotConflictReservation(task);
+    const releaseReason = options.reason?.trim()
+      || 'Task stopped by explicit user request';
     
     if (!isProcessRunning(task.pid)) {
+      await finalizeTask(task, 'failed', { stateManager });
+      if (releaseQuarantine) {
+        await releaseStoppedQuarantine(stateManager, taskId, releaseReason);
+      }
+
       console.log(JSON.stringify({ 
         message: 'Process already stopped',
-        taskId 
+        taskId,
+        quarantineReleased: releaseQuarantine,
+        quarantineReleaseReason: releaseQuarantine ? releaseReason : undefined,
       }));
-      await finalizeTask(task, 'failed', { stateManager });
       return;
     }
     
@@ -63,10 +103,15 @@ export async function stopCommand(taskId: string): Promise<void> {
       }
       
       await finalizeTask(task, 'failed', { stateManager });
+      if (releaseQuarantine) {
+        await releaseStoppedQuarantine(stateManager, taskId, releaseReason);
+      }
       
       console.log(JSON.stringify({
         message: 'Task stopped',
-        taskId
+        taskId,
+        quarantineReleased: releaseQuarantine,
+        quarantineReleaseReason: releaseQuarantine ? releaseReason : undefined,
       }));
       
     } catch (error) {

@@ -411,9 +411,67 @@ test('schedulePendingTasks keeps later overlap pending while an earlier failed m
     startTime: 200,
     enqueuedAt: 200,
   });
+  const nonOverlappingTask = createTask({
+    id: 'non-overlapping-task',
+    prdId: 'non-overlapping-task',
+    prdPath: '/non-overlapping-task.json',
+    declaredWriteSurface: ['docs/README.md'],
+    startTime: 300,
+    enqueuedAt: 300,
+  });
 
   const { scheduler, stateManager, forkCalls } = createScheduler(
-    [failedOwner, laterTask],
+    [failedOwner, laterTask, nonOverlappingTask],
+    {
+      '/later-task.json': { id: 'later-task', dependencies: [] },
+      '/non-overlapping-task.json': { id: 'non-overlapping-task', dependencies: [] },
+    },
+    { maxConcurrent: 2 }
+  );
+
+  const startedTasks = await scheduler.schedulePendingTasks();
+  const persistedLaterTask = await stateManager.loadTask('later-task');
+  const persistedNonOverlappingTask = await stateManager.loadTask('non-overlapping-task');
+
+  assert.equal(startedTasks.length, 1);
+  assert.equal(startedTasks[0].id, 'non-overlapping-task');
+  assert.deepEqual(forkCalls, ['non-overlapping-task']);
+  assert.equal(persistedLaterTask.status, 'pending');
+  assert.equal(persistedLaterTask.coordinationStatus, 'blocked_predicted_overlap');
+  assert.deepEqual(persistedLaterTask.coordinationBlockers, ['failed-owner']);
+  assert.equal(persistedNonOverlappingTask.status, 'running');
+});
+
+test('schedulePendingTasks starts later overlap after explicit quarantine demotion', async () => {
+  const demotedOwner = createTask({
+    id: 'demoted-owner',
+    prdId: 'demoted-owner',
+    status: 'failed',
+    observedWriteSurface: ['packages/contracts/src/index.ts'],
+    mergeConflictFiles: ['packages/contracts/src/index.ts'],
+    repairContext: {
+      mode: 'merge',
+      storyId: 'US-003',
+      createdAt: 123,
+      reason: 'Merge repair required by Ralph.',
+    },
+    quarantineExitKind: 'demote',
+    quarantineReleasedAt: 456,
+    quarantineReleaseReason: 'superseded by later-task',
+    startTime: 100,
+    enqueuedAt: 100,
+  });
+  const laterTask = createTask({
+    id: 'later-task',
+    prdId: 'later-task',
+    prdPath: '/later-task.json',
+    declaredWriteSurface: ['packages/contracts/src/index.ts'],
+    startTime: 200,
+    enqueuedAt: 200,
+  });
+
+  const { scheduler, stateManager, forkCalls } = createScheduler(
+    [demotedOwner, laterTask],
     {
       '/later-task.json': { id: 'later-task', dependencies: [] },
     },
@@ -423,11 +481,12 @@ test('schedulePendingTasks keeps later overlap pending while an earlier failed m
   const startedTasks = await scheduler.schedulePendingTasks();
   const persistedLaterTask = await stateManager.loadTask('later-task');
 
-  assert.equal(startedTasks.length, 0);
-  assert.deepEqual(forkCalls, []);
-  assert.equal(persistedLaterTask.status, 'pending');
-  assert.equal(persistedLaterTask.coordinationStatus, 'blocked_predicted_overlap');
-  assert.deepEqual(persistedLaterTask.coordinationBlockers, ['failed-owner']);
+  assert.equal(startedTasks.length, 1);
+  assert.equal(startedTasks[0].id, 'later-task');
+  assert.deepEqual(forkCalls, ['later-task']);
+  assert.equal(persistedLaterTask.status, 'running');
+  assert.equal(persistedLaterTask.coordinationStatus, undefined);
+  assert.equal(persistedLaterTask.coordinationBlockers, undefined);
 });
 
 test('schedulePendingTasks does not block overlapping declared conflict domains across repositories', async () => {

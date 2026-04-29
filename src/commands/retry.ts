@@ -1,6 +1,8 @@
 import { StateManager } from '../core/state';
 import { TaskScheduler } from '../core/scheduler';
 import { StoryProgress, Task } from '../types/task';
+import { appendTaskEvent } from '../core/events';
+import { clearQuarantineReleaseUpdates } from '../core/quarantine';
 import { buildMergeRepairReason, buildTaskRepairContext } from '../core/repair-context';
 import { buildFinalizeRetryReset } from '../core/task-reset';
 import {
@@ -239,6 +241,19 @@ export async function retryCommand(taskId: string, options: RetryCommandOptions 
           ...resetRetryableStoryProgress(task),
           repairContext: undefined,
         };
+    const anchoredMergeRepairUpdates: Partial<Task> = retryFromMergeConflict
+      ? {
+          mergeError: task.mergeError || task.lastError,
+          mergeConflictFiles: task.mergeConflictFiles,
+          mergeConflictAt: task.mergeConflictAt,
+          integrationBranch: task.integrationBranch,
+          integrationWorktree: task.integrationWorktree,
+          mergeTargetBranch: task.mergeTargetBranch,
+          mergeStrategy: task.mergeStrategy,
+          mergeRepairDisplayStatus: 'requeued',
+          mergeRepairProof: task.mergeRepairProof,
+        }
+      : {};
     await stateManager.updateTask(taskId, {
       status: 'pending',
       endTime: undefined,
@@ -264,6 +279,8 @@ export async function retryCommand(taskId: string, options: RetryCommandOptions 
       transientRetryBudget: undefined,
       transientRetryLastDelayMs: undefined,
       ...buildFinalizeRetryReset(),
+      ...anchoredMergeRepairUpdates,
+      ...clearQuarantineReleaseUpdates(),
       ...(previousStatus === 'failed_finalize' || retryableCompletedConflict
         ? {
             repairContext: retryProgress.repairContext,
@@ -271,6 +288,20 @@ export async function retryCommand(taskId: string, options: RetryCommandOptions 
         : {
             repairContext: retryProgress.repairContext,
           }),
+    });
+    appendTaskEvent(task, {
+      type: 'task_retried',
+      status: 'pending',
+      storyId: retryProgress.resetStoryIds[0],
+      message: retryFromMergeConflict
+        ? 'Task explicitly retried with anchored merge-repair context preserved'
+        : 'Task explicitly retried',
+      data: {
+        previousStatus,
+        resetStoryIds: retryProgress.resetStoryIds,
+        mergeRepairAnchored: retryFromMergeConflict,
+        conflictFiles: retryFromMergeConflict ? task.mergeConflictFiles : undefined,
+      },
     });
     await scheduler.schedulePendingTasks();
 

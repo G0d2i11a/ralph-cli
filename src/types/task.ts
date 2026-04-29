@@ -21,6 +21,7 @@ export type TaskCoordinationPhase = 'start' | 'finalize' | 'merge';
 export type TaskMergeRepairDisplayStatus = 'unresolved' | 'resolved_pending_finalize' | 'probe_mergeable' | 'requeued' | 'stopped';
 export type TaskMergeProofSourceKind = 'branch_head' | 'worktree_snapshot' | 'resolved_pending_merge';
 export type TaskWorktreeMergeStateKind = 'none' | 'unresolved' | 'resolved_pending_commit';
+export type TaskQuarantineExitKind = 'stop' | 'demote' | 'exact_mergeability' | 'already_integrated';
 
 export interface StoryProgress {
   id: string;
@@ -237,4 +238,8 @@ export interface Task {
   mergeRepairRecoveryStoppedAt?: number;
   mergeRepairRecoveryStopReason?: string;
   postFinalizeMergeProbeRequired?: boolean;
+  quarantineExitKind?: TaskQuarantineExitKind;
+  quarantineReleasedAt?: number;
+  quarantineReleaseReason?: string;
+  quarantineTransferredTo?: string;
 }

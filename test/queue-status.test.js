@@ -45,6 +45,52 @@ test('queue attention labels stopped merge repair distinctly', () => {
   assert.match(resolveNextAction(task), /manual merge repair required/);
 });
 
+test('queue attention labels active merge-repair quarantine distinctly', () => {
+  const task = createTask({
+    status: 'failed',
+    repairContext: {
+      mode: 'merge',
+      storyId: 'US-003',
+      createdAt: 123,
+      reason: 'Merge repair required by Ralph.',
+    },
+    lastError: 'merge repair did not converge',
+    mergeConflictFiles: ['apps/api/src/service.ts'],
+  });
+
+  const attention = deriveAttention(task);
+
+  assert.equal(attention.needed, true);
+  assert.equal(attention.reason, 'merge_repair_quarantine');
+  assert.match(resolveNextAction(task), /merge-repair quarantine/);
+});
+
+test('queue attention records explicit quarantine release reason', () => {
+  const task = createTask({
+    status: 'failed',
+    repairContext: {
+      mode: 'merge',
+      storyId: 'US-003',
+      createdAt: 123,
+      reason: 'Merge repair required by Ralph.',
+    },
+    lastError: 'merge repair did not converge',
+    mergeConflictFiles: ['apps/api/src/service.ts'],
+    quarantineExitKind: 'demote',
+    quarantineReleasedAt: 456,
+    quarantineReleaseReason: 'superseded by smaller fix',
+    quarantineTransferredTo: 'task-next',
+  });
+
+  const attention = deriveAttention(task);
+
+  assert.equal(attention.needed, true);
+  assert.equal(attention.reason, 'merge_repair_quarantine_released');
+  assert.match(resolveNextAction(task), /released by demotion/);
+  assert.match(resolveNextAction(task), /task-next/);
+  assert.match(resolveNextAction(task), /superseded by smaller fix/);
+});
+
 test('queue attention labels nonretryable story incomplete distinctly', () => {
   const task = createTask({
     status: 'failed',

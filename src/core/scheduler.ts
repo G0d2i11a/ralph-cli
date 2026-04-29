@@ -12,6 +12,7 @@ import {
   captureObservedTaskSurface,
   findCoordinationBlockers,
   hasHotConflictReservation,
+  isHotConflictQuarantineOwner,
 } from './task-coordination';
 import { getRalphPaths, RalphHomeOptions, resolveRalphHome } from './paths';
 import { StateManager } from './state';
@@ -64,6 +65,7 @@ export interface PendingTaskState {
   recoveringDependencies?: string[];
   missingDependencies?: string[];
   blockers: string[];
+  quarantinedBlockers?: string[];
   failedBlockers?: string[];
   recoveringBlockers?: string[];
   coordinationReason?: string;
@@ -470,6 +472,7 @@ export class TaskScheduler {
         reason: 'coordination',
         dependencies: [],
         blockers: coordinationState.blockers,
+        quarantinedBlockers: coordinationState.quarantinedBlockers,
         failedBlockers: coordinationState.failedBlockers,
         recoveringBlockers: coordinationState.recoveringBlockers,
         coordinationReason: coordinationState.reason,
@@ -490,6 +493,7 @@ export class TaskScheduler {
 
   private async describeCoordinationBlockedTask(task: Task): Promise<{
     blockers: string[];
+    quarantinedBlockers: string[];
     failedBlockers: string[];
     recoveringBlockers: string[];
     reason?: string;
@@ -498,6 +502,7 @@ export class TaskScheduler {
     const tasks = await this.stateManager.listTasks();
     const result = findCoordinationBlockers(task, tasks, 'start');
     const tasksById = new Map(tasks.map((entry) => [entry.id, entry]));
+    const quarantinedBlockers: string[] = [];
     const failedBlockers: string[] = [];
     const recoveringBlockers: string[] = [];
 
@@ -512,6 +517,11 @@ export class TaskScheduler {
         continue;
       }
 
+      if (isHotConflictQuarantineOwner(blocker)) {
+        quarantinedBlockers.push(blockerId);
+        continue;
+      }
+
       if (isFailedCoordinationBlocker(blocker)) {
         failedBlockers.push(blockerId);
       }
@@ -520,6 +530,7 @@ export class TaskScheduler {
     return result.blocked
       ? {
           blockers: result.blockers,
+          quarantinedBlockers,
           failedBlockers,
           recoveringBlockers,
           reason: result.reason,

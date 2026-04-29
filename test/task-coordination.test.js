@@ -122,6 +122,62 @@ test('findCoordinationBlockers keeps failed merge-conflict owners blocking later
   assert.equal(result.phase, 'start');
 });
 
+test('findCoordinationBlockers keeps failed blocked-conflict owners blocking later overlap', () => {
+  const earlierTask = createTask({
+    id: 'blocked-conflict-owner',
+    status: 'failed',
+    integrationStatus: 'blocked_conflict',
+    observedWriteSurface: ['packages/contracts/src/index.ts'],
+    startTime: 100,
+    enqueuedAt: 100,
+  });
+  const laterTask = createTask({
+    id: 'later-task',
+    status: 'pending',
+    declaredWriteSurface: ['packages/contracts/src/index.ts'],
+    startTime: 200,
+    enqueuedAt: 200,
+  });
+
+  const result = findCoordinationBlockers(laterTask, [earlierTask, laterTask], 'start', { targetBranch: 'main' });
+
+  assert.equal(result.blocked, true);
+  assert.equal(result.status, 'blocked_predicted_overlap');
+  assert.deepEqual(result.blockers, ['blocked-conflict-owner']);
+});
+
+test('findCoordinationBlockers ignores explicitly demoted merge-repair quarantine owners', () => {
+  const earlierTask = createTask({
+    id: 'demoted-owner',
+    status: 'failed',
+    repairContext: {
+      mode: 'merge',
+      storyId: 'US-003',
+      createdAt: 123,
+      reason: 'Merge repair required by Ralph.',
+    },
+    mergeConflictFiles: ['packages/contracts/src/index.ts'],
+    observedWriteSurface: ['packages/contracts/src/index.ts'],
+    quarantineExitKind: 'demote',
+    quarantineReleasedAt: 456,
+    quarantineReleaseReason: 'superseded by later-task',
+    startTime: 100,
+    enqueuedAt: 100,
+  });
+  const laterTask = createTask({
+    id: 'later-task',
+    status: 'pending',
+    declaredWriteSurface: ['packages/contracts/src/index.ts'],
+    startTime: 200,
+    enqueuedAt: 200,
+  });
+
+  const result = findCoordinationBlockers(laterTask, [earlierTask, laterTask], 'start', { targetBranch: 'main' });
+
+  assert.equal(result.blocked, false);
+  assert.deepEqual(result.blockers, []);
+});
+
 test('findCoordinationBlockers conservatively blocks unknown-surface tasks behind a hot merge-repair owner', () => {
   const earlierTask = createTask({
     id: 'failed-owner',

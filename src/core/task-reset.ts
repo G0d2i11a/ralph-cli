@@ -70,6 +70,7 @@ export function buildFinalizeRetryReset(): Partial<Task> {
     mergeRepairRecoveryDeadlineAt: undefined,
     mergeRepairRecoveryTotalRequeues: 0,
     mergeRepairRecoveryConsecutiveNoProgress: 0,
+    mergeRepairRecoveryLastObservationSignature: undefined,
     mergeRepairRecoveryLastConflictSignature: undefined,
     mergeRepairRecoveryLastProbeMessage: undefined,
     mergeRepairRecoveryLastProgressReason: undefined,

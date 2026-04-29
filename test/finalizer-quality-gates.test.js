@@ -48,6 +48,52 @@ function gitWithEnv(args, cwd, env) {
   }).trim();
 }
 
+function useFakePnpm(rootDir) {
+  const binDir = path.join(rootDir, 'fake-bin');
+  const pnpmPath = path.join(binDir, 'pnpm');
+  const previousPath = process.env.PATH;
+
+  fs.mkdirSync(binDir, { recursive: true });
+  fs.writeFileSync(pnpmPath, `#!/usr/bin/env node
+const fs = require('node:fs');
+const { spawnSync } = require('node:child_process');
+
+if (process.argv[2] !== 'run' || !process.argv[3]) {
+  process.exit(1);
+}
+
+const manifest = JSON.parse(fs.readFileSync('package.json', 'utf-8'));
+const script = manifest.scripts?.[process.argv[3]];
+if (!script) {
+  process.exit(1);
+}
+
+const result = spawnSync(script, {
+  cwd: process.cwd(),
+  shell: true,
+  stdio: 'inherit',
+  env: process.env,
+});
+
+if (result.error) {
+  console.error(result.error.message);
+  process.exit(1);
+}
+
+process.exit(result.status ?? 0);
+`);
+  fs.chmodSync(pnpmPath, 0o755);
+  process.env.PATH = `${binDir}${path.delimiter}${previousPath || ''}`;
+
+  return () => {
+    if (previousPath === undefined) {
+      delete process.env.PATH;
+    } else {
+      process.env.PATH = previousPath;
+    }
+  };
+}
+
 test('finalizeTaskOutput runs available quality gates before commit', { concurrency: false }, () => {
   const repoDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-finalizer-'));
   const prdPath = path.join(repoDir, 'prd.json');
@@ -873,8 +919,10 @@ test('finalizeTaskOutput refreshes Prisma client before root typecheck when sche
 test('finalizeTaskOutput repairs missing workspace install symlinks before Prisma preparation', { concurrency: false }, () => {
   const repoDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-finalizer-prisma-bootstrap-'));
   const prdPath = path.join(repoDir, 'prd.json');
+  let restorePath = () => {};
 
   try {
+    restorePath = useFakePnpm(repoDir);
     git(['init'], repoDir);
     git(['checkout', '-b', 'main'], repoDir);
     git(['config', 'user.name', 'Ralph Test'], repoDir);
@@ -961,6 +1009,7 @@ require('fs').writeFileSync(require('node:path').join(process.cwd(), 'generated-
     assert.equal(fs.existsSync(path.join(worktreePath, 'packages', 'db', 'generated-client.txt')), true);
     assert.equal(fs.existsSync(path.join(worktreePath, 'typecheck.txt')), true);
   } finally {
+    restorePath();
     fs.rmSync(repoDir, { recursive: true, force: true });
   }
 });
@@ -1134,8 +1183,10 @@ test('finalizeTaskOutput uses baseCommitSha to scope quality gates for already-c
 test('finalizeTaskOutput scopes quality gates using pnpm-workspace.yaml patterns', { concurrency: false }, () => {
   const repoDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-finalizer-pnpm-workspace-'));
   const prdPath = path.join(repoDir, 'prd.json');
+  let restorePath = () => {};
 
   try {
+    restorePath = useFakePnpm(repoDir);
     git(['init'], repoDir);
     git(['checkout', '-b', 'main'], repoDir);
     git(['config', 'user.name', 'Ralph Test'], repoDir);
@@ -1208,6 +1259,7 @@ test('finalizeTaskOutput scopes quality gates using pnpm-workspace.yaml patterns
     assert.equal(fs.existsSync(path.join(worktreePath, 'packages', 'unchanged', 'changed-test.txt')), false);
     assert.match(result.message, /packages\/changed:test/);
   } finally {
+    restorePath();
     fs.rmSync(repoDir, { recursive: true, force: true });
   }
 });

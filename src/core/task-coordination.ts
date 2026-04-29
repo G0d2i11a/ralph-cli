@@ -11,6 +11,7 @@ import {
   TaskCoordinationStatus,
 } from '../types/task';
 import { resolveTaskIntegrationStatus } from './task-delivery';
+import { isQuarantineOwnershipReleased } from './quarantine';
 
 export interface TaskCoordinationState {
   status: TaskCoordinationStatus;
@@ -91,6 +92,36 @@ export function hasHotConflictReservation(task: Pick<
   return /Merge conflicts detected/i.test(task.mergeError || task.lastError || '');
 }
 
+export function isHotConflictQuarantineOwner(task: Pick<
+  Task,
+  | 'status'
+  | 'repairContext'
+  | 'integrationStatus'
+  | 'postFinalizeMergeProbeRequired'
+  | 'mergeRepairAttempts'
+  | 'mergeConflictFiles'
+  | 'mergeError'
+  | 'lastError'
+  | 'quarantineExitKind'
+  | 'quarantineReleasedAt'
+>): boolean {
+  if (isQuarantineOwnershipReleased(task)) {
+    return false;
+  }
+
+  if (!hasHotConflictReservation(task)) {
+    return false;
+  }
+
+  if (task.status === 'completed') {
+    return task.integrationStatus === 'blocked_conflict';
+  }
+
+  return task.status === 'failed'
+    || task.status === 'stagnant'
+    || task.status === 'failed_finalize';
+}
+
 function normalizeSurfaceEntry(value: string): string {
   return value
     .trim()
@@ -136,9 +167,13 @@ function compareTaskOrder(left: Pick<Task, 'id' | 'enqueuedAt' | 'startTime'>, r
 }
 
 function taskBlocksCoordination(task: Task): boolean {
+  if (isQuarantineOwnershipReleased(task) && hasHotConflictReservation(task)) {
+    return false;
+  }
+
   if (!BLOCKING_COORDINATION_STATUSES.has(task.status)) {
     return (task.status === 'failed' || task.status === 'stagnant')
-      ? hasHotConflictReservation(task)
+      ? isHotConflictQuarantineOwner(task)
       : false;
   }
 
