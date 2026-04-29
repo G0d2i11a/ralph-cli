@@ -100,7 +100,7 @@ export function parsePRD(prdPath: string): PRD {
   return parsePRDContent(content, prdPath);
 }
 
-function parseRawPrdMetadata(prdPath: string): Record<string, unknown> {
+export function parseRawPrdMetadata(prdPath: string): Record<string, unknown> {
   const content = fs.readFileSync(prdPath, 'utf-8');
 
   if (path.extname(prdPath).toLowerCase() === '.json') {

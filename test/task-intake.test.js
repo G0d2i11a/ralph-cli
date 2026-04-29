@@ -70,6 +70,29 @@ function createPrdFile(dir, id, dependencies = [], overrides = {}) {
   return prdPath;
 }
 
+function createMarkdownPrdFile(dir, fileName, id, extraFrontmatter = '') {
+  const prdPath = path.join(dir, fileName);
+  const extra = extraFrontmatter.trim() ? `${extraFrontmatter.trim()}\n` : '';
+
+  fs.writeFileSync(prdPath, `---
+id: ${id}
+title: ${id} title
+description: ${id} description
+${extra}userStories:
+  - id: US-001
+    title: First story
+    description: First story description
+    acceptanceCriteria:
+      - done
+---
+
+## Additional Context
+
+Body only.
+`);
+  return prdPath;
+}
+
 test('enqueueTaskFromPrd stores immutable PRD metadata and source hash at intake', async () => {
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-intake-metadata-'));
   const previousHome = process.env.HOME;
@@ -362,6 +385,229 @@ test('enqueueTaskFromPrd rejects PRDs without an explicit title', async () => {
       }),
       /must define a non-empty top-level title/i,
     );
+  } finally {
+    process.env.HOME = previousHome;
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('enqueueTaskFromPrd rejects completed or archived PRDs with delta guidance', async () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-intake-completed-'));
+  const previousHome = process.env.HOME;
+
+  try {
+    process.env.HOME = tempDir;
+    const completedPrdPath = createPrdFile(tempDir, 'completed-prd', [], { status: 'completed' });
+    const archivedPrdPath = createPrdFile(tempDir, 'archived-prd', [], { archived: true });
+    const stateManager = new FakeStateManager();
+    const scheduler = new NoopScheduler();
+    const options = {
+      repoPath: tempDir,
+      stateManager,
+      scheduler,
+      configManager: { get: () => undefined },
+    };
+
+    await assert.rejects(
+      enqueueTaskFromPrd(completedPrdPath, options),
+      /frontmatter status is completed.*Create a narrow delta PRD/i,
+    );
+
+    await assert.rejects(
+      enqueueTaskFromPrd(archivedPrdPath, options),
+      /frontmatter marks it as archived.*Create a narrow delta PRD/i,
+    );
+
+    assert.equal((await stateManager.listTasks()).length, 0);
+  } finally {
+    process.env.HOME = previousHome;
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('enqueueTaskFromPrd reconciles ez4ielts markdown task index status without mutating docs', async () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-intake-markdown-index-'));
+  const previousHome = process.env.HOME;
+  const indexPath = path.join(tempDir, 'INDEX.md');
+
+  try {
+    process.env.HOME = tempDir;
+    const pendingPath = createMarkdownPrdFile(tempDir, 'prd-pending.md', 'prd-pending', 'status: pending');
+    const completedPath = createMarkdownPrdFile(tempDir, 'prd-completed.md', 'prd-completed', 'status: pending');
+    const inProgressPath = createMarkdownPrdFile(tempDir, 'prd-in-progress.md', 'prd-in-progress', 'status: pending');
+    const nonExecutablePath = createMarkdownPrdFile(
+      tempDir,
+      'prd-non-executable.md',
+      'prd-non-executable',
+      'status: pending\nnonExecutable: true',
+    );
+
+    fs.writeFileSync(indexPath, `# PRD Index
+
+## 进行中
+
+| PRD | 分支 | 开始时间 |
+| --- | --- | --- |
+| [prd-in-progress.md](./prd-in-progress.md) | ralph/prd-in-progress | - |
+
+## 已完成
+
+| PRD | 完成时间 | 分支 | Merge SHA |
+| --- | --- | --- | --- |
+| [prd-completed.md](./prd-completed.md) | 2026-02-09 | ralph/prd-completed | abc123 |
+
+## 待执行
+
+| PRD | 状态 |
+| --- | --- |
+| [prd-pending.md](./prd-pending.md) | pending |
+| [prd-non-executable.md](./prd-non-executable.md) | pending |
+`);
+
+    const originalDocs = new Map(
+      [indexPath, pendingPath, completedPath, inProgressPath, nonExecutablePath]
+        .map((filePath) => [filePath, fs.readFileSync(filePath, 'utf-8')])
+    );
+    const stateManager = new FakeStateManager();
+    const scheduler = new NoopScheduler();
+    const options = {
+      repoPath: tempDir,
+      stateManager,
+      scheduler,
+      configManager: { get: () => undefined },
+      now: () => 4_000,
+    };
+
+    const pending = await enqueueTaskFromPrd(pendingPath, options);
+    assert.equal(pending.alreadyExists, false);
+
+    await assert.rejects(
+      enqueueTaskFromPrd(completedPath, options),
+      /task index INDEX\.md marks it as completed.*Create a narrow delta PRD/i,
+    );
+
+    await assert.rejects(
+      enqueueTaskFromPrd(inProgressPath, options),
+      /task index INDEX\.md marks it as in_progress.*Create a narrow delta PRD/i,
+    );
+
+    await assert.rejects(
+      enqueueTaskFromPrd(nonExecutablePath, options),
+      /frontmatter marks it as non-executable.*Create a narrow delta PRD/i,
+    );
+
+    assert.equal((await stateManager.listTasks()).length, 1);
+    assert.equal(scheduler.scheduleCalls, 1);
+    for (const [filePath, originalContent] of originalDocs) {
+      assert.equal(fs.readFileSync(filePath, 'utf-8'), originalContent);
+    }
+  } finally {
+    process.env.HOME = previousHome;
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('enqueueTaskFromPrd requires allow flag or executable metadata for umbrella PRDs', async () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-intake-umbrella-'));
+  const previousHome = process.env.HOME;
+
+  try {
+    process.env.HOME = tempDir;
+    const prdPath = createPrdFile(tempDir, 'umbrella-prd', [], { type: 'strategy' });
+    const stateManager = new FakeStateManager();
+    const scheduler = new NoopScheduler();
+    const commonOptions = {
+      repoPath: tempDir,
+      stateManager,
+      scheduler,
+      configManager: { get: () => undefined },
+    };
+
+    await assert.rejects(
+      enqueueTaskFromPrd(prdPath, commonOptions),
+      /frontmatter classifies it as strategy.*Create a narrow delta PRD/i,
+    );
+
+    const result = await enqueueTaskFromPrd(prdPath, {
+      ...commonOptions,
+      allowUmbrellaPrd: true,
+    });
+
+    assert.equal(result.alreadyExists, false);
+    assert.equal((await stateManager.listTasks()).length, 1);
+  } finally {
+    process.env.HOME = previousHome;
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('enqueueTaskFromPrd allows umbrella PRDs with executable metadata', async () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-intake-executable-'));
+  const previousHome = process.env.HOME;
+
+  try {
+    process.env.HOME = tempDir;
+    const prdPath = createPrdFile(tempDir, 'executable-strategy-prd', [], {
+      type: 'strategy',
+      executable: true,
+    });
+    const stateManager = new FakeStateManager();
+    const scheduler = new NoopScheduler();
+
+    const result = await enqueueTaskFromPrd(prdPath, {
+      repoPath: tempDir,
+      stateManager,
+      scheduler,
+      configManager: { get: () => undefined },
+    });
+
+    assert.equal(result.alreadyExists, false);
+    assert.equal((await stateManager.listTasks()).length, 1);
+  } finally {
+    process.env.HOME = previousHome;
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('enqueueTaskFromPrd rejects clearly stale PRDs from completed task history', async () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-intake-stale-'));
+  const previousHome = process.env.HOME;
+
+  try {
+    process.env.HOME = tempDir;
+    const prdPath = createPrdFile(tempDir, 'history-prd');
+    const stateManager = new FakeStateManager([
+      {
+        id: 'task-completed-history',
+        prdPath,
+        prdId: 'history-prd',
+        status: 'completed',
+        startTime: 1,
+        completedUS: ['US-001'],
+        worktree: path.join(tempDir, '.ralph-worktrees', 'task-completed-history'),
+        logPath: path.join(tempDir, '.ralph', 'tasks', 'task-completed-history', 'agent.log'),
+        agent: 'codex',
+        repoPath: tempDir,
+        loopCount: 0,
+        consecutiveNoProgress: 0,
+        consecutiveErrors: 0,
+        lastProgressTime: 1,
+        lastFilesChanged: 0,
+      },
+    ]);
+    const scheduler = new NoopScheduler();
+
+    await assert.rejects(
+      enqueueTaskFromPrd(prdPath, {
+        repoPath: tempDir,
+        stateManager,
+        scheduler,
+        configManager: { get: () => undefined },
+      }),
+      /already completed this PRD.*Create a narrow delta PRD/i,
+    );
+
+    assert.equal((await stateManager.listTasks()).length, 1);
   } finally {
     process.env.HOME = previousHome;
     fs.rmSync(tempDir, { recursive: true, force: true });

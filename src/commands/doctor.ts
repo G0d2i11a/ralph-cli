@@ -7,6 +7,7 @@ import { evaluateRalphHomeIsolation } from '../core/home-isolation';
 import { resolveAutoIntegrate } from '../core/integration-policy';
 import { getManagerStatus } from '../core/manager-state';
 import { resolveRalphHome } from '../core/paths';
+import { assessPrdPaths, listPrdFiles, summarizePrdFolderPreflight } from '../core/prd-preflight';
 import { StateManager } from '../core/state';
 import { resolveTaskIntegrationStatus } from '../core/task-delivery';
 import { summarizeActiveRepoPaths } from '../core/task-home-summary';
@@ -85,7 +86,7 @@ function hasWritableRalphHome(ralphHome: string): boolean {
   }
 }
 
-export async function doctorCommand(options: { repo?: string } = {}): Promise<void> {
+export async function doctorCommand(options: { repo?: string; prdDir?: string } = {}): Promise<void> {
   const repoPath = path.resolve(options.repo || process.cwd());
   const ralphHome = resolveRalphHome();
   const configManager = new ConfigManager({ ralphHome });
@@ -116,6 +117,40 @@ export async function doctorCommand(options: { repo?: string } = {}): Promise<vo
     || task.coordinationStatus === 'blocked_observed_overlap'
     || (task.status === 'completed' && resolveTaskIntegrationStatus(task) !== 'integrated')
   ));
+  let prdFolder: ReturnType<typeof summarizePrdFolderPreflight> | { path: string; ok: false; error: string } | undefined;
+  let prdFolderCheck: DoctorCheck | undefined;
+
+  if (options.prdDir) {
+    const prdFolderPath = path.resolve(options.prdDir);
+
+    try {
+      const prdFiles = listPrdFiles(prdFolderPath);
+      const prdResults = await assessPrdPaths(prdFiles, {
+        repoPath,
+        stateManager,
+      });
+      const prdFolderSummary = summarizePrdFolderPreflight(prdFolderPath, prdResults);
+      prdFolder = prdFolderSummary;
+      prdFolderCheck = {
+        name: 'prd.folder',
+        ok: prdFolderSummary.ok,
+        message: prdFolderSummary.ok
+          ? `PRD folder has ${prdFolderSummary.total} enqueueable PRD(s): ${prdFolderPath}`
+          : `PRD folder has ${prdFolderSummary.skipped.length} skipped and ${prdFolderSummary.blocked.length} blocked PRD(s): ${prdFolderPath}`,
+      };
+    } catch (error) {
+      prdFolder = {
+        path: prdFolderPath,
+        ok: false,
+        error: error instanceof Error ? error.message : String(error),
+      };
+      prdFolderCheck = {
+        name: 'prd.folder',
+        ok: false,
+        message: prdFolder.error,
+      };
+    }
+  }
 
   const checks: DoctorCheck[] = [
     {
@@ -193,6 +228,9 @@ export async function doctorCommand(options: { repo?: string } = {}): Promise<vo
               : 'Ralph home has no active queued/running/finalizing tasks',
     },
   ];
+  if (prdFolderCheck) {
+    checks.push(prdFolderCheck);
+  }
 
   const ok = checks.every((check) => check.ok);
   console.log(JSON.stringify({
@@ -202,6 +240,7 @@ export async function doctorCommand(options: { repo?: string } = {}): Promise<vo
     backend,
     ...repoSummary,
     manager: managerStatus,
+    ...(prdFolder ? { prdFolder } : {}),
     checks,
   }));
 

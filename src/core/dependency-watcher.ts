@@ -70,6 +70,7 @@ export interface WatchCommandOptions {
   allowMixedHome?: boolean;
   autoIngestEz4ielts?: boolean;
   ez4ieltsDir?: string;
+  allowUmbrellaPrds?: boolean;
 }
 
 interface DependencyWatcherDeps {
@@ -533,6 +534,7 @@ export class DependencyWatcher {
         watchDir,
         pattern: typeof configuredPattern === 'string' ? configuredPattern : DEFAULT_EZ4IELTS_PATTERN,
         settleMs: Number.isFinite(settleMs) && settleMs >= 0 ? settleMs : DEFAULT_EZ4IELTS_SETTLE_MS,
+        allowUmbrellaPrd: options.allowUmbrellaPrds,
         logger: (message) => this.logger.log(message),
       }, {
         stateManager,

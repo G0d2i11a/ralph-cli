@@ -4,6 +4,7 @@ import { AgentBackend, AgentType, DEFAULT_AGENT, resolveAgentBackend, resolveAge
 import { TaskScheduler } from './scheduler';
 import { StateManager } from './state';
 import { enqueueTaskFromPrd } from './task-intake';
+import { PrdIntakeRefusalError } from './prd-intake-policy';
 import { assertPrdHasExplicitTitle, parsePRD } from '../utils/helpers';
 
 export const DEFAULT_EZ4IELTS_WATCH_DIR = '';
@@ -23,6 +24,7 @@ export interface PrdAutoIngestOptions {
   agent?: string;
   backend?: string;
   settleMs?: number;
+  allowUmbrellaPrd?: boolean;
   logger?: (message: string) => void;
 }
 
@@ -37,7 +39,7 @@ export interface PrdAutoIngestDeps {
 export interface PrdAutoIngestResult {
   filePath: string;
   taskId?: string;
-  action: 'ingested' | 'already-tracked' | 'invalid';
+  action: 'ingested' | 'already-tracked' | 'invalid' | 'skipped';
   status?: string;
   error?: string;
 }
@@ -56,6 +58,7 @@ export class PrdAutoIngestor {
   private readonly watchDir: string;
   private readonly pattern: string;
   private readonly settleMs: number;
+  private readonly allowUmbrellaPrd: boolean;
   private readonly now: () => number;
   private readonly logger: (message: string) => void;
   private readonly listFilesFn: (watchDir: string) => string[];
@@ -79,6 +82,7 @@ export class PrdAutoIngestor {
     this.backend = resolveAgentBackend(options.backend);
     this.pattern = options.pattern || DEFAULT_EZ4IELTS_PATTERN;
     this.settleMs = options.settleMs ?? DEFAULT_EZ4IELTS_SETTLE_MS;
+    this.allowUmbrellaPrd = options.allowUmbrellaPrd ?? false;
     this.now = deps.now ?? (() => Date.now());
     this.logger = options.logger ?? (() => undefined);
     this.listFilesFn = deps.listFiles ?? defaultListFiles;
@@ -173,6 +177,7 @@ export class PrdAutoIngestor {
           backend: this.backend,
           allowMixedHome: false,
           dedupeByPrdPath: true,
+          allowUmbrellaPrd: this.allowUmbrellaPrd,
           stateManager: this.stateManager,
           scheduler: this.scheduler,
           now: this.now,
@@ -180,12 +185,17 @@ export class PrdAutoIngestor {
       } catch (error) {
         candidate.attemptedSignature = signature;
         const message = error instanceof Error ? error.message : String(error);
+        const action = error instanceof PrdIntakeRefusalError ? 'skipped' : 'invalid';
         results.push({
           filePath,
-          action: 'invalid',
+          action,
           error: message,
         });
-        this.logger(`[watch] waiting for valid PRD ${path.basename(filePath)}: ${message}`);
+        this.logger(
+          action === 'skipped'
+            ? `[watch] skipping PRD ${path.basename(filePath)}: ${message}`
+            : `[watch] waiting for valid PRD ${path.basename(filePath)}: ${message}`
+        );
         continue;
       }
 

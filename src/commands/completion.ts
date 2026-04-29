@@ -59,7 +59,7 @@ _ralph_completion() {
 
   case "\${cur}" in
     -*)
-      local opts="--repo --agent --backend --status --auto --strategy --target --format --all --interval --auto-ingest-ez4ielts --ez4ielts-dir --story-id --passes --notes --detailed --help"
+      local opts="--repo --agent --backend --status --auto --strategy --target --format --all --interval --auto-ingest-ez4ielts --allow-umbrella-prd --allow-umbrella-prds --ez4ielts-dir --story-id --passes --notes --detailed --help"
       COMPREPLY=( $(compgen -W "\${opts}" -- \${cur}) )
       return 0
       ;;
@@ -110,14 +110,16 @@ _ralph() {
             '1:PRD file:_files -g "*.md|*.json"' \\
             '--repo[Repository path]:directory:_directories' \\
             '--agent[Agent to use]:agent:(claude codex)' \\
-            '--backend[Backend to use]:backend:(cli agent-runners)'
+            '--backend[Backend to use]:backend:(cli agent-runners)' \\
+            '--allow-umbrella-prd[Allow broad umbrella or strategy PRDs without executable frontmatter]'
           ;;
         batch-start)
           _arguments \\
             '*:PRD file:_files -g "*.md|*.json"' \\
             '--repo[Repository path]:directory:_directories' \\
             '--agent[Agent to use]:agent:(claude codex)' \\
-            '--backend[Backend to use]:backend:(cli agent-runners)'
+            '--backend[Backend to use]:backend:(cli agent-runners)' \\
+            '--allow-umbrella-prd[Allow broad umbrella or strategy PRDs without executable frontmatter]'
           ;;
         status)
           _arguments \\
@@ -151,6 +153,7 @@ _ralph() {
             '--agent[Agent to use for auto-ingested tasks]:agent:(claude codex)' \\
             '--backend[Backend to use for auto-ingested tasks]:backend:(cli agent-runners)' \\
             '--auto-ingest-ez4ielts[Auto-enqueue new ez4ielts PRDs]' \\
+            '--allow-umbrella-prds[Allow broad umbrella or strategy PRDs without executable frontmatter]' \\
             '--ez4ielts-dir[Directory to scan for ez4ielts PRDs]:directory:_directories'
           ;;
         completion)
