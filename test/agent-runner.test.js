@@ -13,7 +13,7 @@ function createAgentRunnersFixture(rootDir) {
   return agentRunnersPath;
 }
 
-function createMockChild({ exitCode = 0, stdoutLines = [], closeOnKill = true } = {}) {
+function createMockChild({ exitCode = 0, stdoutLines = [], closeOnKill = true, killExitCode } = {}) {
   const child = new EventEmitter();
   child.stdout = new EventEmitter();
   child.stderr = new EventEmitter();
@@ -21,7 +21,8 @@ function createMockChild({ exitCode = 0, stdoutLines = [], closeOnKill = true } 
   child.kill = (signal = 'SIGTERM') => {
     child.killSignals.push(signal);
     if (closeOnKill) {
-      process.nextTick(() => child.emit('close', signal === 'SIGKILL' ? 137 : 124));
+      const closeCode = killExitCode ?? (signal === 'SIGKILL' ? 137 : 124);
+      process.nextTick(() => child.emit('close', closeCode));
     }
   };
 
@@ -432,6 +433,67 @@ test('AgentRunner enforces configured timeout', async () => {
     );
 
     assert.equal(result.success, false);
+    assert.ok(child.killSignals.includes('SIGTERM'));
+    assert.match(result.output, /Timed out after/);
+  } finally {
+    childProcess.spawn = originalSpawn;
+    process.env.HOME = previousHome;
+    restoreRunnerEnv(previousRunnerEnv);
+    await cleanupPath(tempRoot);
+    await cleanupPath(worktreePath);
+    delete require.cache[require.resolve('../dist/core/agent.js')];
+  }
+});
+
+test('AgentRunner treats timeout as failure even when child exits zero after SIGTERM', async () => {
+  const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-agent-timeout-zero-'));
+  const worktreePath = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-agent-worktree-'));
+  const logPath = path.join(tempRoot, 'agent.log');
+  const previousHome = process.env.HOME;
+  const previousRunnerEnv = captureRunnerEnv();
+  const originalSpawn = childProcess.spawn;
+
+  let child;
+
+  try {
+    process.env.HOME = tempRoot;
+    process.env.RALPH_AGENT_RUNNERS_CLI = createAgentRunnersFixture(tempRoot);
+    delete process.env.RALPH_SDK_RUNNER_CLI;
+    fs.mkdirSync(path.join(tempRoot, '.ralph'), { recursive: true });
+    fs.writeFileSync(
+      path.join(tempRoot, '.ralph', 'config.json'),
+      JSON.stringify({
+        agent: {
+          agentRunnersPath: process.env.RALPH_AGENT_RUNNERS_CLI,
+          timeout: 0.01,
+        },
+      }),
+    );
+
+    childProcess.spawn = () => {
+      child = createMockChild({ exitCode: null, closeOnKill: true, killExitCode: 0 });
+      return child;
+    };
+
+    const { AgentRunner } = require('../dist/core/agent.js');
+    const runner = new AgentRunner();
+
+    const result = await runner.runUserStory(
+      {
+        id: 'US-timeout-zero',
+        title: 'Timeout zero exit smoke',
+        description: 'Ensure timeout state wins over process close code.',
+        acceptanceCriteria: ['Finish quickly.'],
+      },
+      worktreePath,
+      'codex',
+      logPath,
+      'agent-runners',
+    );
+
+    assert.equal(result.success, false);
+    assert.equal(result.timedOut, true);
+    assert.equal(result.exitCode, 0);
     assert.ok(child.killSignals.includes('SIGTERM'));
     assert.match(result.output, /Timed out after/);
   } finally {

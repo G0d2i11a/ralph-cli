@@ -25,6 +25,7 @@ export function buildFinalizeRetryReset(): Partial<Task> {
     mergeMessage: undefined,
     mergeError: undefined,
     mergeConflictFiles: undefined,
+    mergeConflictPhase: undefined,
     mergeConflictAt: undefined,
     mergeRepairAttempts: 0,
     mergeRepairBranch: undefined,

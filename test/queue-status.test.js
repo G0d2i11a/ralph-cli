@@ -47,6 +47,26 @@ test('queue attention labels stopped merge repair distinctly', () => {
   assert.match(resolveNextAction(task), /manual merge repair required/);
 });
 
+test('queue attention labels integration sync conflicts distinctly', () => {
+  const task = createTask({
+    status: 'failed',
+    autoRecoveryKind: 'merge_repair',
+    lastError: 'Integration branch sync failed with conflicts: docs/TODO.md',
+    lastErrorRetryable: true,
+    mergeRepairDisplayStatus: 'stopped',
+    mergeRepairRecoveryStoppedAt: 200,
+    mergeRepairRecoveryStopReason: 'merge_repair_integration_sync_conflict',
+    mergeConflictFiles: ['docs/TODO.md'],
+    mergeConflictPhase: 'integration_sync',
+  });
+
+  const attention = deriveAttention(task);
+
+  assert.equal(attention.needed, true);
+  assert.equal(attention.reason, 'integration_sync_conflict');
+  assert.match(resolveNextAction(task), /integration branch sync conflict/);
+});
+
 test('queue attention labels nonretryable story incomplete distinctly', () => {
   const task = createTask({
     status: 'failed',

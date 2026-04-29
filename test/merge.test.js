@@ -327,6 +327,60 @@ test('probeTaskMergeability reports exact conflicts and leaves the integration w
   }
 });
 
+test('probeTaskWorktreeMergeability labels integration branch sync conflicts separately', async () => {
+  const repoDir = createRepo();
+
+  try {
+    git(['branch', 'ralph/integration/main', 'main'], repoDir);
+    const integrationWorktree = path.join(repoDir, '.ralph-integration', 'main');
+    fs.mkdirSync(path.dirname(integrationWorktree), { recursive: true });
+    git(['worktree', 'add', integrationWorktree, 'ralph/integration/main'], repoDir);
+    fs.writeFileSync(path.join(integrationWorktree, 'feature.txt'), 'integration side\n');
+    git(['add', 'feature.txt'], integrationWorktree);
+    git(['commit', '-m', 'feat: integration side'], integrationWorktree);
+
+    fs.writeFileSync(path.join(repoDir, 'feature.txt'), 'main side\n');
+    git(['add', 'feature.txt'], repoDir);
+    git(['commit', '-m', 'feat: main side'], repoDir);
+
+    const worktreePath = path.join(repoDir, '.ralph-worktrees', 'task-probe-sync-conflict');
+    fs.mkdirSync(path.dirname(worktreePath), { recursive: true });
+    git(['worktree', 'add', '-b', 'ralph/task-probe-sync-conflict', worktreePath, 'main'], repoDir);
+    fs.writeFileSync(path.join(worktreePath, 'task.txt'), 'task side\n');
+    git(['add', 'task.txt'], worktreePath);
+    git(['commit', '-m', 'feat: task side'], worktreePath);
+
+    const task = {
+      id: 'task-probe-sync-conflict',
+      prdPath: path.join(repoDir, 'prd.json'),
+      status: 'running',
+      startTime: Date.now(),
+      completedUS: [],
+      worktree: worktreePath,
+      logPath: path.join(repoDir, '.ralph', 'tasks', 'task-probe-sync-conflict', 'agent.log'),
+      agent: 'codex',
+      repoPath: repoDir,
+      baseCommitSha: git(['rev-parse', 'main'], repoDir),
+      loopCount: 0,
+      consecutiveNoProgress: 0,
+      consecutiveErrors: 0,
+      lastProgressTime: Date.now(),
+      lastFilesChanged: 1,
+    };
+
+    const result = await probeTaskWorktreeMergeability(task, 'main', { pullLatest: false });
+
+    assert.equal(result.mergeable, false);
+    assert.equal(result.alreadyIntegrated, false);
+    assert.equal(result.failurePhase, 'integration_sync');
+    assert.deepEqual(result.conflictFiles, ['feature.txt']);
+    assert.match(result.message, /Integration branch sync failed/);
+    assert.equal(git(['status', '--porcelain'], result.integrationWorktree), '');
+  } finally {
+    fs.rmSync(repoDir, { recursive: true, force: true });
+  }
+});
+
 test('probeTaskWorktreeMergeability includes uncommitted worktree changes instead of stale branch HEAD', async () => {
   const repoDir = createRepo();
 

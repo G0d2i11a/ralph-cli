@@ -115,6 +115,10 @@ function hasStoppedRecoveryState(task: Task): boolean {
 }
 
 function stoppedFailedReason(task: Task): string {
+  if (task.mergeConflictPhase === 'integration_sync') {
+    return 'integration_sync_conflict';
+  }
+
   if (task.mergeRepairRecoveryStoppedAt || task.mergeRepairDisplayStatus === 'stopped') {
     return 'merge_repair_stopped';
   }
@@ -435,6 +439,10 @@ export function resolveNextAction(task: Task, pendingState?: PendingSummary, aut
   }
 
   if (task.status === 'failed') {
+    if (task.mergeConflictPhase === 'integration_sync') {
+      return 'resolve the integration branch sync conflict, then retry the blocked task';
+    }
+
     if (task.mergeRepairRecoveryStoppedAt || task.mergeRepairDisplayStatus === 'stopped') {
       return 'manual merge repair required; resolve conflicts in the task worktree or explicitly reset/requeue the repair story';
     }
