@@ -177,7 +177,6 @@ function createScheduler(tasks, prds, options = {}) {
     parsePRD: createParsePrd(prds),
     checkDependencies: dependencyChecker,
     isProcessRunning: options.isProcessRunning || (() => true),
-    getProcessInfo: options.getProcessInfo,
     terminateProcess: options.terminateProcess,
     lockDir,
     now: options.now,
@@ -412,9 +411,67 @@ test('schedulePendingTasks keeps later overlap pending while an earlier failed m
     startTime: 200,
     enqueuedAt: 200,
   });
+  const nonOverlappingTask = createTask({
+    id: 'non-overlapping-task',
+    prdId: 'non-overlapping-task',
+    prdPath: '/non-overlapping-task.json',
+    declaredWriteSurface: ['docs/README.md'],
+    startTime: 300,
+    enqueuedAt: 300,
+  });
 
   const { scheduler, stateManager, forkCalls } = createScheduler(
-    [failedOwner, laterTask],
+    [failedOwner, laterTask, nonOverlappingTask],
+    {
+      '/later-task.json': { id: 'later-task', dependencies: [] },
+      '/non-overlapping-task.json': { id: 'non-overlapping-task', dependencies: [] },
+    },
+    { maxConcurrent: 2 }
+  );
+
+  const startedTasks = await scheduler.schedulePendingTasks();
+  const persistedLaterTask = await stateManager.loadTask('later-task');
+  const persistedNonOverlappingTask = await stateManager.loadTask('non-overlapping-task');
+
+  assert.equal(startedTasks.length, 1);
+  assert.equal(startedTasks[0].id, 'non-overlapping-task');
+  assert.deepEqual(forkCalls, ['non-overlapping-task']);
+  assert.equal(persistedLaterTask.status, 'pending');
+  assert.equal(persistedLaterTask.coordinationStatus, 'blocked_predicted_overlap');
+  assert.deepEqual(persistedLaterTask.coordinationBlockers, ['failed-owner']);
+  assert.equal(persistedNonOverlappingTask.status, 'running');
+});
+
+test('schedulePendingTasks starts later overlap after explicit quarantine demotion', async () => {
+  const demotedOwner = createTask({
+    id: 'demoted-owner',
+    prdId: 'demoted-owner',
+    status: 'failed',
+    observedWriteSurface: ['packages/contracts/src/index.ts'],
+    mergeConflictFiles: ['packages/contracts/src/index.ts'],
+    repairContext: {
+      mode: 'merge',
+      storyId: 'US-003',
+      createdAt: 123,
+      reason: 'Merge repair required by Ralph.',
+    },
+    quarantineExitKind: 'demote',
+    quarantineReleasedAt: 456,
+    quarantineReleaseReason: 'superseded by later-task',
+    startTime: 100,
+    enqueuedAt: 100,
+  });
+  const laterTask = createTask({
+    id: 'later-task',
+    prdId: 'later-task',
+    prdPath: '/later-task.json',
+    declaredWriteSurface: ['packages/contracts/src/index.ts'],
+    startTime: 200,
+    enqueuedAt: 200,
+  });
+
+  const { scheduler, stateManager, forkCalls } = createScheduler(
+    [demotedOwner, laterTask],
     {
       '/later-task.json': { id: 'later-task', dependencies: [] },
     },
@@ -424,11 +481,12 @@ test('schedulePendingTasks keeps later overlap pending while an earlier failed m
   const startedTasks = await scheduler.schedulePendingTasks();
   const persistedLaterTask = await stateManager.loadTask('later-task');
 
-  assert.equal(startedTasks.length, 0);
-  assert.deepEqual(forkCalls, []);
-  assert.equal(persistedLaterTask.status, 'pending');
-  assert.equal(persistedLaterTask.coordinationStatus, 'blocked_predicted_overlap');
-  assert.deepEqual(persistedLaterTask.coordinationBlockers, ['failed-owner']);
+  assert.equal(startedTasks.length, 1);
+  assert.equal(startedTasks[0].id, 'later-task');
+  assert.deepEqual(forkCalls, ['later-task']);
+  assert.equal(persistedLaterTask.status, 'running');
+  assert.equal(persistedLaterTask.coordinationStatus, undefined);
+  assert.equal(persistedLaterTask.coordinationBlockers, undefined);
 });
 
 test('schedulePendingTasks skips active observed-surface overlap but starts non-overlapping same-repo work up to concurrency', async () => {
@@ -817,115 +875,6 @@ test('schedulePendingTasks recovers live running tasks that exceed stagnation ti
   assert.deepEqual(terminateSignals, ['SIGTERM']);
   assert.equal(startedQueuedTask.status, 'running');
   assert.deepEqual(forkCalls, ['queued-after-stagnant']);
-});
-
-test('schedulePendingTasks reclaims orphaned worker leases from a previous manager', async () => {
-  let processAlive = true;
-  let now = 100_000;
-  const terminateSignals = [];
-  const orphanedTask = createTask({
-    id: 'orphaned-running-task',
-    prdId: 'orphaned-running-task',
-    prdPath: '/orphaned-running.json',
-    status: 'running',
-    startTime: 100,
-    currentUS: 'US-002',
-    worktree: '/worktrees/orphaned-running-task',
-    pid: 5151,
-    leaseOwner: 'worker:5151',
-    leaseHeartbeatAt: now,
-    leaseExpiresAt: now + 60_000,
-    lastProgressTime: now,
-  });
-  const queuedTask = createTask({
-    id: 'queued-after-orphan',
-    prdId: 'queued-after-orphan',
-    prdPath: '/queued-after-orphan.json',
-    startTime: 200,
-  });
-
-  const { scheduler, stateManager, forkCalls } = createScheduler(
-    [orphanedTask, queuedTask],
-    {
-      '/orphaned-running.json': { id: 'orphaned-running-task', dependencies: [] },
-      '/queued-after-orphan.json': { id: 'queued-after-orphan', dependencies: [] },
-    },
-    {
-      maxConcurrent: 1,
-      now: () => now,
-      sleep: async (ms) => {
-        now += ms;
-      },
-      isProcessRunning: () => processAlive,
-      getProcessInfo: () => ({
-        ppid: 1,
-        command: 'node /repo/dist/worker.js orphaned-running-task',
-      }),
-      terminateProcess: (_pid, signal) => {
-        terminateSignals.push(signal);
-        processAlive = false;
-      },
-    }
-  );
-
-  const startedTasks = await scheduler.schedulePendingTasks();
-  const recoveredTask = await stateManager.loadTask('orphaned-running-task');
-  const queuedAfter = await stateManager.loadTask('queued-after-orphan');
-
-  assert.equal(startedTasks.length, 1);
-  assert.equal(startedTasks[0].id, 'orphaned-running-task');
-  assert.equal(recoveredTask.status, 'running');
-  assert.equal(recoveredTask.pid, 4000);
-  assert.equal(recoveredTask.currentUS, undefined);
-  assert.equal(recoveredTask.lastErrorKind, 'orphaned_worker');
-  assert.match(recoveredTask.lastError, /orphaned from the current manager/i);
-  assert.equal(queuedAfter.status, 'pending');
-  assert.deepEqual(terminateSignals, ['SIGTERM']);
-  assert.deepEqual(forkCalls, ['orphaned-running-task']);
-});
-
-test('schedulePendingTasks keeps current-manager worker leases active', async () => {
-  const runningTask = createTask({
-    id: 'current-manager-running-task',
-    prdId: 'current-manager-running-task',
-    prdPath: '/current-manager-running.json',
-    status: 'running',
-    startTime: 100,
-    worktree: '/worktrees/current-manager-running-task',
-    pid: 6161,
-    leaseOwner: 'worker:6161',
-  });
-  const queuedTask = createTask({
-    id: 'queued-behind-current-manager',
-    prdId: 'queued-behind-current-manager',
-    prdPath: '/queued-behind-current-manager.json',
-    startTime: 200,
-  });
-
-  const { scheduler, stateManager, forkCalls } = createScheduler(
-    [runningTask, queuedTask],
-    {
-      '/current-manager-running.json': { id: 'current-manager-running-task', dependencies: [] },
-      '/queued-behind-current-manager.json': { id: 'queued-behind-current-manager', dependencies: [] },
-    },
-    {
-      maxConcurrent: 1,
-      getProcessInfo: () => ({
-        ppid: process.pid,
-        command: 'node /repo/dist/worker.js current-manager-running-task',
-      }),
-    }
-  );
-
-  const startedTasks = await scheduler.schedulePendingTasks();
-  const stillRunning = await stateManager.loadTask('current-manager-running-task');
-  const queuedAfter = await stateManager.loadTask('queued-behind-current-manager');
-
-  assert.equal(startedTasks.length, 0);
-  assert.equal(stillRunning.status, 'running');
-  assert.equal(stillRunning.pid, 6161);
-  assert.equal(queuedAfter.status, 'pending');
-  assert.deepEqual(forkCalls, []);
 });
 
 test('schedulePendingTasks does not overwrite ready_to_finalize task after stale stagnant worker completes during recovery', async () => {

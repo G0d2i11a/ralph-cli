@@ -1,5 +1,6 @@
 import { StateManager } from '../core/state';
 import { finalizeTask } from '../core/scheduler';
+import { hasHotConflictReservation } from '../core/task-coordination';
 import { isProcessRunning } from '../utils/helpers';
 
 function signalTaskProcess(pid: number, signal: NodeJS.Signals): boolean {
@@ -26,7 +27,9 @@ function signalTaskProcess(pid: number, signal: NodeJS.Signals): boolean {
   }
 }
 
-export async function stopCommand(taskId: string): Promise<void> {
+type StopCommandOptions = { reason?: string };
+
+export async function stopCommand(taskId: string, options: StopCommandOptions = {}): Promise<void> {
   try {
     const stateManager = new StateManager();
     const task = await stateManager.loadTask(taskId);
@@ -40,11 +43,19 @@ export async function stopCommand(taskId: string): Promise<void> {
       console.error(JSON.stringify({ error: 'No PID found for task' }));
       process.exit(1);
     }
+
+    const releaseQuarantine = hasHotConflictReservation(task);
+    const releaseReason = options.reason?.trim()
+      || 'Task stopped by explicit user request';
+    if (releaseQuarantine) {
+      task.quarantineReleaseReason = releaseReason;
+    }
     
     if (!isProcessRunning(task.pid)) {
       console.log(JSON.stringify({ 
         message: 'Process already stopped',
-        taskId 
+        taskId,
+        quarantineReleased: releaseQuarantine,
       }));
       await finalizeTask(task, 'stopped', { stateManager });
       return;
@@ -66,7 +77,8 @@ export async function stopCommand(taskId: string): Promise<void> {
       
       console.log(JSON.stringify({
         message: 'Task stopped',
-        taskId
+        taskId,
+        quarantineReleased: releaseQuarantine,
       }));
       
     } catch (error) {

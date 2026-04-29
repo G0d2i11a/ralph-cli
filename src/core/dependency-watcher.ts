@@ -61,6 +61,7 @@ import {
 import { TaskScheduler } from './scheduler';
 import { Task } from '../types/task';
 import { probeTaskMergeability, probeTaskWorktreeMergeability } from './merge';
+import { isQuarantineOwnershipReleased } from './quarantine';
 
 export interface WatchCommandOptions {
   interval?: number;
@@ -164,6 +165,22 @@ function buildMergeConflictSignature(conflictFiles?: string[]): string | undefin
   }
 
   return [...new Set(conflictFiles)].sort().join('\n');
+}
+
+function didMergeConflictSignatureShrink(previous?: string, current?: string): boolean {
+  if (!previous || !current) {
+    return false;
+  }
+
+  const previousEntries = previous.split('\n').filter(Boolean);
+  const currentEntries = current.split('\n').filter(Boolean);
+
+  if (currentEntries.length >= previousEntries.length) {
+    return false;
+  }
+
+  const previousSet = new Set(previousEntries);
+  return currentEntries.every((entry) => previousSet.has(entry));
 }
 
 function isResolvedPendingMergeProof(
@@ -797,7 +814,6 @@ export class DependencyWatcher {
         lastErrorHadObjectiveProgress: undefined,
         mergeError: undefined,
         mergeConflictFiles: undefined,
-        mergeConflictPhase: undefined,
         mergeConflictAt: undefined,
         integrationBranch: mergeProofRecovery?.integrationBranch ?? task.integrationBranch,
         integrationWorktree: mergeProofRecovery?.integrationWorktree ?? task.integrationWorktree,
@@ -836,6 +852,10 @@ export class DependencyWatcher {
         continue;
       }
 
+      if (isQuarantineOwnershipReleased(task)) {
+        continue;
+      }
+
       if (resolveRetryableTransientFailure(task) && task.repairContext?.mode === 'merge') {
         continue;
       }
@@ -868,14 +888,14 @@ export class DependencyWatcher {
       const firstRecoveryObservation = task.mergeRepairRecoveryStartedAt === undefined
         && task.mergeRepairRecoveryTotalRequeues === undefined
         && task.mergeRepairRecoveryConsecutiveNoProgress === undefined;
-      const startedAt = task.mergeRepairRecoveryStartedAt
+      const observedStartedAt = task.mergeRepairRecoveryStartedAt
         ?? (firstRecoveryObservation
           ? now
           : task.repairContext?.createdAt
             ?? task.lastErrorObservedAt
             ?? now);
-      const deadlineAt = task.mergeRepairRecoveryDeadlineAt
-        ?? startedAt + (repairConfig.repairDeadlineSeconds * 1000);
+      const observedDeadlineAt = task.mergeRepairRecoveryDeadlineAt
+        ?? observedStartedAt + (repairConfig.repairDeadlineSeconds * 1000);
       const currentObservationSignature = buildMergeRepairObservationSignature(mergeProbeResult);
       const previousSignature = task.mergeRepairRecoveryLastConflictSignature
         || buildMergeConflictSignature(task.mergeConflictFiles)
@@ -886,12 +906,27 @@ export class DependencyWatcher {
         || 'merge_conflict';
       const previousObservationSignature = task.mergeRepairRecoveryLastObservationSignature;
       const resolvedPendingMergeProof = isResolvedPendingMergeProof(mergeProbeResult);
-      const hasProgress = !firstRecoveryObservation && (
-        resolvedPendingMergeProof
-        || (previousObservationSignature
-          ? previousObservationSignature !== currentObservationSignature
-          : currentSignature !== previousSignature)
+      const conflictSetShrank = didMergeConflictSignatureShrink(previousSignature, currentSignature);
+      const observationSignatureChanged = Boolean(
+        previousObservationSignature
+        && previousObservationSignature !== currentObservationSignature
       );
+      const conflictSignatureChanged = !previousObservationSignature
+        && currentSignature !== previousSignature;
+      const progressReason = resolvedPendingMergeProof
+        ? 'Observed resolved pending merge awaiting finalizer commit'
+        : conflictSetShrank
+          ? 'Merge conflict file set shrank'
+          : observationSignatureChanged
+            ? 'Merge-repair proof signature changed'
+            : conflictSignatureChanged
+              ? 'Merge conflict signature changed'
+              : undefined;
+      const hasProgress = !firstRecoveryObservation && Boolean(progressReason);
+      const startedAt = hasProgress ? now : observedStartedAt;
+      const deadlineAt = hasProgress
+        ? now + (repairConfig.repairDeadlineSeconds * 1000)
+        : observedDeadlineAt;
       const nextConsecutiveNoProgress = firstRecoveryObservation
         ? 0
         : hasProgress
@@ -900,9 +935,7 @@ export class DependencyWatcher {
       const nextProgressReason = firstRecoveryObservation
         ? 'Initialized worker merge-repair recovery tracking'
         : hasProgress
-          ? resolvedPendingMergeProof
-            ? 'Observed resolved pending merge awaiting finalizer commit'
-            : 'Merge-repair worktree observation changed'
+          ? progressReason
           : task.mergeRepairRecoveryLastProgressReason;
       const commonUpdates: Partial<Task> = {
         lastError: mergeProbeResult.message,
@@ -1024,7 +1057,6 @@ export class DependencyWatcher {
           lastErrorHadObjectiveProgress: undefined,
           mergeError: undefined,
           mergeConflictFiles: undefined,
-          mergeConflictPhase: undefined,
           mergeConflictAt: undefined,
           repairContext: undefined,
           autoRecoveryKind: undefined,
@@ -1053,7 +1085,7 @@ export class DependencyWatcher {
         continue;
       }
 
-      const currentTotalRequeues = task.mergeRepairRecoveryTotalRequeues ?? 0;
+      const currentTotalRequeues = hasProgress ? 0 : (task.mergeRepairRecoveryTotalRequeues ?? 0);
       const currentAutoRequeues = task.autoRecoveryTotalRequeues ?? 0;
       const integrationSyncConflict = mergeProbeResult.failurePhase === 'integration_sync';
       let stopReason: string | undefined;
@@ -1111,7 +1143,6 @@ export class DependencyWatcher {
         ...task,
         mergeError: mergeProbeResult.message,
         mergeConflictFiles: mergeProbeResult.conflictFiles,
-        mergeConflictPhase: mergeProbeResult.failurePhase,
         integrationBranch: mergeProbeResult.integrationBranch,
       });
       const resetState = resetSingleStory(task, repairStoryId, {
@@ -1159,7 +1190,6 @@ export class DependencyWatcher {
         data: {
           exactProbeMessage: mergeProbeResult.message,
           conflictFiles: mergeProbeResult.conflictFiles,
-          failurePhase: mergeProbeResult.failurePhase,
           consecutiveNoProgress: nextConsecutiveNoProgress,
           totalRequeues: nextMergeRepairRequeues,
           deadlineAt,
@@ -1378,6 +1408,10 @@ export class DependencyWatcher {
       .sort((a: Task, b: Task) => a.startTime - b.startTime);
 
     for (const task of stagnantTasks) {
+      if (hasMergeConflict(task) && isQuarantineOwnershipReleased(task)) {
+        continue;
+      }
+
       const now = Date.now();
       const currentAutoRequeues = task.autoRecoveryTotalRequeues ?? 0;
       const stopReason = 'stagnation_auto_recovery_hard_cap_reached';
@@ -1478,6 +1512,7 @@ export class DependencyWatcher {
         mergeRepairRecoveryDeadlineAt: undefined,
         mergeRepairRecoveryTotalRequeues: undefined,
         mergeRepairRecoveryConsecutiveNoProgress: undefined,
+        mergeRepairRecoveryLastObservationSignature: undefined,
         mergeRepairRecoveryLastConflictSignature: undefined,
         mergeRepairRecoveryLastProbeMessage: undefined,
         mergeRepairRecoveryLastProgressReason: undefined,
@@ -1510,6 +1545,10 @@ export class DependencyWatcher {
     for (const task of failedFinalizeTasks) {
       let activeTask = task;
       const mergeConflict = hasMergeConflict(activeTask);
+
+      if (mergeConflict && isQuarantineOwnershipReleased(activeTask)) {
+        continue;
+      }
 
       if (
         !activeTask.finalizeRepairStartedAt
@@ -1704,7 +1743,6 @@ export class DependencyWatcher {
           lastError: undefined,
           mergeError: undefined,
           mergeConflictFiles: undefined,
-          mergeConflictPhase: undefined,
           mergeConflictAt: undefined,
           finalizerFailure: undefined,
           repairContext: undefined,
@@ -1881,7 +1919,11 @@ export class DependencyWatcher {
     const integrationPolicy = resolveIntegrationPolicy(this.configManager);
     const targetBranch = resolveMergeTargetBranch(this.configManager.get('merge.targetBranch'));
     const completedConflictTasks = (await this.stateManager.listTasks('completed'))
-      .filter((task) => resolveTaskIntegrationStatus(task) === 'blocked_conflict' && hasMergeConflict(task))
+      .filter((task) => (
+        resolveTaskIntegrationStatus(task) === 'blocked_conflict'
+        && hasMergeConflict(task)
+        && !isQuarantineOwnershipReleased(task)
+      ))
       .slice()
       .sort((a: Task, b: Task) => a.startTime - b.startTime);
 
@@ -1936,7 +1978,6 @@ export class DependencyWatcher {
             integrationStatus: 'integrated',
             mergeError: undefined,
             mergeConflictFiles: undefined,
-            mergeConflictPhase: undefined,
             mergeConflictAt: undefined,
             postFinalizeMergeProbeRequired: undefined,
             integrationBranch: mergeProbeResult.integrationBranch,
@@ -2003,7 +2044,6 @@ export class DependencyWatcher {
               mergeMessage: undefined,
               mergeError: undefined,
               mergeConflictFiles: undefined,
-              mergeConflictPhase: undefined,
               mergeConflictAt: undefined,
               postFinalizeMergeProbeRequired: undefined,
               targetSyncedAt: undefined,
@@ -2051,7 +2091,6 @@ export class DependencyWatcher {
             lastErrorHadObjectiveProgress: undefined,
             mergeError: undefined,
             mergeConflictFiles: undefined,
-            mergeConflictPhase: undefined,
             mergeConflictAt: undefined,
             postFinalizeMergeProbeRequired: true,
             repairContext: undefined,
@@ -2230,7 +2269,6 @@ export class DependencyWatcher {
       mergeMessage: undefined,
       mergeError: message,
       mergeConflictFiles: undefined,
-      mergeConflictPhase: undefined,
       mergeConflictAt: undefined,
       integrationStatus: 'failed',
       targetSyncStatus: 'not_requested',
@@ -2470,7 +2508,6 @@ export class DependencyWatcher {
             finalizerCommittedAt,
             mergeError: undefined,
             mergeConflictFiles: undefined,
-            mergeConflictPhase: undefined,
             mergeConflictAt: undefined,
             postFinalizeMergeProbeRequired: undefined,
             finalizerFailure: undefined,
@@ -2818,7 +2855,6 @@ export class DependencyWatcher {
         finalizeRepairStopReason: undefined,
         mergeError: undefined,
         mergeConflictFiles: undefined,
-        mergeConflictPhase: undefined,
         mergeConflictAt: undefined,
         mergeRepairDisplayStatus: undefined,
         mergeRepairProof: undefined,

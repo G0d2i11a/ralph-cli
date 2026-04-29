@@ -2,9 +2,9 @@ import { UserStory } from '../types/prd';
 import {
   FinalizeFailureDiagnostic,
   FinalizerFailureDetails,
+  TaskMergeConflictPhase,
   TaskRepairContext,
   TaskRepairMode,
-  TaskMergeConflictPhase,
 } from '../types/task';
 
 interface RepairContextTaskView {

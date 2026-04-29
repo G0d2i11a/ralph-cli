@@ -9,14 +9,6 @@ export type AgentBackend = 'cli' | 'agent-runners';
 export type CodexConversationScope = 'attempt' | 'story' | 'task';
 
 export type AcceptedAgentBackend = AgentBackend | 'sdk-runner';
-export interface AgentRunResult {
-  success: boolean;
-  output: string;
-  sessionId?: string;
-  threadId?: string;
-  timedOut?: boolean;
-  exitCode?: number | null;
-}
 
 export const DEFAULT_AGENT: AgentType = 'codex';
 export const DEFAULT_BACKEND: AgentBackend = 'cli';
@@ -200,7 +192,7 @@ export class AgentRunner {
     logPath: string,
     backendOrState?: AgentBackend | AgentRunState,
     maybeState?: AgentRunState,
-  ): Promise<AgentRunResult> {
+  ): Promise<{ success: boolean; output: string; sessionId?: string; threadId?: string }> {
     const prompt = this.generatePrompt(us);
     const backend = typeof backendOrState === 'string'
       ? resolveAgentBackend(backendOrState)
@@ -231,7 +223,7 @@ Do not commit your changes. Instead, leave the worktree ready for a separate fin
     logPath: string,
     backend: AgentBackend,
     state?: AgentRunState
-  ): Promise<AgentRunResult> {
+  ): Promise<{ success: boolean; output: string; sessionId?: string; threadId?: string }> {
     return new Promise((resolve, reject) => {
       let command: string;
       let args: string[];
@@ -314,7 +306,6 @@ Do not commit your changes. Instead, leave the worktree ready for a separate fin
       let capturedSessionId: string | undefined;
       let capturedThreadId: string | undefined;
       let settled = false;
-      let timedOut = false;
       let timeoutHandle: NodeJS.Timeout | undefined;
       let forceKillHandle: NodeJS.Timeout | undefined;
 
@@ -335,7 +326,7 @@ Do not commit your changes. Instead, leave the worktree ready for a separate fin
         env
       });
 
-      const finish = (result: AgentRunResult) => {
+      const finish = (result: { success: boolean; output: string; sessionId?: string; threadId?: string }) => {
         if (settled) {
           return;
         }
@@ -347,7 +338,6 @@ Do not commit your changes. Instead, leave the worktree ready for a separate fin
 
       if (timeoutMs > 0) {
         timeoutHandle = setTimeout(() => {
-          timedOut = true;
           const timeoutSeconds = timeoutMs / 1000;
           const formattedTimeout = Number.isInteger(timeoutSeconds)
             ? String(timeoutSeconds)
@@ -405,12 +395,10 @@ Do not commit your changes. Instead, leave the worktree ready for a separate fin
         this.logStream?.write(`\n=== Agent execution ended at ${new Date().toISOString()} with code ${code} ===\n`);
         this.logStream?.end();
         finish({
-          success: !timedOut && code === 0,
+          success: code === 0,
           output,
           sessionId: capturedSessionId,
-          threadId: capturedThreadId,
-          timedOut,
-          exitCode: code,
+          threadId: capturedThreadId
         });
       });
 

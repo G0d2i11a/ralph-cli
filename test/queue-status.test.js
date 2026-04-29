@@ -68,6 +68,52 @@ test('queue attention labels integration sync conflicts distinctly', () => {
   assert.match(resolveNextAction(task), /integration branch sync conflict/);
 });
 
+test('queue attention labels active merge-repair quarantine distinctly', () => {
+  const task = createTask({
+    status: 'failed',
+    repairContext: {
+      mode: 'merge',
+      storyId: 'US-003',
+      createdAt: 123,
+      reason: 'Merge repair required by Ralph.',
+    },
+    lastError: 'merge repair did not converge',
+    mergeConflictFiles: ['apps/api/src/service.ts'],
+  });
+
+  const attention = deriveAttention(task);
+
+  assert.equal(attention.needed, true);
+  assert.equal(attention.reason, 'merge_repair_quarantine');
+  assert.match(resolveNextAction(task), /merge-repair quarantine/);
+});
+
+test('queue attention records explicit quarantine release reason', () => {
+  const task = createTask({
+    status: 'failed',
+    repairContext: {
+      mode: 'merge',
+      storyId: 'US-003',
+      createdAt: 123,
+      reason: 'Merge repair required by Ralph.',
+    },
+    lastError: 'merge repair did not converge',
+    mergeConflictFiles: ['apps/api/src/service.ts'],
+    quarantineExitKind: 'demote',
+    quarantineReleasedAt: 456,
+    quarantineReleaseReason: 'superseded by smaller fix',
+    quarantineTransferredTo: 'task-next',
+  });
+
+  const attention = deriveAttention(task);
+
+  assert.equal(attention.needed, true);
+  assert.equal(attention.reason, 'merge_repair_quarantine_released');
+  assert.match(resolveNextAction(task), /released by demotion/);
+  assert.match(resolveNextAction(task), /task-next/);
+  assert.match(resolveNextAction(task), /superseded by smaller fix/);
+});
+
 test('queue attention labels nonretryable story incomplete distinctly', () => {
   const task = createTask({
     status: 'failed',
@@ -95,6 +141,69 @@ test('queue does not mark active auto recovery as attention', () => {
 
   assert.equal(attention.needed, false);
   assert.match(resolveNextAction(task), /auto-recovery cooldown/);
+});
+
+test('queue suppresses stale manager heartbeat display while finalizer lease is fresh', () => {
+  const now = Date.now();
+  const task = createTask({
+    id: 'finalizing-task',
+    status: 'finalizing',
+    leaseOwner: 'finalizer:123',
+    leaseHeartbeatAt: now - 1000,
+    leaseExpiresAt: now + 60_000,
+  });
+  const manager = {
+    ralphHome: '/tmp/ralph',
+    statePath: '/tmp/ralph/manager/state.json',
+    lockDir: '/tmp/ralph/manager.lock',
+    state: null,
+    stateExists: true,
+    processRunning: true,
+    active: true,
+    heartbeatStale: true,
+    staleAfterMs: 5000,
+    codeDriftDetected: false,
+    message: 'manager process 123 is running but heartbeat is stale',
+  };
+
+  const lease = findFreshFinalizerLease([task], now);
+  const adjusted = adjustManagerStatusForFinalizerLease(manager, lease);
+
+  assert.equal(adjusted.heartbeatStale, false);
+  assert.equal(adjusted.heartbeatStaleSuppressed, true);
+  assert.equal(adjusted.heartbeatStaleSuppressedReason, 'active_finalizer_lease');
+  assert.equal(adjusted.finalizerLease.taskId, 'finalizing-task');
+});
+
+test('queue keeps stale manager heartbeat when finalizer lease is expired', () => {
+  const now = Date.now();
+  const task = createTask({
+    id: 'finalizing-task',
+    status: 'finalizing',
+    leaseOwner: 'finalizer:123',
+    leaseHeartbeatAt: now - 60_000,
+    leaseExpiresAt: now - 1,
+  });
+  const manager = {
+    ralphHome: '/tmp/ralph',
+    statePath: '/tmp/ralph/manager/state.json',
+    lockDir: '/tmp/ralph/manager.lock',
+    state: null,
+    stateExists: true,
+    processRunning: true,
+    active: true,
+    heartbeatStale: true,
+    staleAfterMs: 5000,
+    codeDriftDetected: false,
+    message: 'manager process 123 is running but heartbeat is stale',
+  };
+
+  const lease = findFreshFinalizerLease([task], now);
+  const adjusted = adjustManagerStatusForFinalizerLease(manager, lease);
+
+  assert.equal(lease, undefined);
+  assert.equal(adjusted.heartbeatStale, true);
+  assert.equal(adjusted.heartbeatStaleSuppressed, undefined);
 });
 
 test('queue summary explains coordination owner and overlapping conflict surface', () => {
@@ -168,67 +277,4 @@ test('queue coordination next action stays bounded for human output', () => {
   assert.match(nextAction, /owner-b/);
   assert.match(nextAction, /\+1 more/);
   assert.doesNotMatch(nextAction, /owner-c/);
-});
-
-test('queue suppresses stale manager heartbeat display while finalizer lease is fresh', () => {
-  const now = Date.now();
-  const task = createTask({
-    id: 'finalizing-task',
-    status: 'finalizing',
-    leaseOwner: 'finalizer:123',
-    leaseHeartbeatAt: now - 1000,
-    leaseExpiresAt: now + 60_000,
-  });
-  const manager = {
-    ralphHome: '/tmp/ralph',
-    statePath: '/tmp/ralph/manager/state.json',
-    lockDir: '/tmp/ralph/manager.lock',
-    state: null,
-    stateExists: true,
-    processRunning: true,
-    active: true,
-    heartbeatStale: true,
-    staleAfterMs: 5000,
-    codeDriftDetected: false,
-    message: 'manager process 123 is running but heartbeat is stale',
-  };
-
-  const lease = findFreshFinalizerLease([task], now);
-  const adjusted = adjustManagerStatusForFinalizerLease(manager, lease);
-
-  assert.equal(adjusted.heartbeatStale, false);
-  assert.equal(adjusted.heartbeatStaleSuppressed, true);
-  assert.equal(adjusted.heartbeatStaleSuppressedReason, 'active_finalizer_lease');
-  assert.equal(adjusted.finalizerLease.taskId, 'finalizing-task');
-});
-
-test('queue keeps stale manager heartbeat when finalizer lease is expired', () => {
-  const now = Date.now();
-  const task = createTask({
-    id: 'finalizing-task',
-    status: 'finalizing',
-    leaseOwner: 'finalizer:123',
-    leaseHeartbeatAt: now - 60_000,
-    leaseExpiresAt: now - 1,
-  });
-  const manager = {
-    ralphHome: '/tmp/ralph',
-    statePath: '/tmp/ralph/manager/state.json',
-    lockDir: '/tmp/ralph/manager.lock',
-    state: null,
-    stateExists: true,
-    processRunning: true,
-    active: true,
-    heartbeatStale: true,
-    staleAfterMs: 5000,
-    codeDriftDetected: false,
-    message: 'manager process 123 is running but heartbeat is stale',
-  };
-
-  const lease = findFreshFinalizerLease([task], now);
-  const adjusted = adjustManagerStatusForFinalizerLease(manager, lease);
-
-  assert.equal(lease, undefined);
-  assert.equal(adjusted.heartbeatStale, true);
-  assert.equal(adjusted.heartbeatStaleSuppressed, undefined);
 });

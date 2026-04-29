@@ -777,7 +777,6 @@ function mergeConflictResult(
   repoPath: string,
   conflicts: string[],
   details: Partial<Pick<MergeResult, 'sourceBranch' | 'targetBranch' | 'baseCommitSha'>> = {},
-  failurePhase: MergeFailurePhase = 'source_merge',
 ): MergeResult {
   tryAbortMerge(repoPath);
   return {
@@ -785,7 +784,6 @@ function mergeConflictResult(
     hasConflicts: true,
     message: `Merge conflicts detected: ${conflicts.join(', ')}`,
     conflictFiles: conflicts,
-    failurePhase,
     ...details,
   };
 }
@@ -959,7 +957,8 @@ async function mergeBranchInIntegrationWorktree(
             sourceBranch: normalizedTarget,
             targetBranch: integration.integrationBranch,
             baseCommitSha: task.baseCommitSha,
-          }, 'integration_sync'),
+          }),
+          failurePhase: 'integration_sync',
           integrationBranch: integration.integrationBranch,
           integrationWorktree: integration.integrationWorktree,
         };
@@ -1047,7 +1046,8 @@ async function mergeBranchInIntegrationWorktree(
             sourceBranch: sourceLabel,
             targetBranch: integration.integrationBranch,
             baseCommitSha: task.baseCommitSha,
-          }, 'source_merge'),
+          }),
+          failurePhase: 'source_merge',
           integrationBranch: integration.integrationBranch,
           integrationWorktree: integration.integrationWorktree,
         };
@@ -1142,12 +1142,12 @@ async function probeBranchMergeabilityInIntegrationWorktree(
         return {
           mergeable: false,
           alreadyIntegrated: false,
-        message: `Integration branch sync failed with conflicts: ${conflicts.join(', ')}`,
-        conflictFiles: conflicts,
-        failurePhase: 'integration_sync',
-        integrationBranch: integration.integrationBranch,
-        integrationWorktree: integration.integrationWorktree,
-        sourceKind,
+          message: `Integration branch sync failed with conflicts: ${conflicts.join(', ')}`,
+          conflictFiles: conflicts,
+          failurePhase: 'integration_sync',
+          integrationBranch: integration.integrationBranch,
+          integrationWorktree: integration.integrationWorktree,
+          sourceKind,
           worktreeMergeState,
         };
       }

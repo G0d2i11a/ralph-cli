@@ -18,6 +18,11 @@ try {
     XDG_CACHE_HOME: path.join(testHome, '.cache'),
   };
   delete env.RALPH_HOME;
+  delete env.GIT_DIR;
+  delete env.GIT_WORK_TREE;
+  delete env.GIT_INDEX_FILE;
+  delete env.GIT_OBJECT_DIRECTORY;
+  delete env.GIT_ALTERNATE_OBJECT_DIRECTORIES;
 
   const result = spawnSync(process.execPath, ['--test', ...testFiles], {
     cwd: path.resolve(__dirname, '..'),

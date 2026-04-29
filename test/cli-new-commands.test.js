@@ -3,7 +3,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
-const { spawnSync, execFileSync } = require('node:child_process');
+const { spawn, spawnSync, execFileSync } = require('node:child_process');
 
 function runCli(args, env = {}) {
   return spawnSync('node', ['dist/cli.js', ...args], {
@@ -14,6 +14,14 @@ function runCli(args, env = {}) {
       ...env,
     },
   });
+}
+
+function git(cwd, args) {
+  return execFileSync('git', args, {
+    cwd,
+    encoding: 'utf-8',
+    stdio: ['ignore', 'pipe', 'pipe'],
+  }).trim();
 }
 
 test('queue command reports active queue state', () => {
@@ -261,12 +269,148 @@ test('queue command marks pending tasks blocked by failed coordination owners as
     assert.equal(output.summary.totalAttention, 2);
     assert.equal(laterTask.reason, 'coordination');
     assert.deepEqual(laterTask.blockers, ['failed-owner']);
-    assert.deepEqual(laterTask.failedBlockers, ['failed-owner']);
+    assert.deepEqual(laterTask.quarantinedBlockers, ['failed-owner']);
+    assert.deepEqual(laterTask.failedBlockers, []);
     assert.equal(laterTask.attention.needed, true);
-    assert.equal(laterTask.attention.reason, 'blocked_failed_coordination');
-    assert.match(laterTask.nextAction, /blocked by failed overlapping task/);
+    assert.equal(laterTask.attention.reason, 'blocked_merge_repair_quarantine');
+    assert.match(laterTask.nextAction, /merge-repair quarantine/);
     assert.deepEqual(laterAttention.blockers, ['failed-owner']);
   } finally {
+    fs.rmSync(homeDir, { recursive: true, force: true });
+  }
+});
+
+test('demote command releases merge-repair quarantine with an auditable queue reason', () => {
+  const homeDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-demote-home-'));
+
+  try {
+    const taskDir = path.join(homeDir, '.ralph', 'tasks', 'failed-owner');
+    fs.mkdirSync(taskDir, { recursive: true });
+    fs.writeFileSync(path.join(taskDir, 'state.json'), JSON.stringify({
+      id: 'failed-owner',
+      prdPath: '/tmp/owner.json',
+      prdId: 'owner-prd',
+      prdDependencies: [],
+      status: 'failed',
+      startTime: 100,
+      enqueuedAt: 100,
+      completedUS: ['US-001'],
+      worktree: '/tmp/owner',
+      logPath: path.join(taskDir, 'agent.log'),
+      agent: 'codex',
+      repoPath: '/tmp/repo',
+      declaredWriteSurface: ['packages/contracts/src/index.ts'],
+      observedWriteSurface: ['packages/contracts/src/index.ts'],
+      mergeConflictFiles: ['packages/contracts/src/index.ts'],
+      repairContext: {
+        mode: 'merge',
+        storyId: 'US-003',
+        createdAt: 123,
+        reason: 'Merge repair required by Ralph.',
+      },
+      lastError: 'merge repair did not converge',
+      loopCount: 0,
+      consecutiveNoProgress: 0,
+      consecutiveErrors: 0,
+      lastProgressTime: 100,
+      lastFilesChanged: 0,
+    }, null, 2));
+
+    const result = runCli([
+      'demote',
+      'failed-owner',
+      '--reason',
+      'superseded by smaller fix',
+      '--to',
+      'later-task',
+    ], { HOME: homeDir });
+    const output = JSON.parse(result.stdout);
+    const queueResult = runCli(['queue'], { HOME: homeDir });
+    const queueOutput = JSON.parse(queueResult.stdout);
+    const task = queueOutput.tasks.find((entry) => entry.id === 'failed-owner');
+    const state = JSON.parse(fs.readFileSync(path.join(taskDir, 'state.json'), 'utf-8'));
+
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(output.quarantineReleased, true);
+    assert.equal(state.quarantineExitKind, 'demote');
+    assert.equal(state.quarantineReleaseReason, 'superseded by smaller fix');
+    assert.equal(state.quarantineTransferredTo, 'later-task');
+    assert.equal(queueResult.status, 0, queueResult.stderr);
+    assert.equal(task.attention.reason, 'merge_repair_quarantine_released');
+    assert.equal(task.quarantine.reason, 'superseded by smaller fix');
+    assert.match(task.nextAction, /released by demotion/);
+    assert.match(task.nextAction, /later-task/);
+  } finally {
+    fs.rmSync(homeDir, { recursive: true, force: true });
+  }
+});
+
+test('stop command releases running merge-repair quarantine with a queue reason', () => {
+  const homeDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-stop-quarantine-home-'));
+  const child = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], {
+    stdio: 'ignore',
+  });
+
+  try {
+    const taskDir = path.join(homeDir, '.ralph', 'tasks', 'running-owner');
+    fs.mkdirSync(taskDir, { recursive: true });
+    fs.writeFileSync(path.join(taskDir, 'state.json'), JSON.stringify({
+      id: 'running-owner',
+      prdPath: '/tmp/owner.json',
+      prdId: 'owner-prd',
+      prdDependencies: [],
+      status: 'running',
+      startTime: 100,
+      enqueuedAt: 100,
+      completedUS: ['US-001'],
+      worktree: '/tmp/owner',
+      logPath: path.join(taskDir, 'agent.log'),
+      pid: child.pid,
+      agent: 'codex',
+      repoPath: '/tmp/repo',
+      declaredWriteSurface: ['packages/contracts/src/index.ts'],
+      observedWriteSurface: ['packages/contracts/src/index.ts'],
+      mergeConflictFiles: ['packages/contracts/src/index.ts'],
+      repairContext: {
+        mode: 'merge',
+        storyId: 'US-003',
+        createdAt: 123,
+        reason: 'Merge repair required by Ralph.',
+      },
+      currentUS: 'US-003',
+      loopCount: 0,
+      consecutiveNoProgress: 0,
+      consecutiveErrors: 0,
+      lastProgressTime: 100,
+      lastFilesChanged: 0,
+    }, null, 2));
+
+    const result = runCli([
+      'stop',
+      'running-owner',
+      '--reason',
+      'operator stopped stale repair',
+    ], { HOME: homeDir });
+    const output = JSON.parse(result.stdout);
+    const state = JSON.parse(fs.readFileSync(path.join(taskDir, 'state.json'), 'utf-8'));
+    const queueResult = runCli(['queue'], { HOME: homeDir });
+    const queueOutput = JSON.parse(queueResult.stdout);
+    const task = queueOutput.tasks.find((entry) => entry.id === 'running-owner');
+
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(output.quarantineReleased, true);
+    assert.equal(state.status, 'stopped');
+    assert.equal(state.pid, undefined);
+    assert.equal(state.quarantineExitKind, 'stop');
+    assert.equal(state.quarantineReleaseReason, 'operator stopped stale repair');
+    assert.equal(queueResult.status, 0, queueResult.stderr);
+    assert.equal(task.attention.reason, 'merge_repair_quarantine_released');
+    assert.match(task.nextAction, /released by stop/);
+    assert.match(task.nextAction, /operator stopped stale repair/);
+  } finally {
+    try {
+      process.kill(child.pid, 'SIGKILL');
+    } catch {}
     fs.rmSync(homeDir, { recursive: true, force: true });
   }
 });
@@ -1224,6 +1368,160 @@ test('doctor command respects configured codex CLI path', () => {
     assert.equal(result.status, 0, result.stderr);
     assert.equal(codexCheck.ok, true);
     assert.match(codexCheck.message, /fake-codex is available/);
+  } finally {
+    fs.rmSync(homeDir, { recursive: true, force: true });
+    fs.rmSync(repoDir, { recursive: true, force: true });
+  }
+});
+
+test('prove-integration clears completed blocked_conflict via exact mergeability without resetting unrelated stories', () => {
+  const homeDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-proof-home-'));
+  const repoDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-proof-repo-'));
+  const taskId = 'completed-proof-task';
+  const worktreePath = path.join(repoDir, '.ralph-worktrees', taskId);
+  const taskDir = path.join(homeDir, '.ralph', 'tasks', taskId);
+
+  try {
+    git(repoDir, ['init', '-b', 'main']);
+    git(repoDir, ['config', 'user.name', 'Ralph Test']);
+    git(repoDir, ['config', 'user.email', 'ralph@example.com']);
+    fs.writeFileSync(path.join(repoDir, 'feature.txt'), 'base\n');
+    git(repoDir, ['add', '.']);
+    git(repoDir, ['commit', '-m', 'base']);
+    fs.mkdirSync(path.dirname(worktreePath), { recursive: true });
+    git(repoDir, ['worktree', 'add', '-b', `ralph/${taskId}`, worktreePath, 'main']);
+    fs.appendFileSync(path.join(worktreePath, 'feature.txt'), 'task change\n');
+    git(worktreePath, ['add', 'feature.txt']);
+    git(worktreePath, ['commit', '-m', 'feat: task change']);
+    fs.writeFileSync(path.join(repoDir, 'other.txt'), 'main change\n');
+    git(repoDir, ['add', 'other.txt']);
+    git(repoDir, ['commit', '-m', 'feat: main change']);
+
+    fs.mkdirSync(taskDir, { recursive: true });
+    fs.writeFileSync(path.join(taskDir, 'state.json'), JSON.stringify({
+      id: taskId,
+      prdPath: path.join(repoDir, 'prd.json'),
+      prdId: 'proof-prd',
+      status: 'completed',
+      startTime: 100,
+      completedUS: ['US-001'],
+      storyProgress: [
+        { id: 'US-001', status: 'passed', attempts: 1, updatedAt: 1 },
+        { id: 'US-002', status: 'needs_repair', attempts: 2, lastError: 'merge conflict', updatedAt: 1 },
+      ],
+      worktree: worktreePath,
+      logPath: path.join(taskDir, 'agent.log'),
+      agent: 'codex',
+      repoPath: repoDir,
+      loopCount: 0,
+      consecutiveNoProgress: 0,
+      consecutiveErrors: 0,
+      lastProgressTime: 100,
+      lastFilesChanged: 1,
+      integrationStatus: 'blocked_conflict',
+      integrationBranch: 'ralph/integration/main',
+      integrationWorktree: path.join(repoDir, '.ralph-integration', 'main'),
+      mergeError: 'Merge conflicts detected: feature.txt',
+      mergeConflictFiles: ['feature.txt'],
+      repairContext: {
+        mode: 'merge',
+        storyId: 'US-002',
+        createdAt: 123,
+        reason: 'Merge repair required by Ralph.',
+      },
+      quarantineExitKind: 'demote',
+      quarantineReleasedAt: 456,
+      quarantineReleaseReason: 'old release marker',
+    }, null, 2));
+
+    const result = runCli(['prove-integration', taskId, '--target', 'main'], { HOME: homeDir });
+    const output = JSON.parse(result.stdout);
+    const state = JSON.parse(fs.readFileSync(path.join(taskDir, 'state.json'), 'utf-8'));
+
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(output.outcome, 'exact_mergeability');
+    assert.equal(state.status, 'completed');
+    assert.equal(state.integrationStatus, 'not_started');
+    assert.deepEqual(state.completedUS, ['US-001', 'US-002']);
+    assert.equal(state.storyProgress[0].status, 'passed');
+    assert.equal(state.storyProgress[0].attempts, 1);
+    assert.equal(state.storyProgress[1].status, 'passed');
+    assert.equal(state.storyProgress[1].attempts, 2);
+    assert.equal(state.mergeError, undefined);
+    assert.equal(state.mergeConflictFiles, undefined);
+    assert.equal(state.repairContext, undefined);
+    assert.equal(state.quarantineExitKind, undefined);
+    assert.equal(state.quarantineReleasedAt, undefined);
+  } finally {
+    fs.rmSync(homeDir, { recursive: true, force: true });
+    fs.rmSync(repoDir, { recursive: true, force: true });
+  }
+});
+
+test('prove-integration marks already-integrated quarantine owners integrated', () => {
+  const homeDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-proof-integrated-home-'));
+  const repoDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-proof-integrated-repo-'));
+  const taskId = 'already-integrated-proof-task';
+  const worktreePath = path.join(repoDir, '.ralph-worktrees', taskId);
+  const taskDir = path.join(homeDir, '.ralph', 'tasks', taskId);
+
+  try {
+    git(repoDir, ['init', '-b', 'main']);
+    git(repoDir, ['config', 'user.name', 'Ralph Test']);
+    git(repoDir, ['config', 'user.email', 'ralph@example.com']);
+    fs.writeFileSync(path.join(repoDir, 'feature.txt'), 'base\n');
+    git(repoDir, ['add', '.']);
+    git(repoDir, ['commit', '-m', 'base']);
+    fs.mkdirSync(path.dirname(worktreePath), { recursive: true });
+    git(repoDir, ['worktree', 'add', '-b', `ralph/${taskId}`, worktreePath, 'main']);
+    fs.appendFileSync(path.join(worktreePath, 'feature.txt'), 'task change\n');
+    git(worktreePath, ['add', 'feature.txt']);
+    git(worktreePath, ['commit', '-m', 'feat: task change']);
+    git(repoDir, ['branch', 'ralph/integration/main', `ralph/${taskId}`]);
+
+    fs.mkdirSync(taskDir, { recursive: true });
+    fs.writeFileSync(path.join(taskDir, 'state.json'), JSON.stringify({
+      id: taskId,
+      prdPath: path.join(repoDir, 'prd.json'),
+      prdId: 'integrated-proof-prd',
+      status: 'failed',
+      startTime: 100,
+      completedUS: ['US-001'],
+      storyProgress: [
+        { id: 'US-001', status: 'passed', attempts: 1, updatedAt: 1 },
+      ],
+      worktree: worktreePath,
+      logPath: path.join(taskDir, 'agent.log'),
+      agent: 'codex',
+      repoPath: repoDir,
+      loopCount: 0,
+      consecutiveNoProgress: 0,
+      consecutiveErrors: 0,
+      lastProgressTime: 100,
+      lastFilesChanged: 1,
+      integrationStatus: 'blocked_conflict',
+      mergeError: 'Merge conflicts detected: feature.txt',
+      mergeConflictFiles: ['feature.txt'],
+      repairContext: {
+        mode: 'merge',
+        storyId: 'US-001',
+        createdAt: 123,
+        reason: 'Merge repair required by Ralph.',
+      },
+    }, null, 2));
+
+    const result = runCli(['prove-integration', taskId, '--target', 'main'], { HOME: homeDir });
+    const output = JSON.parse(result.stdout);
+    const state = JSON.parse(fs.readFileSync(path.join(taskDir, 'state.json'), 'utf-8'));
+
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(output.outcome, 'already_integrated');
+    assert.equal(state.status, 'completed');
+    assert.equal(state.integrationStatus, 'integrated');
+    assert.equal(typeof state.integratedAt, 'number');
+    assert.equal(state.mergeError, undefined);
+    assert.equal(state.mergeConflictFiles, undefined);
+    assert.equal(state.repairContext, undefined);
   } finally {
     fs.rmSync(homeDir, { recursive: true, force: true });
     fs.rmSync(repoDir, { recursive: true, force: true });
