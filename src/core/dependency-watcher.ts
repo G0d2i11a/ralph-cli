@@ -495,7 +495,7 @@ export class DependencyWatcher {
     this.mergeTask = deps.mergeTask ?? mergeBranch;
     this.probeMergeability = deps.probeMergeability ?? probeTaskMergeability;
     this.probeWorktreeMergeability = deps.probeWorktreeMergeability ?? probeTaskWorktreeMergeability;
-    this.scheduler = deps.scheduler ?? new TaskScheduler({ stateManager });
+    this.scheduler = deps.scheduler ?? new TaskScheduler({ stateManager, managerOwnedScheduling: true });
     this.pollInterval = Number.isFinite(options.interval) && Number(options.interval) > 0
       ? Number(options.interval)
       : resolveConfiguredPollIntervalMs(configManager.get('runner.pollInterval'));

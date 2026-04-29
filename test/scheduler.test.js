@@ -1,5 +1,6 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
+const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 
@@ -36,8 +37,13 @@ function createTask(overrides = {}) {
 }
 
 class FakeStateManager {
-  constructor(tasks = []) {
+  constructor(tasks = [], options = {}) {
     this.tasks = new Map(tasks.map((task) => [task.id, { ...task }]));
+    this.ralphHome = options.ralphHome;
+  }
+
+  getRalphHome() {
+    return this.ralphHome;
   }
 
   async saveTask(task) {
@@ -146,7 +152,7 @@ async function dependencyChecker(prd, stateManager, options = {}) {
 
 function createScheduler(tasks, prds, options = {}) {
   let nextPid = options.initialPid || 4000;
-  const stateManager = new FakeStateManager(tasks);
+  const stateManager = new FakeStateManager(tasks, { ralphHome: options.stateManagerRalphHome });
   const worktreeCalls = [];
   const forkCalls = [];
   const lockDir = path.join(
@@ -179,6 +185,7 @@ function createScheduler(tasks, prds, options = {}) {
     isProcessRunning: options.isProcessRunning || (() => true),
     getProcessInfo: options.getProcessInfo,
     terminateProcess: options.terminateProcess,
+    managerOwnedScheduling: options.managerOwnedScheduling,
     lockDir,
     now: options.now,
     sleep: options.sleep,
@@ -227,6 +234,98 @@ test('schedulePendingTasks passes RALPH_HOME to worker processes', async () => {
   await scheduler.schedulePendingTasks();
 
   assert.equal(capturedEnv.RALPH_HOME, ralphHome);
+});
+
+test('schedulePendingTasks defers worker starts to an active external manager', async () => {
+  const now = 100_000;
+  const ralphHome = path.join(
+    os.tmpdir(),
+    `ralph-scheduler-active-manager-${process.pid}-${Date.now()}`
+  );
+  const managerDir = path.join(ralphHome, 'manager');
+  fs.mkdirSync(managerDir, { recursive: true });
+  fs.writeFileSync(path.join(managerDir, 'state.json'), JSON.stringify({
+    pid: 9999,
+    status: 'running',
+    startedAt: now - 1_000,
+    updatedAt: now,
+    lastHeartbeatAt: now,
+    pollIntervalMs: 10_000,
+    autoIngestEnabled: false,
+    hostname: 'test-host',
+    argv: ['node', '/repo/dist/cli.js', 'manager'],
+  }));
+
+  const queuedTask = createTask({
+    id: 'queued-for-active-manager',
+    prdId: 'queued-for-active-manager',
+    prdPath: '/queued-for-active-manager.json',
+    startTime: 100,
+  });
+  const { scheduler, stateManager, forkCalls } = createScheduler(
+    [queuedTask],
+    {
+      '/queued-for-active-manager.json': { id: 'queued-for-active-manager', dependencies: [] },
+    },
+    {
+      ralphHome,
+      now: () => now,
+      isProcessRunning: (pid) => pid === 9999,
+    }
+  );
+
+  const startedTasks = await scheduler.schedulePendingTasks();
+  const stillQueued = await stateManager.loadTask('queued-for-active-manager');
+
+  assert.equal(startedTasks.length, 0);
+  assert.equal(stillQueued.status, 'pending');
+  assert.deepEqual(forkCalls, []);
+});
+
+test('schedulePendingTasks inherits Ralph home from the state manager', async () => {
+  const now = 100_000;
+  const ralphHome = path.join(
+    os.tmpdir(),
+    `ralph-scheduler-state-home-${process.pid}-${Date.now()}`
+  );
+  const managerDir = path.join(ralphHome, 'manager');
+  fs.mkdirSync(managerDir, { recursive: true });
+  fs.writeFileSync(path.join(managerDir, 'state.json'), JSON.stringify({
+    pid: 9998,
+    status: 'running',
+    startedAt: now - 1_000,
+    updatedAt: now,
+    lastHeartbeatAt: now,
+    pollIntervalMs: 10_000,
+    autoIngestEnabled: false,
+    hostname: 'test-host',
+    argv: ['node', '/repo/dist/cli.js', 'manager'],
+  }));
+
+  const queuedTask = createTask({
+    id: 'queued-for-state-home-manager',
+    prdId: 'queued-for-state-home-manager',
+    prdPath: '/queued-for-state-home-manager.json',
+    startTime: 100,
+  });
+  const { scheduler, stateManager, forkCalls } = createScheduler(
+    [queuedTask],
+    {
+      '/queued-for-state-home-manager.json': { id: 'queued-for-state-home-manager', dependencies: [] },
+    },
+    {
+      stateManagerRalphHome: ralphHome,
+      now: () => now,
+      isProcessRunning: (pid) => pid === 9998,
+    }
+  );
+
+  const startedTasks = await scheduler.schedulePendingTasks();
+  const stillQueued = await stateManager.loadTask('queued-for-state-home-manager');
+
+  assert.equal(startedTasks.length, 0);
+  assert.equal(stillQueued.status, 'pending');
+  assert.deepEqual(forkCalls, []);
 });
 
 test('schedulePendingTasks respects maxConcurrent and starts oldest queued task first', async () => {
@@ -857,6 +956,75 @@ test('schedulePendingTasks keeps current-manager worker leases active', async ()
   assert.equal(stillRunning.status, 'running');
   assert.equal(stillRunning.pid, 6161);
   assert.equal(queuedAfter.status, 'pending');
+  assert.deepEqual(forkCalls, []);
+});
+
+test('schedulePendingTasks keeps workers owned by the active manager process', async () => {
+  const now = 100_000;
+  const ralphHome = path.join(
+    os.tmpdir(),
+    `ralph-scheduler-manager-owned-worker-${process.pid}-${Date.now()}`
+  );
+  const managerDir = path.join(ralphHome, 'manager');
+  fs.mkdirSync(managerDir, { recursive: true });
+  fs.writeFileSync(path.join(managerDir, 'state.json'), JSON.stringify({
+    pid: 9997,
+    status: 'running',
+    startedAt: now - 1_000,
+    updatedAt: now,
+    lastHeartbeatAt: now,
+    pollIntervalMs: 10_000,
+    autoIngestEnabled: false,
+    hostname: 'test-host',
+    argv: ['node', '/repo/dist/cli.js', 'manager'],
+  }));
+  const runningTask = createTask({
+    id: 'active-manager-running-task',
+    prdId: 'active-manager-running-task',
+    prdPath: '/active-manager-running.json',
+    status: 'running',
+    startTime: 100,
+    worktree: '/worktrees/active-manager-running-task',
+    pid: 6162,
+    leaseOwner: 'worker:6162',
+  });
+  const queuedTask = createTask({
+    id: 'queued-behind-active-manager',
+    prdId: 'queued-behind-active-manager',
+    prdPath: '/queued-behind-active-manager.json',
+    startTime: 200,
+  });
+  const terminateSignals = [];
+
+  const { scheduler, stateManager, forkCalls } = createScheduler(
+    [runningTask, queuedTask],
+    {
+      '/active-manager-running.json': { id: 'active-manager-running-task', dependencies: [] },
+      '/queued-behind-active-manager.json': { id: 'queued-behind-active-manager', dependencies: [] },
+    },
+    {
+      ralphHome,
+      managerOwnedScheduling: true,
+      maxConcurrent: 1,
+      now: () => now,
+      isProcessRunning: () => true,
+      getProcessInfo: () => ({
+        ppid: 9997,
+        command: 'node /repo/dist/worker.js active-manager-running-task',
+      }),
+      terminateProcess: (_pid, signal) => terminateSignals.push(signal),
+    }
+  );
+
+  const startedTasks = await scheduler.schedulePendingTasks();
+  const stillRunning = await stateManager.loadTask('active-manager-running-task');
+  const queuedAfter = await stateManager.loadTask('queued-behind-active-manager');
+
+  assert.equal(startedTasks.length, 0);
+  assert.equal(stillRunning.status, 'running');
+  assert.equal(stillRunning.pid, 6162);
+  assert.equal(queuedAfter.status, 'pending');
+  assert.deepEqual(terminateSignals, []);
   assert.deepEqual(forkCalls, []);
 });
 

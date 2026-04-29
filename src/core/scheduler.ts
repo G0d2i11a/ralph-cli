@@ -13,10 +13,11 @@ import {
   findCoordinationBlockers,
   hasHotConflictReservation,
 } from './task-coordination';
-import { getRalphPaths, RalphHomeOptions, resolveRalphHome } from './paths';
+import { RalphHomeOptions, resolveRalphHome } from './paths';
 import { StateManager } from './state';
 import { resolveTaskIntegrationStatus } from './task-delivery';
 import { WorktreeManager } from './worktree';
+import { getManagerStatus } from './manager-state';
 
 const DEFAULT_MAX_CONCURRENT = 3;
 const LOCK_RETRY_MS = 50;
@@ -56,6 +57,7 @@ export interface SchedulerDeps extends RalphHomeOptions {
   isProcessRunning?: ProcessChecker;
   getProcessInfo?: (pid: number) => ProcessInfo | undefined;
   terminateProcess?: (pid: number, signal?: NodeJS.Signals | number) => void;
+  managerOwnedScheduling?: boolean;
   lockDir?: string;
   now?: () => number;
   sleep?: (ms: number) => Promise<void>;
@@ -137,6 +139,14 @@ function readProcessInfo(pid: number): ProcessInfo | undefined {
   }
 }
 
+function resolveSchedulerRalphHome(deps: SchedulerDeps): string {
+  if (deps.ralphHome || deps.homeDir) {
+    return resolveRalphHome(deps);
+  }
+
+  return deps.stateManager?.getRalphHome?.() ?? resolveRalphHome(deps);
+}
+
 function isFailedCoordinationBlocker(task: Task): boolean {
   if (task.status === 'failed' || task.status === 'stagnant' || task.status === 'failed_finalize') {
     return true;
@@ -170,9 +180,10 @@ export class TaskScheduler {
   private readonly lockDir: string;
   private readonly lockInfoPath: string;
   private readonly ralphHome: string;
+  private readonly managerOwnedScheduling: boolean;
 
   constructor(deps: SchedulerDeps = {}) {
-    this.ralphHome = resolveRalphHome(deps);
+    this.ralphHome = resolveSchedulerRalphHome(deps);
     this.stateManager = deps.stateManager ?? new StateManager(deps);
     this.worktreeManager = deps.worktreeManager ?? new WorktreeManager();
     this.configManager = deps.configManager ?? new ConfigManager(deps);
@@ -185,8 +196,9 @@ export class TaskScheduler {
     this.terminateProcessFn = deps.terminateProcess ?? ((pid, signal) => process.kill(pid, signal));
     this.now = deps.now ?? (() => Date.now());
     this.sleep = deps.sleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
-    this.lockDir = deps.lockDir ?? getRalphPaths(deps).schedulerLockDir;
+    this.lockDir = deps.lockDir ?? path.join(this.ralphHome, 'scheduler.lock');
     this.lockInfoPath = path.join(this.lockDir, 'owner.json');
+    this.managerOwnedScheduling = deps.managerOwnedScheduling === true;
   }
 
   getConcurrencyLimit(): number {
@@ -252,6 +264,15 @@ export class TaskScheduler {
 
     const processInfo = this.getProcessInfoFn(task.pid);
     if (typeof processInfo?.ppid !== 'number' || processInfo.ppid === process.pid) {
+      return false;
+    }
+
+    const manager = getManagerStatus({
+      ralphHome: this.ralphHome,
+      isProcessRunning: this.isProcessRunningFn,
+      now: this.now,
+    });
+    if (manager.active && processInfo.ppid === manager.state?.pid) {
       return false;
     }
 
@@ -630,6 +651,10 @@ export class TaskScheduler {
   async schedulePendingTasks(): Promise<Task[]> {
     return this.withLock(async () => {
       const startedTasks: Task[] = [];
+      if (this.shouldDeferSchedulingToActiveManager()) {
+        return startedTasks;
+      }
+
       const maxConcurrent = this.getConcurrencyLimit();
       await this.recoverStaleTasksUnlocked();
       let runningCount = await this.countRunningTasks();
@@ -699,6 +724,20 @@ export class TaskScheduler {
 
       return startedTasks;
     });
+  }
+
+  private shouldDeferSchedulingToActiveManager(): boolean {
+    if (this.managerOwnedScheduling) {
+      return false;
+    }
+
+    const manager = getManagerStatus({
+      ralphHome: this.ralphHome,
+      isProcessRunning: this.isProcessRunningFn,
+      now: this.now,
+    });
+
+    return manager.active && manager.state?.pid !== process.pid;
   }
 
   private async startTask(task: Task): Promise<Task | null> {
