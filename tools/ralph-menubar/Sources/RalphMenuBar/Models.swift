@@ -236,6 +236,7 @@ struct ProjectSnapshot: Identifiable {
 
 enum TaskSectionStyle {
   case active
+  case queued
   case attention
   case completed
 }
