@@ -16,6 +16,61 @@ function runCli(args, env = {}) {
   });
 }
 
+function writeMarkdownPrd(filePath, id) {
+  fs.writeFileSync(filePath, `---
+id: ${id}
+title: ${id} title
+dependencies:
+  - missing-upstream-prd
+writeSurface:
+  - src/utils/helpers.ts
+userStories:
+  - id: US-001
+    title: Implement ${id}
+    description: Implement the markdown PRD
+    acceptanceCriteria:
+      - The PRD is accepted by intake
+---
+
+## Notes
+
+The missing dependency keeps the CLI test from launching a worker.
+`);
+}
+
+test('start and batch-start enqueue markdown PRDs with valid frontmatter', () => {
+  const homeDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-cli-markdown-home-'));
+  const repoDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-cli-markdown-repo-'));
+  const startPrd = path.join(repoDir, 'start-prd.md');
+  const batchPrd = path.join(repoDir, 'batch-prd.md');
+  const env = {
+    HOME: homeDir,
+    RALPH_HOME: path.join(homeDir, '.ralph'),
+  };
+
+  try {
+    writeMarkdownPrd(startPrd, 'cli-start-prd');
+    writeMarkdownPrd(batchPrd, 'cli-batch-prd');
+
+    const startResult = runCli(['start', startPrd, '--repo', repoDir], env);
+    assert.equal(startResult.status, 0, startResult.stderr);
+    const startOutput = JSON.parse(startResult.stdout);
+    assert.equal(startOutput.status, 'pending');
+    assert.deepEqual(startOutput.dependencies, ['missing-upstream-prd']);
+
+    const batchResult = runCli(['batch-start', batchPrd, '--repo', repoDir], env);
+    assert.equal(batchResult.status, 0, batchResult.stderr);
+    const batchOutput = JSON.parse(batchResult.stdout);
+    assert.equal(batchOutput.successful, 1);
+    assert.equal(batchOutput.failed, 0);
+    assert.equal(batchOutput.results[0].success, true);
+    assert.equal(batchOutput.results[0].status, 'pending');
+  } finally {
+    fs.rmSync(homeDir, { recursive: true, force: true });
+    fs.rmSync(repoDir, { recursive: true, force: true });
+  }
+});
+
 function git(cwd, args) {
   return execFileSync('git', args, {
     cwd,

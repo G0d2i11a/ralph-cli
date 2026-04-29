@@ -8,7 +8,7 @@ import { assertRalphHomeIsolation } from './home-isolation';
 import { extractDeclaredCoordination } from './task-coordination';
 import { TaskScheduler, PendingTaskState } from './scheduler';
 import { StateManager } from './state';
-import { assertPrdHasExplicitTitle, generateTaskId, parsePRD, saveTaskPRD } from '../utils/helpers';
+import { assertPrdHasExplicitTitle, assertPrdIsExecutable, generateTaskId, parsePRD, saveTaskPRD } from '../utils/helpers';
 import { Task, TaskStatus } from '../types/task';
 import { appendTaskEvent } from './events';
 import { getRalphPaths, RalphHomeOptions } from './paths';
@@ -136,6 +136,7 @@ export async function enqueueTaskFromPrd(
 
   assertPrdHasExplicitTitle(resolvedPrdPath);
   const prd = parsePRD(resolvedPrdPath);
+  assertPrdIsExecutable(prd, resolvedPrdPath);
   const declaredCoordination = extractDeclaredCoordination(prd);
   const sourceHash = hashFile(resolvedPrdPath);
   const base = resolveBaseRef(repoPath);

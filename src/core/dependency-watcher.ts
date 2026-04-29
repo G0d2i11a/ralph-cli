@@ -63,6 +63,8 @@ import { Task } from '../types/task';
 import { probeTaskMergeability, probeTaskWorktreeMergeability } from './merge';
 import { isQuarantineOwnershipReleased } from './quarantine';
 
+type AutoIngestor = Pick<PrdAutoIngestor, 'initialize' | 'scan'>;
+
 export interface WatchCommandOptions {
   interval?: number;
   repo?: string;
@@ -77,7 +79,7 @@ interface DependencyWatcherDeps {
   stateManager?: StateManager;
   scheduler?: TaskScheduler;
   configManager?: Pick<ConfigManager, 'get'>;
-  autoIngestor?: Pick<PrdAutoIngestor, 'initialize' | 'scan'>;
+  autoIngestor?: AutoIngestor;
   detectAlreadyIntegratedTask?: (task: Task, targetBranch: string) => boolean;
   sleep?: (ms: number) => Promise<void>;
   logger?: Pick<typeof console, 'log' | 'error'>;
@@ -124,6 +126,87 @@ function resolveFinalizerLeaseTimeoutMs(value: unknown): number {
   }
 
   return numericValue * 1000;
+}
+
+interface ConfiguredPrdGlob {
+  glob: string;
+  repoPath?: string;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function normalizeConfiguredPrdGlobs(value: unknown): ConfiguredPrdGlob[] {
+  if (value === undefined || value === null) {
+    return [];
+  }
+
+  if (!Array.isArray(value)) {
+    throw new Error('ingestion.prds.globs must be an array of glob strings or { glob, repo } objects.');
+  }
+
+  return value.map((entry, index) => {
+    if (typeof entry === 'string') {
+      const glob = entry.trim();
+      if (!glob) {
+        throw new Error(`ingestion.prds.globs entry ${index + 1} must not be empty.`);
+      }
+
+      return { glob };
+    }
+
+    if (!isRecord(entry)) {
+      throw new Error(`ingestion.prds.globs entry ${index + 1} must be a glob string or object.`);
+    }
+
+    const glob = typeof entry.glob === 'string' ? entry.glob.trim() : '';
+    if (!glob) {
+      throw new Error(`ingestion.prds.globs entry ${index + 1} must define a non-empty glob.`);
+    }
+
+    const repoValue = entry.repoPath ?? entry.repo;
+    if (repoValue !== undefined && (typeof repoValue !== 'string' || !repoValue.trim())) {
+      throw new Error(`ingestion.prds.globs entry ${index + 1} repo must be a non-empty string when provided.`);
+    }
+
+    return {
+      glob,
+      repoPath: typeof repoValue === 'string' ? repoValue.trim() : undefined,
+    };
+  });
+}
+
+function resolveSettleMs(value: unknown): number {
+  const settleMs = Number(value);
+  return Number.isFinite(settleMs) && settleMs >= 0
+    ? settleMs
+    : DEFAULT_EZ4IELTS_SETTLE_MS;
+}
+
+function combineAutoIngestors(ingestors: AutoIngestor[]): AutoIngestor | undefined {
+  if (ingestors.length === 0) {
+    return undefined;
+  }
+
+  if (ingestors.length === 1) {
+    return ingestors[0];
+  }
+
+  return {
+    initialize: async () => {
+      for (const ingestor of ingestors) {
+        await ingestor.initialize();
+      }
+    },
+    scan: async () => {
+      const results = [];
+      for (const ingestor of ingestors) {
+        results.push(...await ingestor.scan());
+      }
+      return results;
+    },
+  };
 }
 
 function hasMergeConflict(task: Task): boolean {
@@ -486,7 +569,7 @@ export class DependencyWatcher {
   private readonly pollInterval: number;
   private readonly sleep: (ms: number) => Promise<void>;
   private readonly logger: Pick<typeof console, 'log' | 'error'>;
-  private readonly autoIngestor?: Pick<PrdAutoIngestor, 'initialize' | 'scan'>;
+  private readonly autoIngestor?: AutoIngestor;
   private readonly stateManager: StateManager;
   private readonly configManager: Pick<ConfigManager, 'get'>;
   private readonly detectAlreadyIntegratedTask: (task: Task, targetBranch: string) => boolean;
@@ -520,8 +603,14 @@ export class DependencyWatcher {
     this.logger = deps.logger ?? console;
     this.lifecycle = deps.lifecycle;
 
-    this.autoIngestEnabled = options.autoIngestEz4ielts
+    const prdGlobs = normalizeConfiguredPrdGlobs(configManager.get('ingestion.prds.globs'));
+    const prdGlobAutoIngestEnabled = options.autoIngestEz4ielts === false
+      ? false
+      : Boolean(configManager.get('ingestion.prds.enabled'));
+    const ez4ieltsAutoIngestEnabled = options.autoIngestEz4ielts
       ?? Boolean(configManager.get('ingestion.ez4ielts.enabled'));
+
+    this.autoIngestEnabled = prdGlobAutoIngestEnabled || ez4ieltsAutoIngestEnabled;
 
     if (deps.autoIngestor) {
       this.autoIngestor = deps.autoIngestor;
@@ -529,32 +618,60 @@ export class DependencyWatcher {
     }
 
     if (this.autoIngestEnabled) {
-      const settleMs = Number(configManager.get('ingestion.ez4ielts.settleMs'));
-      const configuredPattern = configManager.get('ingestion.ez4ielts.pattern');
-      const configuredWatchDir = configManager.get('ingestion.ez4ielts.watchDir');
-      const watchDir = options.ez4ieltsDir || configuredWatchDir || process.env.RALPH_EZ4IELTS_WATCH_DIR;
-
-      if (!watchDir || !String(watchDir).trim()) {
-        throw new Error('ez4ielts auto-ingest requires a watch directory. Pass `--ez4ielts-dir` or set `ingestion.ez4ielts.watchDir` / `RALPH_EZ4IELTS_WATCH_DIR`.');
-      }
-
-      const repoPath = options.repo || path.dirname(path.resolve(watchDir));
       const backend = options.backend
         ? resolveAgentBackend(options.backend)
         : resolveConfiguredBackend(configManager);
+      const agent = resolveAgentType(options.agent || DEFAULT_AGENT);
+      const autoIngestors: AutoIngestor[] = [];
 
-      this.autoIngestor = new PrdAutoIngestor({
-        repoPath,
-        agent: resolveAgentType(options.agent || DEFAULT_AGENT),
-        backend,
-        watchDir,
-        pattern: typeof configuredPattern === 'string' ? configuredPattern : DEFAULT_EZ4IELTS_PATTERN,
-        settleMs: Number.isFinite(settleMs) && settleMs >= 0 ? settleMs : DEFAULT_EZ4IELTS_SETTLE_MS,
-        logger: (message) => this.logger.log(message),
-      }, {
-        stateManager,
-        scheduler: this.scheduler,
-      });
+      if (prdGlobAutoIngestEnabled) {
+        if (prdGlobs.length === 0) {
+          throw new Error('PRD auto-ingest requires at least one configured glob in `ingestion.prds.globs`.');
+        }
+
+        const settleMs = resolveSettleMs(configManager.get('ingestion.prds.settleMs'));
+        for (const entry of prdGlobs) {
+          autoIngestors.push(new PrdAutoIngestor({
+            repoPath: entry.repoPath || options.repo || process.cwd(),
+            agent,
+            backend,
+            glob: entry.glob,
+            settleMs,
+            logger: (message) => this.logger.log(message),
+          }, {
+            stateManager,
+            scheduler: this.scheduler,
+          }));
+        }
+      }
+
+      if (ez4ieltsAutoIngestEnabled) {
+        const settleMs = Number(configManager.get('ingestion.ez4ielts.settleMs'));
+        const configuredPattern = configManager.get('ingestion.ez4ielts.pattern');
+        const configuredWatchDir = configManager.get('ingestion.ez4ielts.watchDir');
+        const watchDir = options.ez4ieltsDir || configuredWatchDir || process.env.RALPH_EZ4IELTS_WATCH_DIR;
+
+        if (!watchDir || !String(watchDir).trim()) {
+          throw new Error('ez4ielts auto-ingest requires a watch directory. Pass `--ez4ielts-dir` or set `ingestion.ez4ielts.watchDir` / `RALPH_EZ4IELTS_WATCH_DIR`.');
+        }
+
+        const repoPath = options.repo || path.dirname(path.resolve(watchDir));
+
+        autoIngestors.push(new PrdAutoIngestor({
+          repoPath,
+          agent,
+          backend,
+          watchDir,
+          pattern: typeof configuredPattern === 'string' ? configuredPattern : DEFAULT_EZ4IELTS_PATTERN,
+          settleMs: resolveSettleMs(settleMs),
+          logger: (message) => this.logger.log(message),
+        }, {
+          stateManager,
+          scheduler: this.scheduler,
+        }));
+      }
+
+      this.autoIngestor = combineAutoIngestors(autoIngestors);
     }
   }
 

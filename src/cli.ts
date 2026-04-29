@@ -195,7 +195,7 @@ Examples:
 
 program
   .command('watch')
-  .description('Poll pending tasks and optionally auto-ingest new ez4ielts PRDs into the queue')
+  .description('Poll pending tasks and optionally auto-ingest new PRDs into the queue')
   .option('--interval <ms>', 'Polling interval in milliseconds')
   .option('--repo <path>', 'Repository path for auto-ingested tasks (defaults to the watched docs directory parent)')
   .option('--agent <name>', 'Agent to use (claude|codex)', DEFAULT_AGENT)
@@ -219,6 +219,9 @@ Description:
   With --auto-ingest-ez4ielts enabled, Ralph also watches for brand new
   ez4ielts-*.json PRDs, skips the existing backlog on startup, and queues each
   new PRD only once.
+
+  Configured ingestion.prds.globs entries can watch project PRD paths such as
+  tasks/prd-*.md without requiring ez4ielts file names.
   
   Ralph now auto-starts queued tasks when running tasks finish, fail, stop,
   or transition into ready_to_finalize and complete via the restricted finalizer.

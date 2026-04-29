@@ -86,6 +86,9 @@ test('ConfigManager defaults agent.backend to cli', withTempHome(async () => {
   assert.equal(manager.get('runner.maxFailedBlockerStoryRequeues'), 1);
   assert.equal(manager.get('runner.failedBlockerRecoveryDeadlineSeconds'), 7200);
   assert.equal(manager.get('runner.failedBlockerRecoveryHardCap'), 2);
+  assert.equal(manager.get('ingestion.prds.enabled'), false);
+  assert.deepEqual(manager.get('ingestion.prds.globs'), []);
+  assert.equal(manager.get('ingestion.prds.settleMs'), 2000);
 }));
 
 test('ConfigManager uses RALPH_HOME without appending an extra .ralph segment', withTempHome(async (homeDir) => {
