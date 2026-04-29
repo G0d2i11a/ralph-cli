@@ -58,12 +58,19 @@ async function cleanupPath(targetPath) {
 
 function captureRunnerEnv() {
   return {
+    ralphHome: process.env.RALPH_HOME,
     agentRunnersCli: process.env.RALPH_AGENT_RUNNERS_CLI,
     sdkRunnerCli: process.env.RALPH_SDK_RUNNER_CLI,
   };
 }
 
 function restoreRunnerEnv(previous) {
+  if (previous.ralphHome === undefined) {
+    delete process.env.RALPH_HOME;
+  } else {
+    process.env.RALPH_HOME = previous.ralphHome;
+  }
+
   if (previous.agentRunnersCli === undefined) {
     delete process.env.RALPH_AGENT_RUNNERS_CLI;
   } else {
@@ -89,6 +96,7 @@ test('AgentRunner defaults Codex to the direct CLI backend', async () => {
 
   try {
     process.env.HOME = tempRoot;
+    process.env.RALPH_HOME = path.join(tempRoot, '.ralph');
     delete process.env.RALPH_AGENT_RUNNERS_CLI;
     delete process.env.RALPH_SDK_RUNNER_CLI;
     childProcess.spawn = (command, args, options) => {
@@ -145,6 +153,7 @@ test('AgentRunner prefers .git-local metadata when the worktree provides it', as
   try {
     fs.mkdirSync(path.join(worktreePath, '.git-local'), { recursive: true });
     process.env.HOME = tempRoot;
+    process.env.RALPH_HOME = path.join(tempRoot, '.ralph');
     delete process.env.RALPH_AGENT_RUNNERS_CLI;
     delete process.env.RALPH_SDK_RUNNER_CLI;
     childProcess.spawn = (command, args, options) => {
@@ -194,6 +203,7 @@ test('AgentRunner persists and resumes Codex thread ids via agent-runners CLI', 
 
   try {
     process.env.HOME = tempRoot;
+    process.env.RALPH_HOME = path.join(tempRoot, '.ralph');
     process.env.RALPH_AGENT_RUNNERS_CLI = createAgentRunnersFixture(tempRoot);
     delete process.env.RALPH_SDK_RUNNER_CLI;
     fs.mkdirSync(path.join(tempRoot, '.ralph'), { recursive: true });
@@ -274,6 +284,7 @@ test('AgentRunner does not resume Codex thread across stories by default', async
 
   try {
     process.env.HOME = tempRoot;
+    process.env.RALPH_HOME = path.join(tempRoot, '.ralph');
     process.env.RALPH_AGENT_RUNNERS_CLI = createAgentRunnersFixture(tempRoot);
     delete process.env.RALPH_SDK_RUNNER_CLI;
     childProcess.spawn = (command, args, options) => {
@@ -328,6 +339,7 @@ test('AgentRunner preserves Claude agent-runners model and resume args', async (
 
   try {
     process.env.HOME = tempRoot;
+    process.env.RALPH_HOME = path.join(tempRoot, '.ralph');
     process.env.RALPH_AGENT_RUNNERS_CLI = createAgentRunnersFixture(tempRoot);
     delete process.env.RALPH_SDK_RUNNER_CLI;
     fs.mkdirSync(path.join(tempRoot, '.ralph'), { recursive: true });
@@ -397,6 +409,7 @@ test('AgentRunner enforces configured timeout', async () => {
 
   try {
     process.env.HOME = tempRoot;
+    process.env.RALPH_HOME = path.join(tempRoot, '.ralph');
     process.env.RALPH_AGENT_RUNNERS_CLI = createAgentRunnersFixture(tempRoot);
     delete process.env.RALPH_SDK_RUNNER_CLI;
     fs.mkdirSync(path.join(tempRoot, '.ralph'), { recursive: true });

@@ -453,6 +453,12 @@ test('queue command compact mode trims heavy task payload fields', () => {
       coordinationStatus: 'blocked_observed_overlap',
       coordinationPhase: 'finalize',
       coordinationBlockers: ['task-a'],
+      coordinationConflicts: [{
+        taskId: 'task-a',
+        overlapKinds: ['write_surface'],
+        overlappingDomains: [],
+        overlappingPaths: ['packages/app/src/index.ts'],
+      }],
       coordinationReason: 'shared writes',
       integrationLane: 'main',
       declaredWriteSurface: ['packages/app/src'],
@@ -488,8 +494,17 @@ test('queue command compact mode trims heavy task payload fields', () => {
     });
     assert.equal(task.integrationStatus, 'not_started');
     assert.equal(task.coordination.status, 'blocked_observed_overlap');
+    assert.equal(task.coordination.owner, 'task-a');
+    assert.equal(task.coordination.phase, 'finalize');
+    assert.equal(task.coordination.lane, 'main');
     assert.equal(task.coordination.reason, 'shared writes');
     assert.deepEqual(task.coordination.blockers, ['task-a']);
+    assert.deepEqual(task.coordination.conflicts, [{
+      taskId: 'task-a',
+      overlapKinds: ['write_surface'],
+      overlappingDomains: [],
+      overlappingPaths: ['packages/app/src/index.ts'],
+    }]);
     assert.equal(task.coordination.observedWriteSurface, undefined);
     assert.equal(task.coordination.declaredConflictDomains, undefined);
     assert.equal(task.storyProgress[0].history, undefined);

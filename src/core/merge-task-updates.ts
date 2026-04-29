@@ -117,6 +117,7 @@ export function buildSuccessfulMergeTaskUpdates(
     coordinationStatus: undefined,
     coordinationPhase: undefined,
     coordinationBlockers: undefined,
+    coordinationConflicts: undefined,
     coordinationReason: undefined,
     mergeRepairDisplayStatus: undefined,
     mergeRepairProof: undefined,
@@ -150,6 +151,7 @@ export function buildFailedMergeTaskUpdates(
     coordinationStatus: undefined,
     coordinationPhase: undefined,
     coordinationBlockers: undefined,
+    coordinationConflicts: undefined,
     coordinationReason: undefined,
     mergeRepairDisplayStatus: result.hasConflicts ? 'unresolved' as const : undefined,
   };

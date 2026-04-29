@@ -1932,6 +1932,7 @@ export class DependencyWatcher {
             coordinationStatus: undefined,
             coordinationPhase: undefined,
             coordinationBlockers: undefined,
+            coordinationConflicts: undefined,
             coordinationReason: undefined,
             mergeRepairDisplayStatus: undefined,
             mergeRepairProof: undefined,
@@ -1998,6 +1999,7 @@ export class DependencyWatcher {
               coordinationStatus: undefined,
               coordinationPhase: undefined,
               coordinationBlockers: undefined,
+              coordinationConflicts: undefined,
               coordinationReason: undefined,
               mergeRepairDisplayStatus: undefined,
               mergeRepairProof: undefined,
@@ -2221,6 +2223,7 @@ export class DependencyWatcher {
       coordinationStatus: undefined,
       coordinationPhase: undefined,
       coordinationBlockers: undefined,
+      coordinationConflicts: undefined,
       coordinationReason: undefined,
     };
   }
@@ -2809,6 +2812,7 @@ export class DependencyWatcher {
         coordinationStatus: undefined,
         coordinationPhase: undefined,
         coordinationBlockers: undefined,
+        coordinationConflicts: undefined,
         coordinationReason: undefined,
         failedBlockerRecoveryStartedAt: startedAt,
         failedBlockerRecoveryDeadlineAt: deadlineAt,

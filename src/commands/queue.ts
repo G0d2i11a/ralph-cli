@@ -1,7 +1,11 @@
 import { ConfigManager } from '../config/manager';
 import { resolveAutoIntegrate } from '../core/integration-policy';
 import { getManagerStatus } from '../core/manager-state';
-import { buildCoordinationState } from '../core/task-coordination';
+import {
+  buildCoordinationState,
+  CoordinationOverlapMatch,
+  formatCoordinationConflictSurface,
+} from '../core/task-coordination';
 import { summarizeActiveRepoPaths } from '../core/task-home-summary';
 import { buildAutoRecoveryState, buildDeliveryState, buildTransientRetryState, resolveTaskIntegrationStatus } from '../core/task-delivery';
 import { evaluateAutoRecovery } from '../core/auto-recovery-state';
@@ -21,6 +25,7 @@ interface PendingSummary {
   failedBlockers?: string[];
   recoveringBlockers?: string[];
   coordinationReason?: string;
+  coordinationConflicts?: CoordinationOverlapMatch[];
   integrationLane?: string;
   maxConcurrent: number;
   running: number;
@@ -34,6 +39,8 @@ interface QueueCommandOptions {
   recentCompletedLimit?: string | number;
   compact?: boolean;
 }
+
+const MAX_HUMAN_COORDINATION_BLOCKERS = 2;
 
 function parsePositiveNumber(value: string | number | undefined): number | undefined {
   if (value === undefined) {
@@ -187,7 +194,9 @@ function compactCoordinationState(coordination: ReturnType<typeof buildCoordinat
   return {
     status: coordination.status,
     phase: coordination.phase,
+    owner: coordination.owner,
     blockers: coordination.blockers,
+    conflicts: coordination.conflicts,
     reason: coordination.reason,
     lane: coordination.lane,
   };
@@ -211,6 +220,8 @@ function compactTaskSummary(taskSummary: Record<string, any>) {
     errorMessage: taskSummary.errorMessage,
     mergeError: taskSummary.mergeError,
     reason: taskSummary.reason,
+    coordinationReason: taskSummary.coordinationReason,
+    coordinationConflicts: taskSummary.coordinationConflicts,
     blockers: taskSummary.blockers,
     failedDependencies: taskSummary.failedDependencies,
     recoveringDependencies: taskSummary.recoveringDependencies,
@@ -229,14 +240,26 @@ function compactTaskSummary(taskSummary: Record<string, any>) {
   };
 }
 
-function summarizeTask(
+export function summarizeTask(
   task: Task,
   pendingState?: PendingSummary,
   autoIntegrateEnabled: boolean = false,
   compact: boolean = false,
 ) {
   const delivery = buildDeliveryState(task);
-  const coordination = buildCoordinationState(task);
+  const persistedCoordination = buildCoordinationState(task);
+  const coordination = pendingState?.reason === 'coordination'
+    ? {
+        ...persistedCoordination,
+        status: persistedCoordination?.status ?? ('blocked_predicted_overlap' as const),
+        phase: persistedCoordination?.phase ?? ('start' as const),
+        owner: pendingState.blockers[0] ?? persistedCoordination?.owner,
+        blockers: pendingState.blockers,
+        conflicts: pendingState.coordinationConflicts ?? persistedCoordination?.conflicts,
+        reason: pendingState.coordinationReason ?? persistedCoordination?.reason,
+        lane: pendingState.integrationLane ?? persistedCoordination?.lane,
+      }
+    : persistedCoordination;
   const transientRetry = buildTransientRetryState(task);
   const autoRecovery = buildAutoRecoveryState(task);
   const attention = deriveAttention(task, pendingState);
@@ -257,6 +280,8 @@ function summarizeTask(
     errorMessage: task.lastError,
     mergeError: task.mergeError,
     reason: pendingState?.reason,
+    coordinationReason: pendingState?.coordinationReason ?? coordination?.reason,
+    coordinationConflicts: pendingState?.coordinationConflicts ?? coordination?.conflicts,
     dependencyBlockers: pendingState?.dependencyBlockers,
     failedDependencies: pendingState?.failedDependencies,
     recoveringDependencies: pendingState?.recoveringDependencies,
@@ -320,6 +345,21 @@ function summarizeTask(
   return compact ? compactTaskSummary(taskSummary) : taskSummary;
 }
 
+function formatPendingCoordinationBlockers(pendingState: PendingSummary): string {
+  if (!pendingState.coordinationConflicts?.length) {
+    return pendingState.blockers.join(', ');
+  }
+
+  const visibleConflicts = pendingState.coordinationConflicts.slice(0, MAX_HUMAN_COORDINATION_BLOCKERS);
+  const suffix = pendingState.coordinationConflicts.length > visibleConflicts.length
+    ? `, +${pendingState.coordinationConflicts.length - visibleConflicts.length} more`
+    : '';
+
+  return `${visibleConflicts
+    .map((conflict) => `${conflict.taskId} (${formatCoordinationConflictSurface(conflict)})`)
+    .join(', ')}${suffix}`;
+}
+
 export function resolveNextAction(task: Task, pendingState?: PendingSummary, autoIntegrateEnabled: boolean = false): string {
   const integrationStatus = resolveTaskIntegrationStatus(task);
 
@@ -345,7 +385,7 @@ export function resolveNextAction(task: Task, pendingState?: PendingSummary, aut
         return `wait for overlapping task auto-recovery: ${pendingState.recoveringBlockers.join(', ')}`;
       }
 
-      return `wait for earlier overlapping task(s) to integrate: ${pendingState.blockers.join(', ')}`;
+      return `wait for earlier overlapping task(s) to integrate: ${formatPendingCoordinationBlockers(pendingState)}`;
     }
 
     if (task.repairContext?.mode === 'merge') {
