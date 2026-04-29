@@ -3,8 +3,13 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { ConfigManager } from '../config/manager';
 import { resolveCodexCliCommand, resolveConfiguredBackend } from '../core/agent';
+import { evaluateRalphHomeIsolation } from '../core/home-isolation';
+import { resolveAutoIntegrate } from '../core/integration-policy';
 import { getManagerStatus } from '../core/manager-state';
 import { resolveRalphHome } from '../core/paths';
+import { StateManager } from '../core/state';
+import { resolveTaskIntegrationStatus } from '../core/task-delivery';
+import { summarizeActiveRepoPaths } from '../core/task-home-summary';
 
 interface DoctorCheck {
   name: string;
@@ -89,15 +94,28 @@ export async function doctorCommand(options: { repo?: string } = {}): Promise<vo
   const repoIsGit = isGitRepo(repoPath);
   const repoIsDirty = repoIsGit && hasDirtyWorktree(repoPath);
   const usesIntegrationWorktree = configManager.get('merge.useIntegrationWorktree') !== false;
+  const autoIntegrate = resolveAutoIntegrate(configManager);
   const managerStatus = getManagerStatus({ ralphHome });
+  const stateManager = new StateManager({ ralphHome });
+  const tasks = await stateManager.listTasks();
+  const repoSummary = summarizeActiveRepoPaths(tasks);
+  const homeIsolation = evaluateRalphHomeIsolation({
+    repoPaths: repoSummary.repoPaths,
+    intendedRepoPath: repoPath,
+  });
   const ralphHomeWritable = hasWritableRalphHome(ralphHome);
   const managerCheckOk = !managerStatus.stateExists
     || managerStatus.state?.status !== 'running'
-    || (managerStatus.processRunning && !managerStatus.heartbeatStale);
+    || (managerStatus.processRunning && !managerStatus.heartbeatStale && !managerStatus.codeDriftDetected);
   const agentRunnersPath = resolveFile(configManager.get('agent.agentRunnersPath'))
     || resolveFile(configManager.get('agent.sdkRunnerPath'))
     || resolveFile(process.env.RALPH_AGENT_RUNNERS_CLI)
     || resolveFile(process.env.RALPH_SDK_RUNNER_CLI);
+  const hasOverlapBacklog = tasks.some((task) => (
+    task.coordinationStatus === 'blocked_predicted_overlap'
+    || task.coordinationStatus === 'blocked_observed_overlap'
+    || (task.status === 'completed' && resolveTaskIntegrationStatus(task) !== 'integrated')
+  ));
 
   const checks: DoctorCheck[] = [
     {
@@ -150,9 +168,29 @@ export async function doctorCommand(options: { repo?: string } = {}): Promise<vo
       message: `maxConcurrent=${configManager.get('runner.maxConcurrent')}`,
     },
     {
+      name: 'config.integration-liveness',
+      ok: !(usesIntegrationWorktree && hasOverlapBacklog && !autoIntegrate && !Boolean(configManager.get('autoMerge'))),
+      message: usesIntegrationWorktree && hasOverlapBacklog && !autoIntegrate && !Boolean(configManager.get('autoMerge'))
+        ? 'overlap coordination is active but both merge.autoIntegrate and autoMerge are disabled; completed tasks can stall unattended progress'
+        : `autoIntegrate=${autoIntegrate}, autoMerge=${Boolean(configManager.get('autoMerge'))}`,
+    },
+    {
       name: 'manager',
       ok: managerCheckOk,
       message: managerStatus.message,
+    },
+    {
+      name: 'ralph.home.repos',
+      ok: homeIsolation.compatible,
+      message: homeIsolation.reason === 'mixed_repos'
+        ? `Ralph home currently has active tasks from multiple repos (${repoSummary.repoCount}): ${repoSummary.repoPaths.join(', ')}. Default mode expects one repo per Ralph home.`
+        : homeIsolation.reason === 'foreign_repo' && homeIsolation.foreignRepoPath
+          ? `Ralph home currently has active tasks for a different repo: ${homeIsolation.foreignRepoPath}. Default mode expects one repo per Ralph home.`
+          : repoSummary.mixedRepos
+            ? `Ralph home currently has active tasks from multiple repos (${repoSummary.repoCount}): ${repoSummary.repoPaths.join(', ')}`
+            : repoSummary.repoCount === 1
+              ? `Ralph home currently has active tasks from one repo: ${repoSummary.repoPaths[0]}`
+              : 'Ralph home has no active queued/running/finalizing tasks',
     },
   ];
 
@@ -162,6 +200,7 @@ export async function doctorCommand(options: { repo?: string } = {}): Promise<vo
     ralphHome,
     repoPath,
     backend,
+    ...repoSummary,
     manager: managerStatus,
     checks,
   }));

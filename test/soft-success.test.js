@@ -9,6 +9,7 @@ const {
   detectCompletionSignals,
   detectCurrentWorktreeEvidence,
   hasObjectiveProgressEvidence,
+  reuseTaskLevelEvidenceForStorySuccess,
   shouldTreatNonZeroExitAsSuccess,
 } = require('../dist/core/soft-success.js');
 
@@ -143,6 +144,39 @@ test('detectCurrentWorktreeEvidence detects dirty worktree relative to base comm
   }
 });
 
+test('detectCurrentWorktreeEvidence ignores .git-local-only worktree changes', () => {
+  const repoPath = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-soft-success-git-local-'));
+
+  try {
+    git(repoPath, ['init']);
+    git(repoPath, ['config', 'user.email', 'test@example.com']);
+    git(repoPath, ['config', 'user.name', 'Test User']);
+
+    const filePath = path.join(repoPath, 'tracked.txt');
+    fs.writeFileSync(filePath, 'base\n');
+    git(repoPath, ['add', 'tracked.txt']);
+    git(repoPath, ['commit', '-m', 'initial']);
+
+    const baseCommitSha = execFileSync('git', ['rev-parse', 'HEAD'], {
+      cwd: repoPath,
+      encoding: 'utf8',
+    }).trim();
+
+    fs.mkdirSync(path.join(repoPath, '.git-local'), { recursive: true });
+    fs.writeFileSync(path.join(repoPath, '.git-local', 'HEAD'), 'metadata only\n');
+
+    const evidence = detectCurrentWorktreeEvidence({
+      worktreePath: repoPath,
+      baseCommitSha,
+    });
+
+    assert.equal(evidence.hasProgress, false);
+    assert.equal(evidence.filesChanged, 0);
+  } finally {
+    fs.rmSync(repoPath, { recursive: true, force: true });
+  }
+});
+
 test('hasObjectiveProgressEvidence rejects zero-diff completion claims', () => {
   assert.equal(hasObjectiveProgressEvidence({
     hasProgress: true,
@@ -164,4 +198,46 @@ test('hasObjectiveProgressEvidence accepts HEAD-only progress', () => {
     newCommits: 0,
     headChanged: true,
   }), true);
+});
+
+test('reuseTaskLevelEvidenceForStorySuccess accepts retained base-relative evidence with strong completion signals', () => {
+  const repoPath = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-retained-task-evidence-'));
+
+  try {
+    git(repoPath, ['init']);
+    git(repoPath, ['config', 'user.email', 'test@example.com']);
+    git(repoPath, ['config', 'user.name', 'Test User']);
+
+    const filePath = path.join(repoPath, 'tracked.txt');
+    fs.writeFileSync(filePath, 'base\n');
+    git(repoPath, ['add', 'tracked.txt']);
+    git(repoPath, ['commit', '-m', 'initial']);
+
+    const baseCommitSha = execFileSync('git', ['rev-parse', 'HEAD'], {
+      cwd: repoPath,
+      encoding: 'utf8',
+    }).trim();
+
+    fs.writeFileSync(filePath, 'retained task evidence\n');
+
+    const reusedEvidence = reuseTaskLevelEvidenceForStorySuccess({
+      output: `
+**Done**
+- Hooked review/drill intake to the existing source metadata
+
+**Validation**
+- Passed targeted tests
+`,
+      worktreePath: repoPath,
+      baseCommitSha,
+      storyId: 'US-004',
+    });
+
+    assert.ok(reusedEvidence);
+    assert.equal(reusedEvidence.hasProgress, true);
+    assert.equal(reusedEvidence.filesChanged > 0, true);
+    assert.match(reusedEvidence.reason, /Retained task-level worktree evidence/);
+  } finally {
+    fs.rmSync(repoPath, { recursive: true, force: true });
+  }
 });

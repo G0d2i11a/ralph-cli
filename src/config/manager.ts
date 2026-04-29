@@ -12,6 +12,7 @@ export interface RalphConfig {
     sdkRunnerPath: string;
     timeout: number;
     model: string;
+    codexConversationScope: 'attempt' | 'story' | 'task';
   };
   runner: {
     maxConcurrent: number;
@@ -19,6 +20,19 @@ export interface RalphConfig {
     pollInterval: number;
     leaseTimeout: number;
     maxStoryAttempts: number;
+    maxTransientRetriesPerStory: number;
+    transientRetryBaseDelaySeconds: number;
+    transientRetryMaxDelaySeconds: number;
+    maxTransientRecoveryRequeues: number;
+    transientRecoveryBaseDelaySeconds: number;
+    transientRecoveryMaxDelaySeconds: number;
+    transientRecoveryDeadlineSeconds: number;
+    maxTransientRecoverySameSignature: number;
+    autoRecoveryHardCap: number;
+    autoRemediateFailedBlockers: boolean;
+    maxFailedBlockerStoryRequeues: number;
+    failedBlockerRecoveryDeadlineSeconds: number;
+    failedBlockerRecoveryHardCap: number;
   };
   ingestion: {
     ez4ielts: {
@@ -31,6 +45,7 @@ export interface RalphConfig {
   autoMerge: boolean;
   autoMergeDelay: number;
   merge: {
+    autoIntegrate: boolean;
     targetBranch: string;
     strategy: RalphMergeStrategy;
     pullLatest: boolean;
@@ -62,7 +77,8 @@ const DEFAULT_CONFIG: RalphConfig = {
     agentRunnersPath: process.env.RALPH_AGENT_RUNNERS_CLI || process.env.RALPH_SDK_RUNNER_CLI || '',
     sdkRunnerPath: process.env.RALPH_SDK_RUNNER_CLI || '',
     timeout: 600,
-    model: 'claude-opus-4-6-thinking-xchai'
+    model: 'claude-opus-4-6-thinking-xchai',
+    codexConversationScope: 'story',
   },
   runner: {
     maxConcurrent: 3,
@@ -70,6 +86,19 @@ const DEFAULT_CONFIG: RalphConfig = {
     pollInterval: 10,
     leaseTimeout: 300,
     maxStoryAttempts: 2,
+    maxTransientRetriesPerStory: 3,
+    transientRetryBaseDelaySeconds: 15,
+    transientRetryMaxDelaySeconds: 180,
+    maxTransientRecoveryRequeues: 5,
+    transientRecoveryBaseDelaySeconds: 120,
+    transientRecoveryMaxDelaySeconds: 900,
+    transientRecoveryDeadlineSeconds: 7200,
+    maxTransientRecoverySameSignature: 3,
+    autoRecoveryHardCap: 20,
+    autoRemediateFailedBlockers: true,
+    maxFailedBlockerStoryRequeues: 1,
+    failedBlockerRecoveryDeadlineSeconds: 7200,
+    failedBlockerRecoveryHardCap: 2,
   },
   ingestion: {
     ez4ielts: {
@@ -82,6 +111,7 @@ const DEFAULT_CONFIG: RalphConfig = {
   autoMerge: false,
   autoMergeDelay: 0,
   merge: {
+    autoIntegrate: true,
     targetBranch: 'main',
     strategy: 'manual',
     pullLatest: true,
@@ -132,6 +162,20 @@ function mergeConfig<T extends Record<string, any>>(defaults: T, overrides: Part
   return merged as T;
 }
 
+function hasNestedKey(value: unknown, parts: string[]): boolean {
+  let current: unknown = value;
+
+  for (const part of parts) {
+    if (!isPlainObject(current) || !(part in current)) {
+      return false;
+    }
+
+    current = current[part];
+  }
+
+  return true;
+}
+
 export class ConfigManager {
   private configPath: string;
   private config: RalphConfig;
@@ -161,7 +205,13 @@ export class ConfigManager {
       const content = fs.readFileSync(this.configPath, 'utf-8');
       const parsed = JSON.parse(content);
       this.rawConfig = isPlainObject(parsed) ? parsed : {};
-      return mergeConfig(DEFAULT_CONFIG, this.rawConfig as Partial<RalphConfig>);
+      const merged = mergeConfig(DEFAULT_CONFIG, this.rawConfig as Partial<RalphConfig>);
+
+      if (!hasNestedKey(this.rawConfig, ['merge', 'autoIntegrate'])) {
+        merged.merge.autoIntegrate = merged.merge.useIntegrationWorktree;
+      }
+
+      return merged;
     } catch (error) {
       console.error('Failed to load config, using defaults:', error);
       this.rawConfig = {};

@@ -133,6 +133,26 @@ export class StateManager {
     await this.saveTask(task);
   }
 
+  async updateTaskIf(
+    taskId: string,
+    predicate: (latest: Task) => boolean,
+    updates: Partial<Task>,
+  ): Promise<{ updated: boolean; task: Task | null }> {
+    const task = await this.loadTask(taskId);
+    if (!task) {
+      return { updated: false, task: null };
+    }
+
+    if (!predicate(task)) {
+      return { updated: false, task };
+    }
+
+    Object.assign(task, updates);
+    await this.saveTask(task);
+    const updatedTask = await this.loadTask(taskId);
+    return { updated: true, task: updatedTask };
+  }
+
   async getTaskByPrdId(prdId: string, options: { repoPath?: string } = {}): Promise<Task | null> {
     const tasks = await this.listTasks();
     const resolvedRepoPath = options.repoPath ? path.resolve(options.repoPath) : undefined;

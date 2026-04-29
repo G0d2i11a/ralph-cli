@@ -38,6 +38,13 @@ export interface ManagerStatus {
   staleAfterMs: number;
   ageMs?: number;
   lastHeartbeatAgeMs?: number;
+  managerEntryPath?: string;
+  managerEntryModifiedAt?: number;
+  managerCodeRootPath?: string;
+  managerCodeLatestPath?: string;
+  managerCodeLatestModifiedAt?: number;
+  codeDriftDetected: boolean;
+  codeDriftReason?: string;
   message: string;
 }
 
@@ -48,6 +55,16 @@ export interface ManagerStatePaths {
 }
 
 export const DEFAULT_MANAGER_HEARTBEAT_STALE_MS = 15 * 60 * 1000;
+
+interface ManagerCodeInspection {
+  entryPath?: string;
+  entryModifiedAt?: number;
+  codeRootPath?: string;
+  latestPath?: string;
+  latestModifiedAt?: number;
+  codeDriftDetected: boolean;
+  codeDriftReason?: string;
+}
 
 export function getManagerDir(options: ManagerStatePaths = {}): string {
   return options.managerDir || getRalphPaths(options).managerDir;
@@ -84,6 +101,126 @@ function sanitizeStatePatch(
   }
 
   return sanitized;
+}
+
+function resolveManagerEntryPath(state: ManagerRuntimeState): string | undefined {
+  if (!Array.isArray(state.argv) || state.argv.length < 2) {
+    return undefined;
+  }
+
+  const candidate = typeof state.argv[1] === 'string' ? state.argv[1].trim() : '';
+  if (!candidate) {
+    return undefined;
+  }
+
+  return path.resolve(candidate);
+}
+
+function resolveManagerCodeRoot(entryPath: string): string {
+  const normalizedEntryPath = path.resolve(entryPath);
+  const distSegment = `${path.sep}dist${path.sep}`;
+  const distIndex = normalizedEntryPath.lastIndexOf(distSegment);
+
+  if (distIndex >= 0) {
+    return normalizedEntryPath.slice(0, distIndex + distSegment.length - 1);
+  }
+
+  const entryDir = path.dirname(normalizedEntryPath);
+  if (path.basename(entryDir) === 'dist') {
+    return entryDir;
+  }
+
+  return normalizedEntryPath;
+}
+
+function findLatestModifiedEntry(targetPath: string): { path: string; modifiedAt: number } | undefined {
+  if (!fs.existsSync(targetPath)) {
+    return undefined;
+  }
+
+  let latestFile: { path: string; modifiedAt: number } | undefined;
+  let latest: { path: string; modifiedAt: number } | undefined;
+  const stack = [path.resolve(targetPath)];
+
+  while (stack.length > 0) {
+    const currentPath = stack.pop();
+    if (!currentPath) {
+      continue;
+    }
+
+    let stat: fs.Stats;
+    try {
+      stat = fs.statSync(currentPath);
+    } catch {
+      continue;
+    }
+
+    if (!latest || stat.mtimeMs > latest.modifiedAt) {
+      latest = {
+        path: currentPath,
+        modifiedAt: stat.mtimeMs,
+      };
+    }
+
+    if (!stat.isDirectory()) {
+      if (!latestFile || stat.mtimeMs > latestFile.modifiedAt) {
+        latestFile = {
+          path: currentPath,
+          modifiedAt: stat.mtimeMs,
+        };
+      }
+      continue;
+    }
+
+    let entries: string[];
+    try {
+      entries = fs.readdirSync(currentPath);
+    } catch {
+      continue;
+    }
+
+    for (const entry of entries) {
+      stack.push(path.join(currentPath, entry));
+    }
+  }
+
+  return latestFile ?? latest;
+}
+
+function inspectManagerCode(state: ManagerRuntimeState): ManagerCodeInspection {
+  const entryPath = resolveManagerEntryPath(state);
+
+  if (!entryPath || !fs.existsSync(entryPath)) {
+    return {
+      entryPath,
+      codeDriftDetected: false,
+    };
+  }
+
+  let entryModifiedAt: number | undefined;
+  try {
+    entryModifiedAt = fs.statSync(entryPath).mtimeMs;
+  } catch {
+    entryModifiedAt = undefined;
+  }
+
+  const codeRootPath = resolveManagerCodeRoot(entryPath);
+  const latestEntry = findLatestModifiedEntry(codeRootPath);
+  const latestModifiedAt = latestEntry?.modifiedAt ?? entryModifiedAt;
+  const latestPath = latestEntry?.path ?? entryPath;
+  const codeDriftDetected = typeof latestModifiedAt === 'number' && latestModifiedAt > state.startedAt;
+
+  return {
+    entryPath,
+    entryModifiedAt,
+    codeRootPath,
+    latestPath,
+    latestModifiedAt,
+    codeDriftDetected,
+    codeDriftReason: codeDriftDetected
+      ? `manager started at ${new Date(state.startedAt).toISOString()} before ${latestPath} changed at ${new Date(latestModifiedAt!).toISOString()}`
+      : undefined,
+  };
 }
 
 export function writeManagerState(
@@ -239,6 +376,7 @@ export function getManagerStatus(options: ManagerStatePaths & {
       active: false,
       heartbeatStale: false,
       staleAfterMs,
+      codeDriftDetected: false,
       message: 'manager state not found',
     };
   }
@@ -248,9 +386,14 @@ export function getManagerStatus(options: ManagerStatePaths & {
   const lastHeartbeatAgeMs = Math.max(0, now() - state.lastHeartbeatAt);
   const heartbeatStale = state.status === 'running' && lastHeartbeatAgeMs > staleAfterMs;
   const active = state.status === 'running' && processRunning;
+  const codeInspection = inspectManagerCode(state);
 
   let message = 'manager is stopped';
-  if (active && heartbeatStale) {
+  if (active && heartbeatStale && codeInspection.codeDriftDetected) {
+    message = `manager process ${state.pid} is running but heartbeat is stale and loaded code is older than current code on disk`;
+  } else if (active && codeInspection.codeDriftDetected) {
+    message = `manager process ${state.pid} is running but loaded code is older than current code on disk`;
+  } else if (active && heartbeatStale) {
     message = `manager process ${state.pid} is running but heartbeat is stale`;
   } else if (active) {
     message = `manager process ${state.pid} is running`;
@@ -274,6 +417,13 @@ export function getManagerStatus(options: ManagerStatePaths & {
     staleAfterMs,
     ageMs: Math.max(0, now() - state.startedAt),
     lastHeartbeatAgeMs,
+    managerEntryPath: codeInspection.entryPath,
+    managerEntryModifiedAt: codeInspection.entryModifiedAt,
+    managerCodeRootPath: codeInspection.codeRootPath,
+    managerCodeLatestPath: codeInspection.latestPath,
+    managerCodeLatestModifiedAt: codeInspection.latestModifiedAt,
+    codeDriftDetected: codeInspection.codeDriftDetected,
+    codeDriftReason: codeInspection.codeDriftReason,
     message,
   };
 }

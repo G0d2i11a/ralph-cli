@@ -156,3 +156,49 @@ test('manager state paths use RALPH_HOME directly when provided', () => {
     fs.rmSync(tempDir, { recursive: true, force: true });
   }
 });
+
+test('getManagerStatus detects manager code drift when dist files changed after startup', () => {
+  const homeDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-manager-drift-home-'));
+  const repoDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-manager-drift-repo-'));
+  const distDir = path.join(repoDir, 'dist');
+  const entryPath = path.join(distDir, 'cli.js');
+  const dependencyPath = path.join(distDir, 'core', 'dependency-watcher.js');
+
+  try {
+    fs.mkdirSync(path.dirname(dependencyPath), { recursive: true });
+    fs.writeFileSync(entryPath, 'console.log("entry");\n');
+    fs.writeFileSync(dependencyPath, 'console.log("dep");\n');
+    fs.utimesSync(entryPath, 1, 1);
+    fs.utimesSync(dependencyPath, 5, 5);
+
+    writeManagerState({
+      pid: 99999,
+      status: 'running',
+      startedAt: 2000,
+      updatedAt: 3000,
+      lastHeartbeatAt: 3000,
+      pollIntervalMs: 1000,
+      autoIngestEnabled: false,
+      hostname: 'test-host',
+      argv: ['node', entryPath, 'manager'],
+    }, { homeDir });
+
+    const status = getManagerStatus({
+      homeDir,
+      now: () => 4000,
+      staleAfterMs: 5000,
+      isProcessRunning: () => true,
+    });
+
+    assert.equal(status.active, true);
+    assert.equal(status.codeDriftDetected, true);
+    assert.equal(status.managerEntryPath, entryPath);
+    assert.equal(status.managerCodeRootPath, distDir);
+    assert.equal(status.managerCodeLatestPath, dependencyPath);
+    assert.match(status.message, /older than current code on disk/);
+    assert.match(status.codeDriftReason, /dependency-watcher\.js/);
+  } finally {
+    fs.rmSync(homeDir, { recursive: true, force: true });
+    fs.rmSync(repoDir, { recursive: true, force: true });
+  }
+});

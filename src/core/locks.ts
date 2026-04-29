@@ -122,6 +122,18 @@ export function getRepoMergeLockDir(repoPath: string, options: RalphHomeOptions 
   return path.join(getRalphPaths(options).locksDir, 'merge', `${repoSlug}-${repoHash}`);
 }
 
+export function getIntegrationLaneLockDir(
+  repoPath: string,
+  lane: string,
+  options: RalphHomeOptions = {},
+): string {
+  const resolvedRepoPath = path.resolve(repoPath);
+  const repoSlug = sanitizeSegment(path.basename(resolvedRepoPath));
+  const repoHash = createHash('sha1').update(resolvedRepoPath).digest('hex');
+  const laneSlug = sanitizeSegment(lane);
+  return path.join(getRalphPaths(options).locksDir, 'integration-lanes', `${repoSlug}-${repoHash}-${laneSlug}`);
+}
+
 export async function withTaskFinalizeLock<T>(
   taskId: string,
   operation: () => Promise<T>,
@@ -138,4 +150,18 @@ export async function withRepoMergeLock<T>(
 ): Promise<T> {
   const { ralphHome, homeDir, ...lockOptions } = options;
   return withDirectoryLock(getRepoMergeLockDir(repoPath, { ralphHome, homeDir }), operation, lockOptions);
+}
+
+export async function withIntegrationLaneLock<T>(
+  repoPath: string,
+  lane: string,
+  operation: () => Promise<T>,
+  options: RalphLockOptions = {}
+): Promise<T> {
+  const { ralphHome, homeDir, ...lockOptions } = options;
+  return withDirectoryLock(
+    getIntegrationLaneLockDir(repoPath, lane, { ralphHome, homeDir }),
+    operation,
+    lockOptions,
+  );
 }

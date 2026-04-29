@@ -132,6 +132,57 @@ test('AgentRunner defaults Codex to the direct CLI backend', async () => {
   }
 });
 
+test('AgentRunner prefers .git-local metadata when the worktree provides it', async () => {
+  const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-agent-git-local-'));
+  const worktreePath = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-agent-worktree-'));
+  const logPath = path.join(tempRoot, 'agent.log');
+  const previousHome = process.env.HOME;
+  const previousRunnerEnv = captureRunnerEnv();
+  const originalSpawn = childProcess.spawn;
+
+  let captured;
+
+  try {
+    fs.mkdirSync(path.join(worktreePath, '.git-local'), { recursive: true });
+    process.env.HOME = tempRoot;
+    delete process.env.RALPH_AGENT_RUNNERS_CLI;
+    delete process.env.RALPH_SDK_RUNNER_CLI;
+    childProcess.spawn = (command, args, options) => {
+      captured = { command, args, options };
+      return createMockChild({
+        stdoutLines: [JSON.stringify({ kind: 'final', payload: { status: 'success' } })],
+      });
+    };
+
+    const { AgentRunner } = require('../dist/core/agent.js');
+    const runner = new AgentRunner();
+
+    const result = await runner.runUserStory(
+      {
+        id: 'US-1',
+        title: 'Git metadata smoke',
+        description: 'Keep git writes inside the local worktree metadata.',
+        acceptanceCriteria: ['Reply with OK in the summary.'],
+      },
+      worktreePath,
+      'codex',
+      logPath,
+    );
+
+    assert.equal(result.success, true);
+    assert.ok(captured, 'spawn should be called');
+    assert.equal(captured.options.env.GIT_DIR, path.join(worktreePath, '.git-local'));
+    assert.equal(captured.options.env.GIT_WORK_TREE, worktreePath);
+  } finally {
+    childProcess.spawn = originalSpawn;
+    process.env.HOME = previousHome;
+    restoreRunnerEnv(previousRunnerEnv);
+    await cleanupPath(tempRoot);
+    await cleanupPath(worktreePath);
+    delete require.cache[require.resolve('../dist/core/agent.js')];
+  }
+});
+
 test('AgentRunner persists and resumes Codex thread ids via agent-runners CLI', async () => {
   const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-agent-codex-thread-'));
   const worktreePath = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-agent-worktree-'));
@@ -145,6 +196,16 @@ test('AgentRunner persists and resumes Codex thread ids via agent-runners CLI', 
     process.env.HOME = tempRoot;
     process.env.RALPH_AGENT_RUNNERS_CLI = createAgentRunnersFixture(tempRoot);
     delete process.env.RALPH_SDK_RUNNER_CLI;
+    fs.mkdirSync(path.join(tempRoot, '.ralph'), { recursive: true });
+    fs.writeFileSync(
+      path.join(tempRoot, '.ralph', 'config.json'),
+      JSON.stringify({
+        agent: {
+          agentRunnersPath: process.env.RALPH_AGENT_RUNNERS_CLI,
+          codexConversationScope: 'task',
+        },
+      }),
+    );
     childProcess.spawn = (command, args, options) => {
       capturedCalls.push({ command, args, options });
       return createMockChild({
@@ -192,6 +253,59 @@ test('AgentRunner persists and resumes Codex thread ids via agent-runners CLI', 
     assert.deepEqual(capturedCalls[1].args.slice(0, 2), [process.env.RALPH_AGENT_RUNNERS_CLI, 'codex']);
     assert.ok(capturedCalls[1].args.includes('--resume-thread'));
     assert.ok(capturedCalls[1].args.includes('codex-thread-1'));
+  } finally {
+    childProcess.spawn = originalSpawn;
+    process.env.HOME = previousHome;
+    restoreRunnerEnv(previousRunnerEnv);
+    await cleanupPath(tempRoot);
+    await cleanupPath(worktreePath);
+    delete require.cache[require.resolve('../dist/core/agent.js')];
+  }
+});
+
+test('AgentRunner does not resume Codex thread across stories by default', async () => {
+  const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-agent-codex-story-scope-'));
+  const worktreePath = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-agent-worktree-'));
+  const logPath = path.join(tempRoot, 'agent.log');
+  const previousHome = process.env.HOME;
+  const previousRunnerEnv = captureRunnerEnv();
+  const originalSpawn = childProcess.spawn;
+  const capturedCalls = [];
+
+  try {
+    process.env.HOME = tempRoot;
+    process.env.RALPH_AGENT_RUNNERS_CLI = createAgentRunnersFixture(tempRoot);
+    delete process.env.RALPH_SDK_RUNNER_CLI;
+    childProcess.spawn = (command, args, options) => {
+      capturedCalls.push({ command, args, options });
+      return createMockChild({
+        stdoutLines: [JSON.stringify({ kind: 'final', payload: { threadId: 'codex-thread-2' } })],
+      });
+    };
+
+    const { AgentRunner } = require('../dist/core/agent.js');
+    const runner = new AgentRunner();
+
+    await runner.runUserStory(
+      {
+        id: 'US-2',
+        title: 'Codex story scoped thread',
+        description: 'Do not resume another story thread.',
+        acceptanceCriteria: ['Reply with OK in the summary.'],
+      },
+      worktreePath,
+      'codex',
+      logPath,
+      'agent-runners',
+      {
+        threadId: 'codex-thread-1',
+        threadStoryId: 'US-1',
+        storyId: 'US-2',
+      },
+    );
+
+    assert.equal(capturedCalls.length, 1);
+    assert.ok(!capturedCalls[0].args.includes('--resume-thread'));
   } finally {
     childProcess.spawn = originalSpawn;
     process.env.HOME = previousHome;

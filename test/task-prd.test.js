@@ -84,6 +84,8 @@ dependencies: []
       total: 1,
       percentage: 100,
     });
+    assert.equal(detailed.delivery.integrationStatus, 'not_started');
+    assert.equal(detailed.delivery.targetSyncStatus, 'not_requested');
     assert.equal(detailed.userStories[0].passes, true);
     assert.equal(detailed.userStories[0].notes, 'Validated manually');
   } finally {

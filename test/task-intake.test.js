@@ -50,13 +50,14 @@ class NoopScheduler {
   }
 }
 
-function createPrdFile(dir, id, dependencies = []) {
+function createPrdFile(dir, id, dependencies = [], overrides = {}) {
   const prdPath = path.join(dir, `${id}.json`);
   fs.writeFileSync(prdPath, JSON.stringify({
     id,
     title: `${id} title`,
     description: '',
     dependencies,
+    ...overrides,
     userStories: [
       {
         id: 'US-001',
@@ -95,6 +96,38 @@ test('enqueueTaskFromPrd stores immutable PRD metadata and source hash at intake
     assert.equal(task.prdSourceHash.length, 64);
     assert.equal(task.enqueuedAt, 1_000);
     assert.equal(task.storyProgress[0].status, 'pending');
+  } finally {
+    process.env.HOME = previousHome;
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('enqueueTaskFromPrd stores declared coordination metadata from PRD', async () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-intake-coordination-'));
+  const previousHome = process.env.HOME;
+
+  try {
+    process.env.HOME = tempDir;
+    const prdPath = createPrdFile(tempDir, 'prd-coordination', [], {
+      writeSurface: ['packages/contracts/', 'scripts/wiki/sync.ts'],
+      conflictDomains: ['contracts-index'],
+      integrationLane: 'contracts',
+    });
+    const stateManager = new FakeStateManager();
+    const scheduler = new NoopScheduler();
+
+    const result = await enqueueTaskFromPrd(prdPath, {
+      repoPath: tempDir,
+      stateManager,
+      scheduler,
+      configManager: { get: () => undefined },
+      now: () => 2_000,
+    });
+
+    const task = await stateManager.loadTask(result.taskId);
+    assert.deepEqual(task.declaredWriteSurface, ['packages/contracts', 'scripts/wiki/sync.ts']);
+    assert.deepEqual(task.declaredConflictDomains, ['contracts-index']);
+    assert.equal(task.integrationLane, 'contracts');
   } finally {
     process.env.HOME = previousHome;
     fs.rmSync(tempDir, { recursive: true, force: true });
@@ -196,6 +229,141 @@ test('enqueueTaskFromPrd writes task artifacts under RALPH_HOME', async () => {
     } else {
       process.env.RALPH_HOME = previousRalphHome;
     }
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('enqueueTaskFromPrd rejects a Ralph home that is already active for another repo by default', async () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-intake-home-guard-'));
+  const previousHome = process.env.HOME;
+  const repoA = path.join(tempDir, 'repo-a');
+  const repoB = path.join(tempDir, 'repo-b');
+
+  try {
+    process.env.HOME = tempDir;
+    fs.mkdirSync(repoA, { recursive: true });
+    fs.mkdirSync(repoB, { recursive: true });
+    const prdPath = createPrdFile(repoB, 'foreign-home-prd');
+    const stateManager = new FakeStateManager([
+      {
+        id: 'task-a',
+        prdPath: path.join(repoA, 'existing.json'),
+        prdId: 'existing',
+        status: 'running',
+        startTime: 1,
+        completedUS: [],
+        worktree: path.join(repoA, '.ralph-worktrees', 'task-a'),
+        logPath: path.join(tempDir, '.ralph', 'tasks', 'task-a', 'agent.log'),
+        agent: 'codex',
+        repoPath: repoA,
+        loopCount: 0,
+        consecutiveNoProgress: 0,
+        consecutiveErrors: 0,
+        lastProgressTime: 1,
+        lastFilesChanged: 0,
+      },
+    ]);
+    const scheduler = new NoopScheduler();
+
+    await assert.rejects(
+      enqueueTaskFromPrd(prdPath, {
+        repoPath: repoB,
+        stateManager,
+        scheduler,
+        configManager: { get: () => undefined },
+      }),
+      /already active for .*repo-a.*Refusing to enqueue tasks/i,
+    );
+  } finally {
+    process.env.HOME = previousHome;
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('enqueueTaskFromPrd allows mixed-repo Ralph homes when explicitly overridden', async () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-intake-home-guard-override-'));
+  const previousHome = process.env.HOME;
+  const repoA = path.join(tempDir, 'repo-a');
+  const repoB = path.join(tempDir, 'repo-b');
+
+  try {
+    process.env.HOME = tempDir;
+    fs.mkdirSync(repoA, { recursive: true });
+    fs.mkdirSync(repoB, { recursive: true });
+    const prdPath = createPrdFile(repoB, 'mixed-home-prd');
+    const stateManager = new FakeStateManager([
+      {
+        id: 'task-a',
+        prdPath: path.join(repoA, 'existing.json'),
+        prdId: 'existing',
+        status: 'running',
+        startTime: 1,
+        completedUS: [],
+        worktree: path.join(repoA, '.ralph-worktrees', 'task-a'),
+        logPath: path.join(tempDir, '.ralph', 'tasks', 'task-a', 'agent.log'),
+        agent: 'codex',
+        repoPath: repoA,
+        loopCount: 0,
+        consecutiveNoProgress: 0,
+        consecutiveErrors: 0,
+        lastProgressTime: 1,
+        lastFilesChanged: 0,
+      },
+    ]);
+    const scheduler = new NoopScheduler();
+
+    const result = await enqueueTaskFromPrd(prdPath, {
+      repoPath: repoB,
+      allowMixedHome: true,
+      stateManager,
+      scheduler,
+      configManager: { get: () => undefined },
+      now: () => 3_000,
+    });
+
+    assert.equal(result.alreadyExists, false);
+    const task = await stateManager.loadTask(result.taskId);
+    assert.equal(task.repoPath, repoB);
+  } finally {
+    process.env.HOME = previousHome;
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('enqueueTaskFromPrd rejects PRDs without an explicit title', async () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-intake-title-'));
+  const previousHome = process.env.HOME;
+
+  try {
+    process.env.HOME = tempDir;
+    const prdPath = path.join(tempDir, 'untitled.json');
+    fs.writeFileSync(prdPath, JSON.stringify({
+      projectName: 'fallback-project-name',
+      description: '',
+      userStories: [
+        {
+          id: 'US-001',
+          title: 'First story',
+          description: '',
+          acceptanceCriteria: [],
+        },
+      ],
+    }, null, 2));
+
+    const stateManager = new FakeStateManager();
+    const scheduler = new NoopScheduler();
+
+    await assert.rejects(
+      enqueueTaskFromPrd(prdPath, {
+        repoPath: tempDir,
+        stateManager,
+        scheduler,
+        configManager: { get: () => undefined },
+      }),
+      /must define a non-empty top-level title/i,
+    );
+  } finally {
+    process.env.HOME = previousHome;
     fs.rmSync(tempDir, { recursive: true, force: true });
   }
 });

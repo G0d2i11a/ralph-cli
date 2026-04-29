@@ -6,6 +6,7 @@ import { UserStory } from '../types/prd';
 
 export type AgentType = 'claude' | 'codex';
 export type AgentBackend = 'cli' | 'agent-runners';
+export type CodexConversationScope = 'attempt' | 'story' | 'task';
 
 export type AcceptedAgentBackend = AgentBackend | 'sdk-runner';
 
@@ -135,6 +136,19 @@ function resolveAgentTimeoutMs(config: Pick<ConfigManager, 'get'>): number {
   return configuredTimeout * 1000;
 }
 
+function resolveWorktreeGitEnv(worktreePath: string): Partial<NodeJS.ProcessEnv> {
+  const localGitDir = path.join(worktreePath, '.git-local');
+
+  if (!fs.existsSync(localGitDir) || !fs.statSync(localGitDir).isDirectory()) {
+    return {};
+  }
+
+  return {
+    GIT_DIR: localGitDir,
+    GIT_WORK_TREE: worktreePath,
+  };
+}
+
 export function resolveCodexCliCommand(config: Pick<ConfigManager, 'get'>): string {
   const configuredPath = config.get('agent.path');
 
@@ -152,6 +166,18 @@ export function resolveCodexCliCommand(config: Pick<ConfigManager, 'get'>): stri
 interface AgentRunState {
   sessionId?: string;
   threadId?: string;
+  storyId?: string;
+  threadStoryId?: string;
+}
+
+export function resolveCodexConversationScope(config: Pick<ConfigManager, 'get'>): CodexConversationScope {
+  const configuredScope = config.get('agent.codexConversationScope');
+
+  if (configuredScope === 'attempt' || configuredScope === 'story' || configuredScope === 'task') {
+    return configuredScope;
+  }
+
+  return 'story';
 }
 
 export class AgentRunner {
@@ -229,7 +255,7 @@ Do not commit your changes. Instead, leave the worktree ready for a separate fin
           }
         }
 
-        if (agent === 'codex' && state?.threadId) {
+        if (agent === 'codex' && this.shouldResumeCodexThread(state)) {
           args.push('--resume-thread', state.threadId);
         }
       } else if (agent === 'claude') {
@@ -267,7 +293,8 @@ Do not commit your changes. Instead, leave the worktree ready for a separate fin
       const env: NodeJS.ProcessEnv = {
         ...process.env,
         CI: 'true',
-        TERM: 'dumb'
+        TERM: 'dumb',
+        ...resolveWorktreeGitEnv(worktreePath),
       };
 
       if (process.env.LITELLM_MASTER_KEY && !env.OPENAI_API_KEY) {
@@ -389,6 +416,23 @@ Do not commit your changes. Instead, leave the worktree ready for a separate fin
         }
       });
     });
+  }
+
+  private shouldResumeCodexThread(state?: AgentRunState): state is AgentRunState & { threadId: string } {
+    if (!state?.threadId) {
+      return false;
+    }
+
+    const scope = resolveCodexConversationScope(this.config);
+    if (scope === 'attempt') {
+      return false;
+    }
+
+    if (scope === 'task') {
+      return true;
+    }
+
+    return Boolean(state.storyId && state.threadStoryId === state.storyId);
   }
 
   stop(): void {

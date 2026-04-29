@@ -30,6 +30,11 @@ userStories:
       - Session management
       - Invalid credentials handling
 dependencies: []
+writeSurface:
+  - packages/contracts/
+conflictDomains:
+  - contracts-index
+integrationLane: contracts
 ---
 
 ## Additional Context
@@ -43,9 +48,37 @@ Body only.
   assert.equal(prd.title, 'User Authentication System');
   assert.equal(prd.userStories.length, 2);
   assert.equal(prd.userStories[0].id, 'US-001');
+  assert.deepEqual(prd.writeSurface, ['packages/contracts/']);
+  assert.deepEqual(prd.conflictDomains, ['contracts-index']);
+  assert.equal(prd.integrationLane, 'contracts');
   assert.deepEqual(prd.userStories[1].acceptanceCriteria, [
     'JWT token generation',
     'Session management',
     'Invalid credentials handling',
   ]);
+});
+
+test('parsePRD falls back to projectName for JSON PRDs without title', () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-prd-json-'));
+  const prdPath = path.join(tempDir, 'recording-prd.json');
+
+  fs.writeFileSync(prdPath, JSON.stringify({
+    projectName: 'ez4ielts-speaking-recording-transcription',
+    description: 'Recording PRD',
+    userStories: [
+      {
+        id: 'US-001',
+        title: 'Audit',
+        description: 'Audit the current flow',
+        acceptanceCriteria: ['done'],
+      },
+    ],
+  }, null, 2));
+
+  const prd = parsePRD(prdPath);
+
+  assert.equal(prd.id, 'recording-prd');
+  assert.equal(prd.title, 'ez4ielts-speaking-recording-transcription');
+  assert.equal(prd.userStories.length, 1);
+  assert.equal(prd.userStories[0].id, 'US-001');
 });

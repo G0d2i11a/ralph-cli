@@ -1,5 +1,6 @@
 import * as path from 'path';
 import { DependencyWatcher, WatchCommandOptions } from '../core/dependency-watcher';
+import { assertRalphHomeIsolation } from '../core/home-isolation';
 import { withDirectoryLock } from '../core/locks';
 import {
   DEFAULT_MANAGER_HEARTBEAT_STALE_MS,
@@ -27,6 +28,12 @@ export async function managerCommand(options: WatchCommandOptions): Promise<void
   process.once('SIGTERM', stopManager);
 
   try {
+    await assertRalphHomeIsolation({
+      repoPath: options.repo,
+      allowMixedHome: options.allowMixedHome,
+      operation: 'start the Ralph manager',
+    });
+
     await withDirectoryLock(lockDir, async () => {
       watcher = new DependencyWatcher(options, {
         lifecycle: {
@@ -77,7 +84,12 @@ export async function managerCommand(options: WatchCommandOptions): Promise<void
       return;
     }
 
-    throw error;
+    console.error(JSON.stringify({
+      ok: false,
+      error: message,
+    }));
+    process.exitCode = 1;
+    return;
   } finally {
     process.removeListener('SIGINT', stopManager);
     process.removeListener('SIGTERM', stopManager);

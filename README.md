@@ -55,11 +55,14 @@ ralph list
 - **Quality Gates** - Runs available `typecheck`, `lint`, `test`, and `build` scripts before the final commit
 - **Batch Execution** - Start multiple PRDs at once with task-level parallelism
 - **Repo-Scoped Integrated Dependencies** - PRD dependencies only resolve against integrated tasks from the same repository
+- **Declared Coordination Metadata** - Optional PRD `writeSurface`, `conflictDomains`, and `integrationLane` hints are captured at intake
+- **Repo-Scoped Overlap Protection** - Scheduler, finalize, and merge block only earlier overlapping tasks from the same repo
 - **Lease + Revision Safety** - State updates are revisioned and stale `running` / `finalizing` leases are recoverable
 - **Structured Event Log** - Task lifecycle events are written to `events.jsonl` and used by stats when available
 - **Dedicated Integration Worktree** - Background merge runs in `.ralph-integration/` so dirty user checkouts do not block task integration
 - **Watch + Auto-Ingestion** - Poll the queue and auto-enqueue new ez4ielts PRDs
 - **Manager Health + launchd Restart** - The manager records heartbeat/status, prevents duplicate loops, and can install a macOS launchd service
+- **Shared-Home Repo Visibility** - `queue`, `manager-status`, and `doctor` show when one Ralph home is carrying active tasks for multiple repos
 - **Progress Tracking** - Monitor task status and completion
 
 ## Installation
@@ -92,6 +95,8 @@ Resolution order is:
 3. default `~/.ralph`
 
 Each Ralph home has its own `config.json`, `tasks/`, `manager/state.json`, `manager.lock`, `scheduler.lock`, `locks/`, `logs/`, queue view, and `runner.maxConcurrent`. This is the supported way to run two different repos on one machine with clean isolation while still sharing one Ralph CLI binary.
+
+If you intentionally share one Ralph home across repos, coordination remains repo-scoped, and `ralph queue`, `ralph manager-status`, and `ralph doctor` report `repoCount`, `mixedRepos`, and active `repoPaths` so the mixed control plane is visible.
 
 ### Start a new task
 
@@ -174,7 +179,7 @@ ralph --home ~/.ralph-homes/app-b manager --repo ~/Code/app-b
 
 Each home gets its own manager state and lock, so those two managers can run concurrently.
 
-Use `ralph manager-status` to inspect the current manager PID, heartbeat age, loop timing, and stale status. `ralph doctor` includes the same manager health signal in its JSON output.
+Use `ralph manager-status` to inspect the current manager PID, heartbeat age, loop timing, stale status, and active repo summary for the current Ralph home. `ralph doctor` includes the same manager health signal in its JSON output.
 
 ### Keep the manager running with launchd
 
@@ -199,9 +204,12 @@ For the default home, launchd still uses the legacy label `com.ralph.manager`. F
 
 ```bash
 ralph queue
+ralph queue --watch
 ```
 
-The queue view reports pending reasons, dependency blockers, slot usage, lease owner/expiry, story progress, and the next expected action.
+The queue view now acts as the main aggregated runtime snapshot for one Ralph home. It reports manager heartbeat/code-drift status, pending reasons, dependency blockers, coordination blockers, integration lanes, slot usage, lease owner/expiry, story progress, attention candidates, and the next expected action for each active task. A task can remain `pending` with reason `coordination` when an earlier same-repo task declared an overlapping write surface or conflict domain.
+
+Use `ralph queue --watch` to keep one long-lived process open and emit fresh JSON snapshots on an interval instead of repeatedly spawning separate `queue`, `manager-status`, and `list` calls.
 
 ### Preflight the environment
 
@@ -210,7 +218,7 @@ ralph doctor
 ralph doctor --repo ~/Code/my-project
 ```
 
-`doctor` checks git availability, repo validity, dirty working tree risk, Codex availability, backend configuration, and runner concurrency settings.
+`doctor` checks git availability, repo validity, dirty working tree risk, Codex availability, backend configuration, runner concurrency settings, manager health, and whether the current Ralph home is carrying active tasks for multiple repos.
 
 ### Cleanup old task worktrees
 
@@ -272,6 +280,8 @@ Merge runs in a dedicated `.ralph-integration/<target>` worktree by default. Com
 
 Conflict handling is deliberately conservative. Unattended auto-merge defaults to `merge.strategy=manual`; when Git reports conflicts, Ralph records structured conflict metadata (`mergeConflictFiles`, integration branch/worktree, and repair attempts) and routes the task through merge-repair context instead of silently choosing `ours` or `theirs`. The destructive `ours`/`theirs` strategies are only intended for explicit manual merge commands, or for installations that deliberately set `merge.allowDestructiveAutoResolve=true`.
 
+Before finalize or merge, Ralph also acquires a repo-scoped integration lane lock and can block on earlier same-repo tasks with overlapping declared or observed surfaces. This preserves shared integration state without forcing unrelated repos onto one global single queue.
+
 ### Reset stagnation detection
 
 ```bash
@@ -296,6 +306,9 @@ Ralph CLI supports both JSON and Markdown formats for PRD files.
   "id": "prd-auth",
   "title": "User Authentication System",
   "description": "Implement secure user authentication with JWT",
+  "writeSurface": ["src/auth", "package.json"],
+  "conflictDomains": ["auth", "db/users"],
+  "integrationLane": "main",
   "userStories": [
     {
       "id": "US-001",
@@ -329,6 +342,13 @@ Ralph CLI supports both JSON and Markdown formats for PRD files.
 id: prd-auth
 title: User Authentication System
 description: Implement secure user authentication with JWT
+writeSurface:
+  - src/auth
+  - package.json
+conflictDomains:
+  - auth
+  - db/users
+integrationLane: main
 userStories:
   - id: US-001
     title: User Registration
@@ -354,17 +374,28 @@ This PRD implements a secure authentication system using industry best practices
 
 Ralph also supports Markdown body sections like `## US-001: Title` or `### US-001: Title` with `**Description**` and `**Acceptance Criteria**` blocks.
 
+Optional coordination fields:
+
+- `writeSurface`: predicted files, directories, or package roots this task is expected to touch
+- `conflictDomains`: coarse overlap tags when file lists would be too narrow or unstable
+- `integrationLane`: serialization lane for finalize/merge; defaults to the merge target branch when omitted
+
+Ralph uses declared coordination metadata at intake and queue start, then captures observed diff/package surface again before finalize or merge.
+
 ## How It Works
 
 1. **Parse PRD** - Ralph reads your PRD file and extracts user stories
-2. **Capture Intake Metadata** - Persists PRD id/title/dependencies/source hash, queue time, base ref, and merge target into task state
+2. **Capture Intake Metadata** - Persists PRD id/title/dependencies/source hash, queue time, base ref, merge target, and optional coordination hints into task state
 3. **Create Worktree** - Creates a git worktree from the captured base ref for isolated development
 4. **Spawn Agent** - Launches Codex by default, or Claude Code when requested
 5. **Track Progress** - Maintains revisioned state in `~/.ralph/tasks/<task-id>/`
-6. **Require Objective Evidence** - A story is not marked passed from a success message alone; Ralph requires a diff or commit evidence
+6. **Require Objective Evidence** - A story is not marked passed from a success message alone; Ralph requires diff or commit evidence
 7. **Quality Gates** - Runs available `typecheck`, `lint`, `test`, and `build` scripts before the restricted final commit
-8. **Watch + Queue** - `ralph watch` can keep the queue moving, recover stale leases, finalize ready tasks, and auto-ingest new ez4ielts PRDs
-9. **Complete / Integrate** - Marks task as completed after finalization; dependency chains wait for integrated upstream tasks
+8. **Coordinate Queue Starts** - Before a pending task starts, Ralph compares its declared coordination metadata against earlier active tasks in the same repo
+9. **Capture Observed Surface** - When a task becomes ready to finalize, Ralph records the actual changed files and affected package roots from git
+10. **Serialize Finalize / Merge** - Finalize and merge run under a repo-scoped integration lane lock and re-check overlap before changing shared integration state
+11. **Watch + Queue** - `ralph watch` can keep the queue moving, recover stale leases, finalize ready tasks, and auto-ingest new ez4ielts PRDs
+12. **Complete / Integrate** - Marks task as completed after finalization; dependency chains wait for integrated upstream tasks
 
 ## State Management
 
@@ -405,6 +436,9 @@ Task state is stored in `~/.ralph/tasks/<task-id>/state.json`:
   "agent": "codex",
   "backend": "cli",
   "repoPath": "/path/to/repo",
+  "declaredWriteSurface": ["src/auth", "package.json"],
+  "declaredConflictDomains": ["auth", "db/users"],
+  "integrationLane": "main",
   "loopCount": 1,
   "consecutiveNoProgress": 0,
   "consecutiveErrors": 0,
@@ -412,6 +446,8 @@ Task state is stored in `~/.ralph/tasks/<task-id>/state.json`:
   "lastFilesChanged": 3
 }
 ```
+
+Tasks that have reached finalize or merge can also record `observedWriteSurface`, `observedPackageSurface`, `surfaceCapturedAt`, `coordinationStatus`, `coordinationPhase`, `coordinationBlockers`, and `coordinationReason`. When Ralph detects overlap, it records a `coordination_blocked` event and leaves the task waiting instead of forcing a failed finalize/merge state.
 
 ## Agents
 
@@ -431,7 +467,7 @@ ralph start ./prd.json --agent claude
 
 ### agent-runners backend
 
-Uses the unified agent-runners path and preserves Claude session IDs / Codex thread IDs across user stories.
+Uses the unified agent-runners path. Claude session IDs are preserved for continuation, while Codex thread reuse is scoped by `agent.codexConversationScope` and defaults to same-story retry only.
 
 **Command:**
 ```bash
@@ -481,20 +517,28 @@ Ralph CLI stores configuration in `~/.ralph/config.json`:
     "agentRunnersPath": "/absolute/path/to/agent-runners/dist/cli.js",
     "sdkRunnerPath": "",
     "timeout": 600,
-    "model": "claude-opus-4-6-thinking-xchai"
+    "model": "claude-opus-4-6-thinking-xchai",
+    "codexConversationScope": "story"
   },
   "runner": {
     "maxConcurrent": 3,
     "stagnationTimeout": 1800,
     "pollInterval": 10,
     "leaseTimeout": 300,
-    "maxStoryAttempts": 2
+    "maxStoryAttempts": 2,
+    "maxTransientRetriesPerStory": 3,
+    "transientRetryBaseDelaySeconds": 15,
+    "transientRetryMaxDelaySeconds": 180
   },
   "finalizer": {
     "qualityGateTimeout": 600,
     "leaseTimeout": 1800,
     "qualityGates": ["typecheck", "lint", "test", "build"],
-    "maxRepairAttempts": 1
+    "repairPolicy": "progress",
+    "maxRepairAttempts": 1,
+    "maxNoProgressRepairRounds": 2,
+    "repairDeadlineSeconds": 7200,
+    "repairHardCap": 20
   },
   "ingestion": {
     "ez4ielts": {
@@ -507,7 +551,7 @@ Ralph CLI stores configuration in `~/.ralph/config.json`:
 }
 ```
 
-`agent.backend` defaults to `cli` in new configs. New tasks also default to Codex unless `--agent claude` is passed. `agent.agentRunnersPath` (or `RALPH_AGENT_RUNNERS_CLI`) points at the unified agent-runners CLI when you choose the `agent-runners` backend, `agent.timeout` is measured in seconds, `runner.leaseTimeout` and `finalizer.leaseTimeout` are measured in seconds unless you pass a value >= 1000 (treated as milliseconds), `runner.maxStoryAttempts` controls bounded repair attempts per story, `finalizer.qualityGates` controls which package scripts run before final commit, `finalizer.maxRepairAttempts` controls how many failed-finalize tasks can be routed back to repair, `finalizer.qualityGateTimeout` follows the same unit rule, and `agent.model` is only used for Claude runs. `agent.path` is kept for Codex CLI path compatibility.
+`agent.backend` defaults to `cli` in new configs. New tasks also default to Codex unless `--agent claude` is passed. `agent.agentRunnersPath` (or `RALPH_AGENT_RUNNERS_CLI`) points at the unified agent-runners CLI when you choose the `agent-runners` backend, `agent.timeout` is measured in seconds, `agent.codexConversationScope` accepts `attempt`, `story`, or `task` and controls whether agent-runners may pass `--resume-thread` for Codex, `runner.leaseTimeout` and `finalizer.leaseTimeout` are measured in seconds unless you pass a value >= 1000 (treated as milliseconds), `runner.maxStoryAttempts` controls bounded repair attempts per story, `runner.maxTransientRetriesPerStory` plus the transient retry delay settings control automatic backoff for transient provider/runtime failures, `finalizer.qualityGates` controls which package scripts run before final commit, `finalizer.repairPolicy=progress` keeps retrying while a repair round still makes measurable progress, `finalizer.maxRepairAttempts` bounds failed-finalize repair recycling, `finalizer.maxNoProgressRepairRounds` limits stagnant repair loops, `finalizer.repairDeadlineSeconds` applies a wall-clock cutoff, `finalizer.repairHardCap` is the absolute repair ceiling, `finalizer.qualityGateTimeout` follows the same unit rule, and `agent.model` is only used for Claude runs. `agent.path` is kept for Codex CLI path compatibility.
 
 Legacy `agent.sdkRunnerPath` and `RALPH_SDK_RUNNER_CLI` are still accepted for compatibility.
 
@@ -567,6 +611,9 @@ src/
 │   ├── worktree.ts    # Git worktree operations
 │   ├── agent.ts       # Agent execution
 │   ├── task-intake.ts # Shared PRD queueing logic
+│   ├── task-coordination.ts # Repo-scoped overlap detection and integration lanes
+│   ├── task-home-summary.ts # Active repo summary for shared Ralph homes
+│   ├── merge-task-updates.ts # Shared task state updates for merge outcomes
 │   ├── prd-auto-ingest.ts # ez4ielts PRD auto-ingestion
 │   └── merge.ts       # Merge operations
 ├── commands/
@@ -578,6 +625,9 @@ src/
 │   ├── update.ts      # Update command
 │   ├── retry.ts       # Retry command
 │   ├── merge.ts       # Merge command
+│   ├── queue.ts       # Queue inspection
+│   ├── manager-status.ts # Manager heartbeat/status
+│   ├── doctor.ts      # Environment + control-plane checks
 │   ├── stats.ts       # Statistics command
 │   └── completion.ts  # Shell completion
 ├── config/

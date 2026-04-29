@@ -14,4 +14,7 @@ export interface PRD {
   description: string;
   userStories: UserStory[];
   dependencies?: string[];
+  writeSurface?: string[];
+  conflictDomains?: string[];
+  integrationLane?: string;
 }

@@ -67,11 +67,12 @@ export function resolveFinalizeRepairConfig(config: Pick<{ get(key: string): unk
 }
 
 export function captureFinalizeRepairSnapshot(
-  task: Pick<Task, 'worktree' | 'baseCommitSha' | 'mergeConflictFiles' | 'mergeError' | 'lastError'>,
+  task: Pick<Task, 'worktree' | 'baseCommitSha' | 'mergeConflictFiles' | 'mergeError' | 'lastError' | 'finalizerFailure'>,
   capturedAt = Date.now()
 ): FinalizeRepairSnapshot {
   const changedFilesInWorktree = getChangedFilesCount(task.worktree);
   const changedFilesFromBase = getDiffFilesCountFromBase(task.worktree, task.baseCommitSha);
+  const finalizerFailure = task.finalizerFailure;
 
   return {
     headSha: getLatestCommitSHA(task.worktree) || undefined,
@@ -79,7 +80,15 @@ export function captureFinalizeRepairSnapshot(
     changedFiles: Math.max(changedFilesInWorktree, changedFilesFromBase),
     worktreeDiffSignature: getWorktreeDiffSignature(task.worktree),
     failureKind: detectFinalizeRepairFailureKind(task),
-    failureSignature: normalizeFailureSignature(task.mergeError || task.lastError || ''),
+    failureSignature: normalizeFailureSignature(task),
+    failureClass: finalizerFailure?.class,
+    gate: finalizerFailure?.gate,
+    packageLabel: finalizerFailure?.packageLabel,
+    diagnosticCount: finalizerFailure?.diagnosticCount,
+    diagnosticSignature: finalizerFailure?.diagnosticSignature,
+    failedFilesSignature: buildListSignature(finalizerFailure?.failedFiles),
+    failedCodesSignature: buildListSignature(finalizerFailure?.failedCodes),
+    failedSymbolsSignature: buildListSignature(finalizerFailure?.failedSymbols),
     conflictSignature: buildConflictSignature(task.mergeConflictFiles),
     capturedAt,
   };
@@ -93,6 +102,7 @@ export function evaluateFinalizeRepairFailure(
     | 'mergeConflictFiles'
     | 'mergeError'
     | 'lastError'
+    | 'finalizerFailure'
     | 'finalizeRepairStartedAt'
     | 'finalizeRepairDeadlineAt'
     | 'finalizeRepairLastFailureSnapshot'
@@ -255,10 +265,14 @@ function sanitizeCount(value: unknown, fallback: number): number {
 }
 
 function detectFinalizeRepairFailureKind(
-  task: Pick<Task, 'mergeConflictFiles' | 'mergeError' | 'lastError'>
+  task: Pick<Task, 'mergeConflictFiles' | 'mergeError' | 'lastError' | 'finalizerFailure'>
 ): FinalizeRepairFailureKind {
   if (task.mergeConflictFiles?.length || /merge conflicts detected/i.test(task.mergeError || task.lastError || '')) {
     return 'merge_conflict';
+  }
+
+  if (task.finalizerFailure?.failureKind) {
+    return task.finalizerFailure.failureKind;
   }
 
   if (/quality gate/i.test(task.mergeError || task.lastError || '')) {
@@ -268,11 +282,37 @@ function detectFinalizeRepairFailureKind(
   return 'finalizer_error';
 }
 
-function normalizeFailureSignature(message: string): string {
-  return message
+function normalizeFailureSignature(
+  task: Pick<Task, 'mergeError' | 'lastError' | 'finalizerFailure'>
+): string {
+  if (task.finalizerFailure?.diagnosticSignature) {
+    return task.finalizerFailure.diagnosticSignature.slice(0, 500);
+  }
+
+  if (task.finalizerFailure) {
+    return [
+      task.finalizerFailure.class,
+      task.finalizerFailure.gate,
+      task.finalizerFailure.packageLabel,
+      task.finalizerFailure.rawMessage,
+    ]
+      .filter(Boolean)
+      .join(' | ')
+      .slice(0, 500);
+  }
+
+  return (task.mergeError || task.lastError || '')
     .replace(/\s+/g, ' ')
     .trim()
     .slice(0, 500);
+}
+
+function buildListSignature(entries?: string[]): string | undefined {
+  if (!entries || entries.length === 0) {
+    return undefined;
+  }
+
+  return [...new Set(entries)].sort().join('\n');
 }
 
 function buildConflictSignature(conflictFiles?: string[]): string | undefined {
@@ -288,28 +328,74 @@ function compareFinalizeRepairSnapshots(
   current: FinalizeRepairSnapshot
 ): FinalizeRepairComparison {
   const reasons: string[] = [];
+  const mergeConflictLoop = previous.failureKind === 'merge_conflict'
+    && current.failureKind === 'merge_conflict';
+  const hasStructuredDiagnostics = (
+    previous.diagnosticCount !== undefined
+    || current.diagnosticCount !== undefined
+    || Boolean(previous.diagnosticSignature)
+    || Boolean(current.diagnosticSignature)
+  );
 
-  if (previous.headSha && current.headSha && previous.headSha !== current.headSha) {
-    reasons.push('HEAD changed');
+  if (mergeConflictLoop) {
+    if (didConflictSetShrink(previous.conflictSignature, current.conflictSignature)) {
+      reasons.push('conflict file set shrank');
+    }
+  } else if (hasStructuredDiagnostics) {
+    if (
+      previous.diagnosticCount !== undefined
+      && current.diagnosticCount !== undefined
+      && current.diagnosticCount < previous.diagnosticCount
+    ) {
+      reasons.push(`diagnostic count ${previous.diagnosticCount} -> ${current.diagnosticCount}`);
+    }
+
+    if (didListShrink(previous.failedFilesSignature, current.failedFilesSignature)) {
+      reasons.push('failed file set shrank');
+    }
+
+    if (didListShrink(previous.failedCodesSignature, current.failedCodesSignature)) {
+      reasons.push('failed diagnostic code set shrank');
+    }
+
+    if (didListShrink(previous.failedSymbolsSignature, current.failedSymbolsSignature)) {
+      reasons.push('failed symbol set shrank');
+    }
+
+    if (
+      previous.diagnosticSignature
+      && current.diagnosticSignature
+      && previous.diagnosticSignature !== current.diagnosticSignature
+    ) {
+      reasons.push('diagnostic signature changed');
+    }
+
+    if (previous.gate && current.gate && previous.gate !== current.gate) {
+      reasons.push(`quality gate advanced ${previous.gate} -> ${current.gate}`);
+    }
+  } else {
+    if (previous.headSha && current.headSha && previous.headSha !== current.headSha) {
+      reasons.push('HEAD changed');
+    }
+
+    if (
+      previous.worktreeDiffSignature
+      && current.worktreeDiffSignature
+      && previous.worktreeDiffSignature !== current.worktreeDiffSignature
+    ) {
+      reasons.push('worktree diff changed');
+    }
+
+    if (previous.changedFiles !== current.changedFiles) {
+      reasons.push(`changed files ${previous.changedFiles} -> ${current.changedFiles}`);
+    }
+
+    if (previous.commitsAheadOfBase !== current.commitsAheadOfBase) {
+      reasons.push(`commits ahead of base ${previous.commitsAheadOfBase} -> ${current.commitsAheadOfBase}`);
+    }
   }
 
-  if (
-    previous.worktreeDiffSignature
-    && current.worktreeDiffSignature
-    && previous.worktreeDiffSignature !== current.worktreeDiffSignature
-  ) {
-    reasons.push('worktree diff changed');
-  }
-
-  if (previous.changedFiles !== current.changedFiles) {
-    reasons.push(`changed files ${previous.changedFiles} -> ${current.changedFiles}`);
-  }
-
-  if (previous.commitsAheadOfBase !== current.commitsAheadOfBase) {
-    reasons.push(`commits ahead of base ${previous.commitsAheadOfBase} -> ${current.commitsAheadOfBase}`);
-  }
-
-  if (didConflictSetShrink(previous.conflictSignature, current.conflictSignature)) {
+  if (!mergeConflictLoop && didConflictSetShrink(previous.conflictSignature, current.conflictSignature)) {
     reasons.push('conflict file set shrank');
   }
 
@@ -324,6 +410,10 @@ function compareFinalizeRepairSnapshots(
 }
 
 function didConflictSetShrink(previous?: string, current?: string): boolean {
+  return didListShrink(previous, current);
+}
+
+function didListShrink(previous?: string, current?: string): boolean {
   if (!previous || !current) {
     return false;
   }

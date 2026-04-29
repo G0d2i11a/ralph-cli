@@ -5,8 +5,10 @@ const os = require('node:os');
 const path = require('node:path');
 
 const {
+  getIntegrationLaneLockDir,
   getRepoMergeLockDir,
   getTaskFinalizeLockDir,
+  withIntegrationLaneLock,
   withRepoMergeLock,
   withTaskFinalizeLock,
 } = require('../dist/core/locks.js');
@@ -104,4 +106,48 @@ test('lock directories are isolated across different Ralph homes', async () => {
   } finally {
     fs.rmSync(tempDir, { recursive: true, force: true });
   }
+});
+
+test('withIntegrationLaneLock serializes concurrent callers for the same repo and lane', async () => {
+  const events = [];
+  let releaseFirst;
+  let secondStarted = false;
+  const repoPath = '/tmp/ralph-lock-repo';
+  const lane = 'main';
+
+  const first = withIntegrationLaneLock(repoPath, lane, async () => {
+    events.push('first-start');
+    await new Promise((resolve) => {
+      releaseFirst = resolve;
+    });
+    events.push('first-end');
+  });
+
+  await new Promise((resolve) => setTimeout(resolve, 100));
+
+  const second = withIntegrationLaneLock(repoPath, lane, async () => {
+    secondStarted = true;
+    events.push('second-start');
+    events.push('second-end');
+  });
+
+  await new Promise((resolve) => setTimeout(resolve, 100));
+  assert.equal(secondStarted, false);
+
+  releaseFirst();
+  await Promise.all([first, second]);
+
+  assert.deepEqual(events, [
+    'first-start',
+    'first-end',
+    'second-start',
+    'second-end',
+  ]);
+});
+
+test('integration lane lock directories vary by lane', () => {
+  const laneA = getIntegrationLaneLockDir('/tmp/repo', 'main');
+  const laneB = getIntegrationLaneLockDir('/tmp/repo', 'contracts');
+
+  assert.notEqual(laneA, laneB);
 });

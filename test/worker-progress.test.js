@@ -75,3 +75,55 @@ test('detectProgress notices HEAD changes even when commit count stays constant'
     fs.rmSync(repoPath, { recursive: true, force: true });
   }
 });
+
+test('detectProgress ignores .git-local-only worktree changes', () => {
+  const repoPath = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-worker-git-local-progress-'));
+
+  try {
+    git(repoPath, ['init']);
+    git(repoPath, ['config', 'user.email', 'test@example.com']);
+    git(repoPath, ['config', 'user.name', 'Test User']);
+
+    const filePath = path.join(repoPath, 'tracked.txt');
+    fs.writeFileSync(filePath, 'base\n');
+    git(repoPath, ['add', 'tracked.txt']);
+    git(repoPath, ['commit', '-m', 'initial']);
+
+    const baseline = captureProgressBaseline(repoPath);
+    fs.mkdirSync(path.join(repoPath, '.git-local'), { recursive: true });
+    fs.writeFileSync(path.join(repoPath, '.git-local', 'HEAD'), 'metadata only\n');
+
+    const progress = detectProgress(repoPath, path.join(repoPath, 'agent.log'), baseline);
+
+    assert.equal(progress.hasProgress, false);
+  } finally {
+    fs.rmSync(repoPath, { recursive: true, force: true });
+  }
+});
+
+test('detectProgress ignores commits that only touch .git-local', () => {
+  const repoPath = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-worker-git-local-commit-'));
+
+  try {
+    git(repoPath, ['init']);
+    git(repoPath, ['config', 'user.email', 'test@example.com']);
+    git(repoPath, ['config', 'user.name', 'Test User']);
+
+    const filePath = path.join(repoPath, 'tracked.txt');
+    fs.writeFileSync(filePath, 'base\n');
+    git(repoPath, ['add', 'tracked.txt']);
+    git(repoPath, ['commit', '-m', 'initial']);
+
+    const baseline = captureProgressBaseline(repoPath);
+    fs.mkdirSync(path.join(repoPath, '.git-local'), { recursive: true });
+    fs.writeFileSync(path.join(repoPath, '.git-local', 'HEAD'), 'metadata only\n');
+    git(repoPath, ['add', '.git-local']);
+    git(repoPath, ['commit', '-m', 'chore: metadata only']);
+
+    const progress = detectProgress(repoPath, path.join(repoPath, 'agent.log'), baseline);
+
+    assert.equal(progress.hasProgress, false);
+  } finally {
+    fs.rmSync(repoPath, { recursive: true, force: true });
+  }
+});

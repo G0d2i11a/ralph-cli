@@ -2,6 +2,7 @@ import { execFileSync } from 'child_process';
 import { createHash } from 'crypto';
 import * as fs from 'fs';
 import * as path from 'path';
+import { filterGitInternalPaths } from './git-internal-paths';
 
 const WORKTREE_GIT_MAX_BUFFER = 20 * 1024 * 1024;
 
@@ -38,6 +39,25 @@ function tryRunGit(worktreePath: string, args: string[]): string {
   }
 }
 
+function listChangedPathsAgainstHead(worktreePath: string): string[] {
+  const diffFiles = tryRunGit(worktreePath, ['diff', '--name-only', '-z', 'HEAD', '--']);
+  const untrackedFiles = tryRunGit(worktreePath, ['ls-files', '--others', '--exclude-standard', '-z']);
+
+  return filterGitInternalPaths([
+    ...diffFiles.split('\0').filter(Boolean),
+    ...untrackedFiles.split('\0').filter(Boolean),
+  ]);
+}
+
+function listChangedPathsBetweenRefs(worktreePath: string, fromRef: string, toRef: string = 'HEAD'): string[] {
+  if (!fromRef.trim()) {
+    return [];
+  }
+
+  const diffFiles = tryRunGit(worktreePath, ['diff', '--name-only', '-z', `${fromRef}..${toRef}`, '--']);
+  return filterGitInternalPaths(diffFiles.split('\0').filter(Boolean));
+}
+
 export function captureProgressBaseline(worktreePath: string): ProgressBaseline {
   return {
     commitSHA: getLatestCommitSHA(worktreePath),
@@ -55,8 +75,11 @@ export function detectProgress(
 ): ProgressResult {
   const currentCommitCount = getCommitCount(worktreePath);
   const newCommits = currentCommitCount - baseline.commitCount;
+  const relevantCommittedPaths = baseline.commitSHA
+    ? listChangedPathsBetweenRefs(worktreePath, baseline.commitSHA)
+    : [];
 
-  if (newCommits > 0) {
+  if (newCommits > 0 && relevantCommittedPaths.length > 0) {
     return {
       hasProgress: true,
       reason: `${newCommits} new commit(s)`,
@@ -67,7 +90,12 @@ export function detectProgress(
   }
 
   const currentCommitSHA = getLatestCommitSHA(worktreePath);
-  if (currentCommitSHA && baseline.commitSHA && currentCommitSHA !== baseline.commitSHA) {
+  if (
+    currentCommitSHA
+    && baseline.commitSHA
+    && currentCommitSHA !== baseline.commitSHA
+    && relevantCommittedPaths.length > 0
+  ) {
     return {
       hasProgress: true,
       reason: 'HEAD commit changed',
@@ -125,18 +153,11 @@ export function detectProgress(
 export function getWorktreeDiffSignature(worktreePath: string): string {
   try {
     const hash = createHash('sha256');
-    hash.update(tryRunGit(worktreePath, ['status', '--porcelain=v1', '-z']));
-    hash.update('\0diff\0');
-    hash.update(tryRunGit(worktreePath, ['diff', '--binary', 'HEAD', '--']));
+    const changedPaths = listChangedPathsAgainstHead(worktreePath).sort();
 
-    const untrackedFiles = tryRunGit(worktreePath, ['ls-files', '--others', '--exclude-standard', '-z'])
-      .split('\0')
-      .filter(Boolean)
-      .sort();
-
-    for (const relativePath of untrackedFiles) {
+    for (const relativePath of changedPaths) {
       const absolutePath = path.join(worktreePath, relativePath);
-      hash.update('\0untracked\0');
+      hash.update('\0path\0');
       hash.update(relativePath);
       try {
         const stats = fs.statSync(absolutePath);
@@ -186,11 +207,7 @@ export function getCommitCountAheadOfBase(worktreePath: string, baseCommitSha?: 
 
 export function getChangedFilesCount(worktreePath: string): number {
   try {
-    return runGit(worktreePath, ['status', '--porcelain'])
-      .trim()
-      .split('\n')
-      .filter((line) => line.length > 0)
-      .length;
+    return listChangedPathsAgainstHead(worktreePath).length;
   } catch {
     return 0;
   }
@@ -202,11 +219,7 @@ export function getDiffFilesCountFromBase(worktreePath: string, baseCommitSha?: 
   }
 
   try {
-    return runGit(worktreePath, ['diff', '--name-only', baseCommitSha, '--'])
-      .trim()
-      .split('\n')
-      .filter(Boolean)
-      .length;
+    return listChangedPathsBetweenRefs(worktreePath, baseCommitSha).length;
   } catch {
     return 0;
   }

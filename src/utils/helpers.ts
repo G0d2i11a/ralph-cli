@@ -4,6 +4,8 @@ import matter from 'gray-matter';
 import type { PRD, UserStory } from '../types/prd';
 import type { Task } from '../types/task';
 import type { StateManager } from '../core/state';
+import { deriveTaskDeliveryStatus, resolveTaskIntegrationStatus } from '../core/task-delivery';
+import { evaluateAutoRecovery } from '../core/auto-recovery-state';
 
 // Stagnation detection thresholds
 export const STAGNATION_THRESHOLDS = {
@@ -31,6 +33,30 @@ function normalizeStringArray(value: unknown): string[] {
     .filter(Boolean);
 }
 
+function normalizeOptionalStringArray(value: unknown): string[] | undefined {
+  const normalized = normalizeStringArray(value);
+  return normalized.length > 0 ? normalized : undefined;
+}
+
+function resolvePrdTitle(prd: Partial<PRD> & Record<string, unknown>, fallbackId: string): string {
+  const explicitTitle = normalizeString(prd.title);
+  if (explicitTitle) {
+    return explicitTitle;
+  }
+
+  const projectName = normalizeString(prd.projectName);
+  if (projectName) {
+    return projectName;
+  }
+
+  const normalizedId = normalizeString(prd.id);
+  if (normalizedId) {
+    return normalizedId;
+  }
+
+  return fallbackId;
+}
+
 function normalizeUserStory(value: unknown, index: number): UserStory {
   const raw = (value && typeof value === 'object') ? value as Partial<UserStory> : {};
   const fallbackId = `US-${String(index + 1).padStart(3, '0')}`;
@@ -46,17 +72,20 @@ function normalizeUserStory(value: unknown, index: number): UserStory {
   };
 }
 
-function normalizePrd(prd: Partial<PRD>, fallbackId: string): PRD {
+function normalizePrd(prd: Partial<PRD> & Record<string, unknown>, fallbackId: string): PRD {
   const userStories = Array.isArray(prd.userStories)
     ? prd.userStories.map((story, index) => normalizeUserStory(story, index))
     : [];
 
   return {
     id: normalizeString(prd.id, fallbackId),
-    title: normalizeString(prd.title, 'Untitled PRD'),
+    title: resolvePrdTitle(prd, fallbackId),
     description: normalizeString(prd.description),
     userStories,
     dependencies: normalizeStringArray(prd.dependencies),
+    writeSurface: normalizeOptionalStringArray(prd.writeSurface),
+    conflictDomains: normalizeOptionalStringArray(prd.conflictDomains),
+    integrationLane: normalizeString(prd.integrationLane) || undefined,
   };
 }
 
@@ -69,6 +98,39 @@ export function parsePRD(prdPath: string): PRD {
   }
 
   return parsePRDContent(content, prdPath);
+}
+
+function parseRawPrdMetadata(prdPath: string): Record<string, unknown> {
+  const content = fs.readFileSync(prdPath, 'utf-8');
+
+  if (path.extname(prdPath).toLowerCase() === '.json') {
+    const parsed = JSON.parse(content);
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      throw new Error(`PRD ${path.basename(prdPath)} must be a JSON object`);
+    }
+    return parsed as Record<string, unknown>;
+  }
+
+  const parsed = matter(content);
+  return (parsed.data && typeof parsed.data === 'object' && !Array.isArray(parsed.data))
+    ? parsed.data as Record<string, unknown>
+    : {};
+}
+
+export function hasExplicitPrdTitle(prdPath: string): boolean {
+  const metadata = parseRawPrdMetadata(prdPath);
+  return typeof metadata.title === 'string' && metadata.title.trim().length > 0;
+}
+
+export function assertPrdHasExplicitTitle(prdPath: string): void {
+  if (hasExplicitPrdTitle(prdPath)) {
+    return;
+  }
+
+  throw new Error(
+    `PRD ${path.basename(prdPath)} must define a non-empty top-level title. `
+    + `Add a title field instead of relying on projectName or filename fallback.`
+  );
 }
 
 export function parsePRDContent(content: string, prdPath: string = 'prd.json'): PRD {
@@ -94,6 +156,9 @@ export function parsePRDContent(content: string, prdPath: string = 'prd.json'): 
     description: frontmatter.description,
     userStories: frontmatterStories && frontmatterStories.length > 0 ? frontmatterStories : bodyStories,
     dependencies: frontmatter.dependencies,
+    writeSurface: frontmatter.writeSurface,
+    conflictDomains: frontmatter.conflictDomains,
+    integrationLane: frontmatter.integrationLane,
   }, fallbackId);
 }
 
@@ -232,35 +297,191 @@ export function detectStagnation(
   return { isStagnant: false };
 }
 
+export type DependencyBlockerKind =
+  | 'missing'
+  | 'pending'
+  | 'running'
+  | 'finalizing'
+  | 'not_integrated'
+  | 'integration_failed'
+  | 'integration_blocked_conflict'
+  | 'task_failed'
+  | 'task_stagnant'
+  | 'finalize_failed';
+
+export interface DependencyBlocker {
+  prdId: string;
+  taskId?: string;
+  status?: Task['status'];
+  integrationStatus?: ReturnType<typeof resolveTaskIntegrationStatus>;
+  kind: DependencyBlockerKind;
+  reason: string;
+  retryable?: boolean;
+  autoRecoveryActive?: boolean;
+  attentionRequired: boolean;
+}
+
+export interface DependencyCheckResult {
+  satisfied: boolean;
+  pending: string[];
+  blockers: DependencyBlocker[];
+  failed: string[];
+  recovering: string[];
+  missing: string[];
+}
+
+function classifyDependencyBlocker(depId: string, depTask: Task | null): DependencyBlocker | null {
+  if (!depTask) {
+    return {
+      prdId: depId,
+      kind: 'missing',
+      reason: 'dependency task has not been enqueued',
+      attentionRequired: false,
+    };
+  }
+
+  const integrationStatus = resolveTaskIntegrationStatus(depTask);
+  const deliveryStatus = deriveTaskDeliveryStatus(depTask);
+  const integrated = depTask.status === 'completed'
+    && deliveryStatus.integrationStatus === 'integrated';
+
+  if (integrated) {
+    return null;
+  }
+
+  const autoRecoveryActive = evaluateAutoRecovery(depTask).active;
+  const base = {
+    prdId: depId,
+    taskId: depTask.id,
+    status: depTask.status,
+    integrationStatus,
+    retryable: depTask.lastErrorRetryable,
+    autoRecoveryActive,
+  };
+
+  if (depTask.status === 'failed') {
+    return {
+      ...base,
+      kind: 'task_failed',
+      reason: depTask.lastError || 'dependency task failed',
+      attentionRequired: !autoRecoveryActive,
+    };
+  }
+
+  if (depTask.status === 'stagnant') {
+    return {
+      ...base,
+      kind: 'task_stagnant',
+      reason: depTask.lastError || 'dependency task is stagnant',
+      attentionRequired: !autoRecoveryActive,
+    };
+  }
+
+  if (depTask.status === 'failed_finalize') {
+    return {
+      ...base,
+      kind: 'finalize_failed',
+      reason: depTask.lastError || 'dependency finalization failed',
+      attentionRequired: !autoRecoveryActive,
+    };
+  }
+
+  if (depTask.status === 'completed') {
+    if (integrationStatus === 'failed') {
+      return {
+        ...base,
+        kind: 'integration_failed',
+        reason: depTask.mergeError || depTask.lastError || 'dependency integration failed',
+        attentionRequired: !autoRecoveryActive,
+      };
+    }
+
+    if (integrationStatus === 'blocked_conflict') {
+      return {
+        ...base,
+        kind: 'integration_blocked_conflict',
+        reason: depTask.mergeError || depTask.lastError || 'dependency integration is blocked by conflicts',
+        attentionRequired: !autoRecoveryActive,
+      };
+    }
+
+    return {
+      ...base,
+      kind: 'not_integrated',
+      reason: 'dependency completed but has not been integrated',
+      attentionRequired: false,
+    };
+  }
+
+  if (depTask.status === 'running') {
+    return {
+      ...base,
+      kind: 'running',
+      reason: 'dependency task is still running',
+      attentionRequired: false,
+    };
+  }
+
+  if (depTask.status === 'ready_to_finalize' || depTask.status === 'finalizing') {
+    return {
+      ...base,
+      kind: 'finalizing',
+      reason: 'dependency task is waiting for finalization',
+      attentionRequired: false,
+    };
+  }
+
+  return {
+    ...base,
+    kind: 'pending',
+    reason: 'dependency task is still pending',
+    attentionRequired: false,
+  };
+}
+
 export async function checkDependencies(
   prd: PRD,
   stateManager: StateManager,
   options: { repoPath?: string; task?: Task } = {}
-): Promise<{ satisfied: boolean; pending: string[] }> {
+): Promise<DependencyCheckResult> {
   if (!prd.dependencies || prd.dependencies.length === 0) {
-    return { satisfied: true, pending: [] };
+    return {
+      satisfied: true,
+      pending: [],
+      blockers: [],
+      failed: [],
+      recovering: [],
+      missing: [],
+    };
   }
 
-  const pending: string[] = [];
+  const blockers: DependencyBlocker[] = [];
 
   for (const depId of prd.dependencies) {
     const depTask = await stateManager.getTaskByPrdId(depId, {
       repoPath: options.repoPath,
     });
 
-    const isIntegrated = Boolean(
-      depTask
-      && depTask.status === 'completed'
-      && (depTask.integratedAt || depTask.integrationCommitSha || depTask.mergedAt || depTask.mergeCommitSha)
-    );
-
-    if (!isIntegrated) {
-      pending.push(depId);
+    const blocker = classifyDependencyBlocker(depId, depTask);
+    if (blocker) {
+      blockers.push(blocker);
     }
   }
 
+  const pending = blockers.map((blocker) => blocker.prdId);
+
   return {
     satisfied: pending.length === 0,
-    pending
+    pending,
+    blockers,
+    failed: blockers
+      .filter((blocker) => blocker.attentionRequired)
+      .map((blocker) => blocker.prdId),
+    recovering: blockers
+      .filter((blocker) => blocker.autoRecoveryActive && !blocker.attentionRequired)
+      .map((blocker) => blocker.prdId),
+    missing: blockers
+      .filter((blocker) => blocker.kind === 'missing')
+      .map((blocker) => blocker.prdId),
   };
 }

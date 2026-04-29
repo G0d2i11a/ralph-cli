@@ -4,3 +4,4 @@ dist/
 .DS_Store
 .ralph-worktrees/
 *.tmp
+tools/ralph-menubar/build/

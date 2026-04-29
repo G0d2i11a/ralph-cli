@@ -1,6 +1,14 @@
 import { StateManager } from '../core/state';
 import { mergeBranch, MergeStrategy } from '../core/merge';
 import { appendTaskEvent } from '../core/events';
+import { buildFailedMergeTaskUpdates, buildSuccessfulMergeTaskUpdates } from '../core/merge-task-updates';
+import { withIntegrationLaneLock } from '../core/locks';
+import { findCoordinationBlockers, resolveTaskIntegrationLane } from '../core/task-coordination';
+import {
+  buildStoryCompletionInvariantFailureUpdates,
+  evaluateTaskStoryCompletion,
+  formatStoryCompletionInvariantMessage,
+} from '../core/story-completion';
 
 export async function mergeCommand(
   taskId: string,
@@ -20,6 +28,26 @@ export async function mergeCommand(
     if (task.status !== 'completed') {
       console.error(JSON.stringify({
         error: `Task ${taskId} is not completed (status: ${task.status})`
+      }));
+      process.exit(1);
+    }
+
+    const storyCompletion = evaluateTaskStoryCompletion(task);
+    if (!storyCompletion.allStoriesPassed) {
+      const message = formatStoryCompletionInvariantMessage(task.id, 'integrate', storyCompletion);
+      await stateManager.updateTask(taskId, buildStoryCompletionInvariantFailureUpdates(message));
+      appendTaskEvent(task, {
+        type: 'story_completion_invariant_failed',
+        status: task.status,
+        message,
+        data: {
+          phase: 'integrate',
+          incompleteStories: storyCompletion.incompleteStories,
+        },
+      });
+      console.error(JSON.stringify({
+        success: false,
+        error: message,
       }));
       process.exit(1);
     }
@@ -49,26 +77,54 @@ export async function mergeCommand(
       data: { targetBranch, strategy },
     });
 
-    const result = await mergeBranch(task, targetBranch, strategy);
+    const integrationLane = resolveTaskIntegrationLane(task, targetBranch);
+    const result = await withIntegrationLaneLock(task.repoPath, integrationLane, async () => {
+      const latestTask = await stateManager.loadTask(taskId);
+      if (!latestTask) {
+        throw new Error(`Task ${taskId} not found before merge`);
+      }
+
+      const coordinationState = findCoordinationBlockers(
+        latestTask,
+        await stateManager.listTasks(),
+        'merge',
+        { targetBranch },
+      );
+      await stateManager.updateTask(taskId, {
+        integrationLane,
+        ...coordinationState.taskUpdates,
+      });
+      if (coordinationState.blocked) {
+        appendTaskEvent(latestTask, {
+          type: 'coordination_blocked',
+          status: latestTask.status,
+          message: coordinationState.reason,
+          data: {
+            phase: coordinationState.phase,
+            blockers: coordinationState.blockers,
+            lane: coordinationState.lane,
+          },
+        });
+        console.error(JSON.stringify({
+          success: false,
+          blocked: true,
+          blockers: coordinationState.blockers,
+          phase: coordinationState.phase,
+          lane: coordinationState.lane,
+          message: coordinationState.reason,
+        }));
+        process.exit(1);
+      }
+
+      return mergeBranch(latestTask, targetBranch, strategy);
+    });
 
     if (result.success) {
-      await stateManager.updateTask(taskId, {
-        status: 'completed',
-        mergedAt: Date.now(),
-        integratedAt: Date.now(),
-        mergeCommitSha: result.commitSha,
-        integrationCommitSha: result.commitSha,
-        integrationBranch: result.integrationBranch,
-        integrationWorktree: result.integrationWorktree,
-        mergeTargetBranch: targetBranch,
-        mergeStrategy: strategy,
-        mergeMessage: result.message,
-        mergeError: undefined,
-        mergeConflictFiles: undefined,
-        mergeConflictAt: undefined,
-        targetSyncedAt: result.targetSynced ? Date.now() : undefined,
-        targetSyncDeferredReason: result.targetSynced === false ? result.targetSyncMessage : undefined,
-      });
+      await stateManager.updateTask(taskId, buildSuccessfulMergeTaskUpdates(
+        result,
+        targetBranch,
+        strategy,
+      ));
       appendTaskEvent(task, {
         type: 'merge_completed',
         message: result.message,
@@ -80,15 +136,11 @@ export async function mergeCommand(
         commitSha: result.commitSha,
       }));
     } else {
-      await stateManager.updateTask(taskId, {
-        mergeTargetBranch: targetBranch,
-        mergeStrategy: strategy,
-        mergeError: result.message,
-        integrationBranch: result.integrationBranch,
-        integrationWorktree: result.integrationWorktree,
-        mergeConflictFiles: result.conflictFiles,
-        mergeConflictAt: result.hasConflicts ? Date.now() : undefined,
-      });
+      await stateManager.updateTask(taskId, buildFailedMergeTaskUpdates(
+        result,
+        targetBranch,
+        strategy,
+      ));
       appendTaskEvent(task, {
         type: 'merge_failed',
         message: result.message,

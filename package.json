@@ -8,6 +8,7 @@
   },
   "scripts": {
     "build": "tsc",
+    "build:menubar": "bash ./tools/ralph-menubar/build.sh",
     "dev": "tsc --watch",
     "test": "npm run build && node --test test/*.test.js",
     "prepare": "npm run build"

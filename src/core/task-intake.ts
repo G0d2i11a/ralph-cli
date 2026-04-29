@@ -4,9 +4,11 @@ import { createHash } from 'crypto';
 import { execFileSync } from 'child_process';
 import { ConfigManager } from '../config/manager';
 import { resolveAgentBackend, resolveAgentType, resolveConfiguredBackend } from './agent';
+import { assertRalphHomeIsolation } from './home-isolation';
+import { extractDeclaredCoordination } from './task-coordination';
 import { TaskScheduler, PendingTaskState } from './scheduler';
 import { StateManager } from './state';
-import { generateTaskId, parsePRD, saveTaskPRD } from '../utils/helpers';
+import { assertPrdHasExplicitTitle, generateTaskId, parsePRD, saveTaskPRD } from '../utils/helpers';
 import { Task, TaskStatus } from '../types/task';
 import { appendTaskEvent } from './events';
 import { getRalphPaths, RalphHomeOptions } from './paths';
@@ -17,6 +19,7 @@ export interface EnqueueTaskOptions extends RalphHomeOptions {
   repoPath?: string;
   agent?: string;
   backend?: string;
+  allowMixedHome?: boolean;
   dedupeByPrdPath?: boolean;
   allowDuplicate?: boolean;
   stateManager?: TaskStateStore;
@@ -122,7 +125,18 @@ export async function enqueueTaskFromPrd(
   });
   const now = options.now ?? (() => Date.now());
 
+  await assertRalphHomeIsolation({
+    repoPath,
+    ralphHome: options.ralphHome,
+    homeDir: options.homeDir,
+    allowMixedHome: options.allowMixedHome,
+    stateManager,
+    operation: 'enqueue tasks',
+  });
+
+  assertPrdHasExplicitTitle(resolvedPrdPath);
   const prd = parsePRD(resolvedPrdPath);
+  const declaredCoordination = extractDeclaredCoordination(prd);
   const sourceHash = hashFile(resolvedPrdPath);
   const base = resolveBaseRef(repoPath);
   const enqueuedAt = now();
@@ -165,6 +179,9 @@ export async function enqueueTaskFromPrd(
     prdTitle: prd.title,
     prdDependencies: prd.dependencies || [],
     prdSourceHash: sourceHash,
+    declaredWriteSurface: declaredCoordination.declaredWriteSurface,
+    declaredConflictDomains: declaredCoordination.declaredConflictDomains,
+    integrationLane: declaredCoordination.integrationLane,
     enqueuedAt,
     baseRef: base.baseRef,
     baseCommitSha: base.baseCommitSha,

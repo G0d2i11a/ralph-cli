@@ -1,5 +1,6 @@
 import { execFileSync } from 'child_process';
 import * as fs from 'fs';
+import { filterGitInternalPaths } from './git-internal-paths';
 import { getLatestCommitSHA } from './worktree-progress';
 
 const COMPLETION_SIGNAL_SCAN_CHARS = 250_000;
@@ -25,6 +26,13 @@ export interface SoftSuccessDecision {
   reason: string;
   signals: CompletionSignals;
   recoverableStoryId?: string;
+}
+
+export function hasStrongCompletionSignals(signals: CompletionSignals): boolean {
+  return Boolean(
+    (signals.hasCompletionSummary && (signals.hasValidationSignal || signals.hasSuggestedCommitMessage))
+    || signals.matchedSignals.length >= 3
+  );
 }
 
 export function detectCompletionSignals(rawText: string): CompletionSignals {
@@ -97,11 +105,7 @@ export function shouldTreatNonZeroExitAsSuccess(input: {
     };
   }
 
-  const signalCount = signals.matchedSignals.length;
-  const hasStrongEvidence = signals.hasCompletionSummary
-    && (signals.hasValidationSignal || signals.hasSuggestedCommitMessage);
-
-  if (hasStrongEvidence || signalCount >= 3) {
+  if (hasStrongCompletionSignals(signals)) {
     return {
       shouldTreatAsSuccess: true,
       reason: `Non-zero exit accepted due to progress + signals: ${signals.matchedSignals.join(', ')}`,
@@ -124,6 +128,36 @@ export interface CurrentWorktreeEvidence extends ProgressLike {
   reason: string;
 }
 
+export function reuseTaskLevelEvidenceForStorySuccess(input: {
+  output: string;
+  worktreePath?: string;
+  baseCommitSha?: string;
+  storyId?: string;
+}): CurrentWorktreeEvidence | null {
+  const signals = detectCompletionSignals(input.output);
+  if (!hasStrongCompletionSignals(signals)) {
+    return null;
+  }
+
+  const currentEvidence = detectCurrentWorktreeEvidence({
+    worktreePath: input.worktreePath,
+    baseCommitSha: input.baseCommitSha,
+  });
+
+  if (!currentEvidence.hasProgress) {
+    return null;
+  }
+
+  const storyLabel = input.storyId ? ` for ${input.storyId}` : '';
+  return {
+    hasProgress: true,
+    filesChanged: currentEvidence.filesChanged,
+    newCommits: currentEvidence.newCommits,
+    headChanged: currentEvidence.headChanged,
+    reason: `Retained task-level worktree evidence${storyLabel}; ${currentEvidence.reason}; completion signals: ${signals.matchedSignals.join(', ')}`,
+  };
+}
+
 function runGitInWorktree(worktreePath: string, args: string[]): string {
   try {
     return execFileSync('git', args, {
@@ -134,6 +168,21 @@ function runGitInWorktree(worktreePath: string, args: string[]): string {
   } catch {
     return '';
   }
+}
+
+function listRelevantWorktreeChanges(worktreePath: string): string[] {
+  const diffFiles = runGitInWorktree(worktreePath, ['diff', '--name-only', '-z', 'HEAD', '--']);
+  const untrackedFiles = runGitInWorktree(worktreePath, ['ls-files', '--others', '--exclude-standard', '-z']);
+
+  return filterGitInternalPaths([
+    ...diffFiles.split('\0').filter(Boolean),
+    ...untrackedFiles.split('\0').filter(Boolean),
+  ]);
+}
+
+function listRelevantBaseDiffFiles(worktreePath: string, baseCommitSha: string): string[] {
+  const diffFiles = runGitInWorktree(worktreePath, ['diff', '--name-only', '-z', baseCommitSha, '--']);
+  return filterGitInternalPaths(diffFiles.split('\0').filter(Boolean));
 }
 
 export function detectCurrentWorktreeEvidence(input: {
@@ -149,10 +198,7 @@ export function detectCurrentWorktreeEvidence(input: {
     };
   }
 
-  const statusFiles = runGitInWorktree(input.worktreePath, ['status', '--porcelain=v1'])
-    .trim()
-    .split('\n')
-    .filter(Boolean).length;
+  const statusFiles = listRelevantWorktreeChanges(input.worktreePath).length;
 
   if (!input.baseCommitSha) {
     return {
@@ -165,10 +211,7 @@ export function detectCurrentWorktreeEvidence(input: {
     };
   }
 
-  const baseDiffFiles = runGitInWorktree(input.worktreePath, ['diff', '--name-only', input.baseCommitSha, '--'])
-    .trim()
-    .split('\n')
-    .filter(Boolean).length;
+  const baseDiffFiles = listRelevantBaseDiffFiles(input.worktreePath, input.baseCommitSha).length;
 
   const commitsAheadRaw = runGitInWorktree(input.worktreePath, ['rev-list', '--count', `${input.baseCommitSha}..HEAD`]).trim();
   const parsedCommitsAhead = Number(commitsAheadRaw);
@@ -176,7 +219,8 @@ export function detectCurrentWorktreeEvidence(input: {
   const filesChanged = Math.max(statusFiles, baseDiffFiles);
   const currentHeadSha = getLatestCommitSHA(input.worktreePath);
   const headChanged = Boolean(currentHeadSha && currentHeadSha !== input.baseCommitSha);
-  const hasProgress = filesChanged > 0 || commitsAhead > 0 || headChanged;
+  const hasRelevantCommittedChanges = baseDiffFiles > 0;
+  const hasProgress = filesChanged > 0 || (commitsAhead > 0 && hasRelevantCommittedChanges) || (headChanged && hasRelevantCommittedChanges);
 
   return {
     hasProgress,
@@ -195,15 +239,20 @@ export function findRecoverableFailedStoryId(
   storyProgress?: Array<{ id: string; status?: string; lastEvidence?: string; lastError?: string }>,
   fallbackError?: string,
 ): string | undefined {
-  return storyProgress
+  const recoverableStories = storyProgress
     ?.slice()
     .reverse()
-    .find((story) =>
+    .filter((story) =>
       story.status === 'failed'
-      && Boolean(story.lastEvidence)
       && REPAIR_EVIDENCE_ERROR_PATTERN.test(story.lastError || fallbackError || '')
-    )
-    ?.id;
+    );
+
+  if (!recoverableStories?.length) {
+    return undefined;
+  }
+
+  return recoverableStories.find((story) => Boolean(story.lastEvidence))?.id
+    ?? recoverableStories[0]?.id;
 }
 
 export function evaluateFailedTaskForFinalizeRecovery(input: {

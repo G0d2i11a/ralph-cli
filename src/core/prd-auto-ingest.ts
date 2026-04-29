@@ -4,7 +4,7 @@ import { AgentBackend, AgentType, DEFAULT_AGENT, resolveAgentBackend, resolveAge
 import { TaskScheduler } from './scheduler';
 import { StateManager } from './state';
 import { enqueueTaskFromPrd } from './task-intake';
-import { parsePRD } from '../utils/helpers';
+import { assertPrdHasExplicitTitle, parsePRD } from '../utils/helpers';
 
 export const DEFAULT_EZ4IELTS_WATCH_DIR = '';
 export const DEFAULT_EZ4IELTS_PATTERN = 'ez4ielts-*.json';
@@ -151,6 +151,7 @@ export class PrdAutoIngestor {
       }
 
       try {
+        assertPrdHasExplicitTitle(filePath);
         parsePRD(filePath);
       } catch (error) {
         candidate.attemptedSignature = signature;
@@ -164,15 +165,29 @@ export class PrdAutoIngestor {
         continue;
       }
 
-      const queuedTask = await enqueueTaskFromPrd(filePath, {
-        repoPath: this.repoPath,
-        agent: this.agent,
-        backend: this.backend,
-        dedupeByPrdPath: true,
-        stateManager: this.stateManager,
-        scheduler: this.scheduler,
-        now: this.now,
-      });
+      let queuedTask;
+      try {
+        queuedTask = await enqueueTaskFromPrd(filePath, {
+          repoPath: this.repoPath,
+          agent: this.agent,
+          backend: this.backend,
+          allowMixedHome: false,
+          dedupeByPrdPath: true,
+          stateManager: this.stateManager,
+          scheduler: this.scheduler,
+          now: this.now,
+        });
+      } catch (error) {
+        candidate.attemptedSignature = signature;
+        const message = error instanceof Error ? error.message : String(error);
+        results.push({
+          filePath,
+          action: 'invalid',
+          error: message,
+        });
+        this.logger(`[watch] waiting for valid PRD ${path.basename(filePath)}: ${message}`);
+        continue;
+      }
 
       this.trackedPaths.add(filePath);
       this.candidates.delete(filePath);

@@ -29,12 +29,20 @@ program
   .name('ralph')
   .description('PRD-driven autonomous development CLI')
   .version('0.2.0')
-  .option('--home <path>', 'Ralph home directory (overrides RALPH_HOME)');
+  .option('--home <path>', 'Ralph home directory (overrides RALPH_HOME)')
+  .option('--allow-mixed-home', 'Allow multiple repos to share the same Ralph home');
 
 program.hook('preAction', (_thisCommand, actionCommand) => {
-  const home = actionCommand.optsWithGlobals().home;
+  const options = actionCommand.optsWithGlobals();
+  const home = options.home;
   if (typeof home === 'string' && home.trim()) {
     process.env.RALPH_HOME = path.resolve(home);
+  }
+
+  if (options.allowMixedHome) {
+    process.env.RALPH_ALLOW_MIXED_HOME = '1';
+  } else {
+    delete process.env.RALPH_ALLOW_MIXED_HOME;
   }
 });
 
@@ -145,9 +153,11 @@ Examples:
 program
   .command('retry <task-id>')
   .description('Retry a failed or stopped task')
+  .option('--finalize-only', 'For failed_finalize tasks, rerun only the finalizer path without rescheduling worker stories')
   .addHelpText('after', `
 Examples:
-  $ ralph retry task-1772544497775-wdat8zyr5`)
+  $ ralph retry task-1772544497775-wdat8zyr5
+  $ ralph retry task-1772544497775-wdat8zyr5 --finalize-only`)
   .action(retryCommand);
 
 program
@@ -283,10 +293,26 @@ Examples:
 program
   .command('queue')
   .description('Inspect active queue state, blockers, leases, and next actions')
+  .option('--watch', 'Continuously emit aggregated queue snapshots using one process')
+  .option('--interval <ms>', 'Polling interval in milliseconds for --watch mode', '10000')
+  .option('--stale-after-ms <ms>', 'Override the manager heartbeat stale threshold used in queue snapshots')
+  .option('--recent-completed-window-seconds <seconds>', 'Recent integrated task window for queue snapshots', '7200')
+  .option('--recent-completed-limit <count>', 'Maximum recent integrated tasks to include in queue snapshots', '5')
+  .option('--compact', 'Emit trimmed task payloads for lightweight consumers like the menubar')
   .addHelpText('after', `
 Examples:
-  $ ralph queue`)
-  .action(queueCommand);
+  $ ralph queue
+  $ ralph queue --watch
+  $ ralph queue --watch --interval 30000
+  $ ralph queue --compact`)
+  .action((options) => queueCommand({
+    watch: options.watch,
+    interval: options.interval,
+    staleAfterMs: options.staleAfterMs,
+    recentCompletedWindowSeconds: options.recentCompletedWindowSeconds,
+    recentCompletedLimit: options.recentCompletedLimit,
+    compact: options.compact,
+  }));
 
 program
   .command('cleanup')

@@ -1,4 +1,6 @@
 import { ConfigManager } from '../config/manager';
+import { buildAutoRecoveryState, buildDeliveryState, buildTransientRetryState } from '../core/task-delivery';
+import { buildCoordinationState } from '../core/task-coordination';
 import { StateManager } from '../core/state';
 import { isProcessRunning, formatDuration, loadTaskPRD, STAGNATION_THRESHOLDS } from '../utils/helpers';
 
@@ -15,6 +17,7 @@ export async function statusCommand(taskId?: string, options?: StatusOptions): P
       const tasks = await stateManager.listTasks('running');
       console.log(JSON.stringify({
         tasks: tasks.map((task) => ({
+          coordinationStatus: buildCoordinationState(task)?.status,
           id: task.id,
           status: task.status,
           currentUS: task.currentUS,
@@ -22,6 +25,11 @@ export async function statusCommand(taskId?: string, options?: StatusOptions): P
           backend: task.backend,
           duration: formatDuration(Date.now() - task.startTime),
           running: task.pid ? isProcessRunning(task.pid) : false,
+          lastErrorKind: task.lastErrorKind,
+          lastErrorClass: task.lastErrorClass,
+          transientRetryCount: task.transientRetryCount,
+          integrationStatus: buildDeliveryState(task).integrationStatus,
+          targetSyncStatus: buildDeliveryState(task).targetSyncStatus,
         }))
       }));
       return;
@@ -38,6 +46,10 @@ export async function statusCommand(taskId?: string, options?: StatusOptions): P
     const duration = task.endTime
       ? formatDuration(task.endTime - task.startTime)
       : formatDuration(Date.now() - task.startTime);
+    const delivery = buildDeliveryState(task);
+    const coordination = buildCoordinationState(task);
+    const transientRetry = buildTransientRetryState(task);
+    const autoRecovery = buildAutoRecoveryState(task);
 
     const basicStatus = {
       id: task.id,
@@ -69,13 +81,33 @@ export async function statusCommand(taskId?: string, options?: StatusOptions): P
       finalizerCommitMessage: task.finalizerCommitMessage,
       finalizerCommittedAt: task.finalizerCommittedAt ? new Date(task.finalizerCommittedAt).toISOString() : undefined,
       integratedAt: task.integratedAt ? new Date(task.integratedAt).toISOString() : undefined,
+      integrationStatus: delivery.integrationStatus,
       integrationCommitSha: task.integrationCommitSha,
+      integrationBranch: task.integrationBranch,
+      integrationWorktree: task.integrationWorktree,
       mergedAt: task.mergedAt ? new Date(task.mergedAt).toISOString() : undefined,
       mergeCommitSha: task.mergeCommitSha,
       mergeTargetBranch: task.mergeTargetBranch,
       mergeStrategy: task.mergeStrategy,
       mergeMessage: task.mergeMessage,
       mergeError: task.mergeError,
+      targetSyncedAt: task.targetSyncedAt ? new Date(task.targetSyncedAt).toISOString() : undefined,
+      targetSyncStatus: delivery.targetSyncStatus,
+      targetSyncDeferredReason: task.targetSyncDeferredReason,
+      lastError: task.lastError,
+      lastErrorKind: task.lastErrorKind,
+      lastErrorClass: task.lastErrorClass,
+      lastErrorRetryable: task.lastErrorRetryable,
+      lastErrorObservedAt: task.lastErrorObservedAt ? new Date(task.lastErrorObservedAt).toISOString() : undefined,
+      finalizerFailure: task.finalizerFailure,
+      repairContext: task.repairContext,
+      transientRetryCount: task.transientRetryCount,
+      transientRetryBudget: task.transientRetryBudget,
+      transientRetryLastDelayMs: task.transientRetryLastDelayMs,
+      autoRecovery,
+      delivery,
+      coordination,
+      transientRetry,
     };
 
     if (!options?.detailed) {
@@ -98,6 +130,14 @@ export async function statusCommand(taskId?: string, options?: StatusOptions): P
     const loopCount = task.loopCount || 0;
     const consecutiveNoProgress = task.consecutiveNoProgress || 0;
     const consecutiveErrors = task.consecutiveErrors || 0;
+    const transientRetryActive = Boolean(
+      task.lastErrorRetryable
+      && (task.transientRetryCount ?? 0) > 0
+      && (
+        task.transientRetryBudget === undefined
+        || (task.transientRetryCount ?? 0) < task.transientRetryBudget
+      )
+    );
 
     let isAtRisk = false;
     let riskReason: string | null = null;
@@ -106,13 +146,16 @@ export async function statusCommand(taskId?: string, options?: StatusOptions): P
       ? configuredStagnationTimeoutSeconds * 1000
       : undefined;
 
-    if (configuredStagnationTimeoutMs && Date.now() - task.lastProgressTime >= configuredStagnationTimeoutMs * 0.8) {
+    if (transientRetryActive) {
+      isAtRisk = false;
+      riskReason = null;
+    } else if (configuredStagnationTimeoutMs && Date.now() - task.lastProgressTime >= configuredStagnationTimeoutMs * 0.8) {
       isAtRisk = true;
       riskReason = `No progress for ${Math.floor((Date.now() - task.lastProgressTime) / 1000)}s (threshold: ${Math.floor(configuredStagnationTimeoutMs / 1000)}s)`;
     } else if (consecutiveNoProgress >= STAGNATION_THRESHOLDS.NO_PROGRESS_THRESHOLD - 1) {
       isAtRisk = true;
       riskReason = `No file changes for ${consecutiveNoProgress} consecutive updates (threshold: ${STAGNATION_THRESHOLDS.NO_PROGRESS_THRESHOLD})`;
-    } else if (consecutiveErrors >= STAGNATION_THRESHOLDS.CONSECUTIVE_ERRORS_THRESHOLD - 1) {
+    } else if (!task.lastErrorRetryable && consecutiveErrors >= STAGNATION_THRESHOLDS.CONSECUTIVE_ERRORS_THRESHOLD - 1) {
       isAtRisk = true;
       riskReason = `${consecutiveErrors} consecutive errors (threshold: ${STAGNATION_THRESHOLDS.CONSECUTIVE_ERRORS_THRESHOLD})`;
     }
@@ -136,9 +179,18 @@ export async function statusCommand(taskId?: string, options?: StatusOptions): P
         consecutiveNoProgress,
         consecutiveErrors,
         lastError: task.lastError,
+        lastErrorKind: task.lastErrorKind,
+        lastErrorClass: task.lastErrorClass,
+        lastErrorRetryable: task.lastErrorRetryable,
+        lastErrorObservedAt: task.lastErrorObservedAt ? new Date(task.lastErrorObservedAt).toISOString() : undefined,
+        transientRetry,
+        autoRecovery,
+        transientRetryActive,
         isAtRisk,
         riskReason,
-      }
+      },
+      delivery,
+      coordination,
     }));
   } catch (error) {
     console.error(JSON.stringify({

@@ -48,6 +48,224 @@ test('queue command reports active queue state', () => {
     assert.equal(output.tasks.length, 1);
     assert.equal(output.tasks[0].id, 'pending-task');
     assert.equal(output.tasks[0].nextAction, 'start when a concurrency slot is available');
+    assert.equal(output.repoCount, 1);
+    assert.equal(output.mixedRepos, false);
+  } finally {
+    fs.rmSync(homeDir, { recursive: true, force: true });
+  }
+});
+
+test('queue command reports coordination blockers for overlapping pending tasks', () => {
+  const homeDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-queue-coordination-home-'));
+
+  try {
+    const firstTaskDir = path.join(homeDir, '.ralph', 'tasks', 'first-task');
+    const secondTaskDir = path.join(homeDir, '.ralph', 'tasks', 'second-task');
+    fs.mkdirSync(firstTaskDir, { recursive: true });
+    fs.mkdirSync(secondTaskDir, { recursive: true });
+
+    fs.writeFileSync(path.join(firstTaskDir, 'state.json'), JSON.stringify({
+      id: 'first-task',
+      prdPath: '/tmp/first.json',
+      prdId: 'first-prd',
+      prdDependencies: [],
+      status: 'pending',
+      startTime: 100,
+      enqueuedAt: 100,
+      completedUS: [],
+      worktree: '',
+      logPath: path.join(firstTaskDir, 'agent.log'),
+      agent: 'codex',
+      repoPath: '/tmp/repo',
+      declaredConflictDomains: ['contracts-index'],
+      loopCount: 0,
+      consecutiveNoProgress: 0,
+      consecutiveErrors: 0,
+      lastProgressTime: 100,
+      lastFilesChanged: 0,
+    }, null, 2));
+    fs.writeFileSync(path.join(secondTaskDir, 'state.json'), JSON.stringify({
+      id: 'second-task',
+      prdPath: '/tmp/second.json',
+      prdId: 'second-prd',
+      prdDependencies: [],
+      status: 'pending',
+      startTime: 200,
+      enqueuedAt: 200,
+      completedUS: [],
+      worktree: '',
+      logPath: path.join(secondTaskDir, 'agent.log'),
+      agent: 'codex',
+      repoPath: '/tmp/repo',
+      declaredConflictDomains: ['contracts-index'],
+      loopCount: 0,
+      consecutiveNoProgress: 0,
+      consecutiveErrors: 0,
+      lastProgressTime: 200,
+      lastFilesChanged: 0,
+    }, null, 2));
+
+    const result = runCli(['queue'], { HOME: homeDir });
+    const output = JSON.parse(result.stdout);
+    const secondTask = output.tasks.find((task) => task.id === 'second-task');
+
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(secondTask.reason, 'coordination');
+    assert.deepEqual(secondTask.blockers, ['first-task']);
+    assert.match(secondTask.nextAction, /earlier overlapping task/);
+  } finally {
+    fs.rmSync(homeDir, { recursive: true, force: true });
+  }
+});
+
+test('queue command marks pending tasks blocked by failed dependencies as attention', () => {
+  const homeDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-queue-failed-dep-home-'));
+
+  try {
+    const depTaskDir = path.join(homeDir, '.ralph', 'tasks', 'failed-dependency');
+    const childTaskDir = path.join(homeDir, '.ralph', 'tasks', 'blocked-child');
+    fs.mkdirSync(depTaskDir, { recursive: true });
+    fs.mkdirSync(childTaskDir, { recursive: true });
+
+    fs.writeFileSync(path.join(depTaskDir, 'state.json'), JSON.stringify({
+      id: 'failed-dependency',
+      prdPath: '/tmp/dep.json',
+      prdId: 'dep-prd',
+      prdDependencies: [],
+      status: 'failed',
+      startTime: 100,
+      completedUS: ['US-001'],
+      worktree: '/tmp/dep',
+      logPath: path.join(depTaskDir, 'agent.log'),
+      agent: 'codex',
+      repoPath: '/tmp/repo',
+      lastError: 'dependency story did not pass',
+      lastErrorKind: 'story_incomplete',
+      lastErrorRetryable: false,
+      autoRecoveryKind: 'stagnant',
+      autoRecoveryLastReason: 'stale recovery residue',
+      loopCount: 0,
+      consecutiveNoProgress: 0,
+      consecutiveErrors: 0,
+      lastProgressTime: 100,
+      lastFilesChanged: 0,
+    }, null, 2));
+    fs.writeFileSync(path.join(childTaskDir, 'state.json'), JSON.stringify({
+      id: 'blocked-child',
+      prdPath: '/tmp/child.json',
+      prdId: 'child-prd',
+      prdDependencies: ['dep-prd'],
+      status: 'pending',
+      startTime: 200,
+      completedUS: [],
+      worktree: '',
+      logPath: path.join(childTaskDir, 'agent.log'),
+      agent: 'codex',
+      repoPath: '/tmp/repo',
+      loopCount: 0,
+      consecutiveNoProgress: 0,
+      consecutiveErrors: 0,
+      lastProgressTime: 200,
+      lastFilesChanged: 0,
+    }, null, 2));
+
+    const result = runCli(['queue'], { HOME: homeDir });
+    const output = JSON.parse(result.stdout);
+    const childTask = output.tasks.find((task) => task.id === 'blocked-child');
+    const failedTask = output.tasks.find((task) => task.id === 'failed-dependency');
+    const childAttention = output.attention.find((task) => task.id === 'blocked-child');
+
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(output.summary.totalAttention, 2);
+    assert.equal(output.summary.autoRecoveryActive, 0);
+    assert.equal(failedTask.attention.needed, true);
+    assert.equal(failedTask.autoRecovery.active, false);
+    assert.equal(failedTask.autoRecovery.staleInvalidReason, 'semantic_story_incomplete_is_not_auto_recovering');
+    assert.equal(childTask.reason, 'dependencies');
+    assert.deepEqual(childTask.failedDependencies, ['dep-prd']);
+    assert.deepEqual(childTask.recoveringDependencies, []);
+    assert.equal(childTask.attention.needed, true);
+    assert.equal(childTask.attention.reason, 'blocked_failed_dependency');
+    assert.match(childTask.nextAction, /blocked by failed dependencies: dep-prd/);
+    assert.deepEqual(childAttention.blockers, ['dep-prd']);
+  } finally {
+    fs.rmSync(homeDir, { recursive: true, force: true });
+  }
+});
+
+test('queue command marks pending tasks blocked by failed coordination owners as attention', () => {
+  const homeDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-queue-failed-coordination-home-'));
+
+  try {
+    const failedOwnerDir = path.join(homeDir, '.ralph', 'tasks', 'failed-owner');
+    const laterTaskDir = path.join(homeDir, '.ralph', 'tasks', 'later-task');
+    fs.mkdirSync(failedOwnerDir, { recursive: true });
+    fs.mkdirSync(laterTaskDir, { recursive: true });
+
+    fs.writeFileSync(path.join(failedOwnerDir, 'state.json'), JSON.stringify({
+      id: 'failed-owner',
+      prdPath: '/tmp/owner.json',
+      prdId: 'owner-prd',
+      prdDependencies: [],
+      status: 'failed',
+      startTime: 100,
+      enqueuedAt: 100,
+      completedUS: ['US-001'],
+      worktree: '/tmp/owner',
+      logPath: path.join(failedOwnerDir, 'agent.log'),
+      agent: 'codex',
+      repoPath: '/tmp/repo',
+      declaredWriteSurface: ['packages/contracts/src/index.ts'],
+      observedWriteSurface: ['packages/contracts/src/index.ts'],
+      mergeConflictFiles: ['packages/contracts/src/index.ts'],
+      repairContext: {
+        mode: 'merge',
+        storyId: 'US-003',
+        createdAt: 123,
+        reason: 'Merge repair required by Ralph.',
+      },
+      lastError: 'merge repair did not converge',
+      loopCount: 0,
+      consecutiveNoProgress: 0,
+      consecutiveErrors: 0,
+      lastProgressTime: 100,
+      lastFilesChanged: 0,
+    }, null, 2));
+    fs.writeFileSync(path.join(laterTaskDir, 'state.json'), JSON.stringify({
+      id: 'later-task',
+      prdPath: '/tmp/later.json',
+      prdId: 'later-prd',
+      prdDependencies: [],
+      status: 'pending',
+      startTime: 200,
+      enqueuedAt: 200,
+      completedUS: [],
+      worktree: '',
+      logPath: path.join(laterTaskDir, 'agent.log'),
+      agent: 'codex',
+      repoPath: '/tmp/repo',
+      declaredWriteSurface: ['packages/contracts/src/index.ts'],
+      loopCount: 0,
+      consecutiveNoProgress: 0,
+      consecutiveErrors: 0,
+      lastProgressTime: 200,
+      lastFilesChanged: 0,
+    }, null, 2));
+
+    const result = runCli(['queue'], { HOME: homeDir });
+    const output = JSON.parse(result.stdout);
+    const laterTask = output.tasks.find((task) => task.id === 'later-task');
+    const laterAttention = output.attention.find((task) => task.id === 'later-task');
+
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(output.summary.totalAttention, 2);
+    assert.equal(laterTask.reason, 'coordination');
+    assert.deepEqual(laterTask.blockers, ['failed-owner']);
+    assert.deepEqual(laterTask.failedBlockers, ['failed-owner']);
+    assert.equal(laterTask.attention.needed, true);
+    assert.equal(laterTask.attention.reason, 'blocked_failed_coordination');
+    assert.match(laterTask.nextAction, /blocked by failed overlapping task/);
+    assert.deepEqual(laterAttention.blockers, ['failed-owner']);
   } finally {
     fs.rmSync(homeDir, { recursive: true, force: true });
   }
@@ -91,6 +309,349 @@ test('queue command honors the global --home option', () => {
   }
 });
 
+test('queue command includes completed tasks that still block integration', () => {
+  const homeDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-queue-completed-blocker-home-'));
+
+  try {
+    const taskDir = path.join(homeDir, '.ralph', 'tasks', 'completed-blocker');
+    fs.mkdirSync(taskDir, { recursive: true });
+    fs.writeFileSync(path.join(taskDir, 'state.json'), JSON.stringify({
+      id: 'completed-blocker',
+      prdPath: '/tmp/prd.json',
+      prdId: 'completed-prd',
+      prdDependencies: [],
+      status: 'completed',
+      startTime: Date.now(),
+      completedUS: ['US-001'],
+      worktree: '',
+      logPath: path.join(taskDir, 'agent.log'),
+      agent: 'codex',
+      repoPath: '/tmp/repo',
+      integrationStatus: 'not_started',
+      loopCount: 0,
+      consecutiveNoProgress: 0,
+      consecutiveErrors: 0,
+      lastProgressTime: Date.now(),
+      lastFilesChanged: 0,
+    }, null, 2));
+
+    const result = runCli(['queue'], { HOME: homeDir });
+    const output = JSON.parse(result.stdout);
+
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(output.tasks.length, 1);
+    assert.equal(output.tasks[0].id, 'completed-blocker');
+    assert.equal(output.tasks[0].status, 'completed');
+    assert.match(output.tasks[0].nextAction, /manager should integrate this completed task/i);
+  } finally {
+    fs.rmSync(homeDir, { recursive: true, force: true });
+  }
+});
+
+test('queue command includes manager state and aggregate summary in one snapshot', () => {
+  const homeDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-queue-manager-summary-home-'));
+  const managerDir = path.join(homeDir, '.ralph', 'manager');
+
+  try {
+    fs.mkdirSync(managerDir, { recursive: true });
+    fs.writeFileSync(path.join(managerDir, 'state.json'), JSON.stringify({
+      pid: process.pid,
+      status: 'running',
+      startedAt: Date.now(),
+      updatedAt: Date.now(),
+      lastHeartbeatAt: Date.now(),
+      pollIntervalMs: 10000,
+      autoIngestEnabled: false,
+      repo: '/tmp/repo',
+      agent: 'codex',
+      backend: 'cli',
+      hostname: 'test-host',
+      argv: ['ralph', 'manager'],
+    }, null, 2));
+
+    const runningTaskDir = path.join(homeDir, '.ralph', 'tasks', 'running-task');
+    fs.mkdirSync(runningTaskDir, { recursive: true });
+    fs.writeFileSync(path.join(runningTaskDir, 'state.json'), JSON.stringify({
+      id: 'running-task',
+      prdPath: '/tmp/a.json',
+      prdId: 'running-prd',
+      status: 'running',
+      pid: process.pid,
+      startTime: Date.now(),
+      completedUS: [],
+      currentUS: 'US-001',
+      worktree: '/tmp/a',
+      logPath: path.join(runningTaskDir, 'agent.log'),
+      agent: 'codex',
+      repoPath: '/repo-a',
+      loopCount: 0,
+      consecutiveNoProgress: 0,
+      consecutiveErrors: 0,
+      lastProgressTime: Date.now(),
+      lastFilesChanged: 0,
+    }, null, 2));
+
+    const result = runCli(['queue'], { HOME: homeDir });
+    const output = JSON.parse(result.stdout);
+
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(output.manager.active, true);
+    assert.equal(output.manager.state.pid, process.pid);
+    assert.equal(output.summary.totalActive, 1);
+    assert.equal(output.summary.byStatus.running, 1);
+    assert.ok(Array.isArray(output.attention));
+  } finally {
+    fs.rmSync(homeDir, { recursive: true, force: true });
+  }
+});
+
+test('queue command compact mode trims heavy task payload fields', () => {
+  const homeDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-queue-compact-home-'));
+
+  try {
+    const taskDir = path.join(homeDir, '.ralph', 'tasks', 'compact-task');
+    fs.mkdirSync(taskDir, { recursive: true });
+    fs.writeFileSync(path.join(taskDir, 'state.json'), JSON.stringify({
+      id: 'compact-task',
+      prdId: 'compact-prd',
+      prdTitle: 'Compact Queue Payload',
+      prdPath: '/tmp/compact.json',
+      status: 'ready_to_finalize',
+      startTime: Date.now(),
+      updatedAt: Date.now(),
+      currentUS: 'US-001',
+      completedUS: ['US-000'],
+      storyProgress: [
+        {
+          id: 'US-001',
+          status: 'in_progress',
+          attempts: 2,
+          updatedAt: Date.now(),
+          history: [
+            {
+              attempt: 1,
+              status: 'failed',
+              message: 'first try',
+              evidence: 'verbose details',
+              updatedAt: Date.now(),
+            },
+          ],
+          lastEvidence: 'long evidence',
+          lastError: 'long error',
+        },
+      ],
+      repairContext: {
+        mode: 'finalize',
+        storyId: 'US-001',
+        createdAt: Date.now(),
+        reason: 'very long reason that should be stripped from compact mode',
+      },
+      worktree: '/tmp/worktree',
+      logPath: path.join(taskDir, 'agent.log'),
+      agent: 'codex',
+      repoPath: '/tmp/repo',
+      coordinationStatus: 'blocked_observed_overlap',
+      coordinationPhase: 'finalize',
+      coordinationBlockers: ['task-a'],
+      coordinationReason: 'shared writes',
+      integrationLane: 'main',
+      declaredWriteSurface: ['packages/app/src'],
+      declaredConflictDomains: ['contracts'],
+      observedWriteSurface: ['packages/app/src/index.ts'],
+      observedPackageSurface: ['packages/app'],
+      surfaceCapturedAt: Date.now(),
+      loopCount: 0,
+      consecutiveNoProgress: 0,
+      consecutiveErrors: 0,
+      lastProgressTime: Date.now(),
+      lastFilesChanged: 1,
+    }, null, 2));
+
+    const result = runCli(['queue', '--compact'], { HOME: homeDir });
+    const output = JSON.parse(result.stdout);
+    const task = output.tasks[0];
+
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(task.prdTitle, 'Compact Queue Payload');
+    assert.equal(task.worktree, '/tmp/worktree');
+    assert.equal(task.completedUS, 1);
+    assert.deepEqual(task.storyProgress, [{
+      id: 'US-001',
+      status: 'in_progress',
+      attempts: 2,
+      updatedAt: task.storyProgress[0].updatedAt,
+    }]);
+    assert.deepEqual(task.repairContext, {
+      mode: 'finalize',
+      storyId: 'US-001',
+      createdAt: task.repairContext.createdAt,
+    });
+    assert.equal(task.integrationStatus, 'not_started');
+    assert.equal(task.coordination.status, 'blocked_observed_overlap');
+    assert.equal(task.coordination.reason, 'shared writes');
+    assert.deepEqual(task.coordination.blockers, ['task-a']);
+    assert.equal(task.coordination.observedWriteSurface, undefined);
+    assert.equal(task.coordination.declaredConflictDomains, undefined);
+    assert.equal(task.storyProgress[0].history, undefined);
+    assert.equal(task.repairContext.reason, undefined);
+  } finally {
+    fs.rmSync(homeDir, { recursive: true, force: true });
+  }
+});
+
+test('queue command suppresses attention for auto-recovering merge repairs already resolved for finalize', () => {
+  const homeDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-queue-resolved-merge-repair-home-'));
+
+  try {
+    const taskDir = path.join(homeDir, '.ralph', 'tasks', 'resolved-repair-task');
+    fs.mkdirSync(taskDir, { recursive: true });
+    fs.writeFileSync(path.join(taskDir, 'state.json'), JSON.stringify({
+      id: 'resolved-repair-task',
+      prdPath: '/tmp/prd.json',
+      prdId: 'resolved-prd',
+      status: 'failed_finalize',
+      startTime: Date.now(),
+      completedUS: ['US-001'],
+      worktree: '/tmp/worktree',
+      logPath: path.join(taskDir, 'agent.log'),
+      agent: 'codex',
+      repoPath: '/tmp/repo',
+      integrationStatus: 'blocked_conflict',
+      autoRecoveryKind: 'merge_repair',
+      mergeRepairDisplayStatus: 'resolved_pending_finalize',
+      loopCount: 0,
+      consecutiveNoProgress: 0,
+      consecutiveErrors: 0,
+      lastProgressTime: Date.now(),
+      lastFilesChanged: 0,
+    }, null, 2));
+
+    const result = runCli(['queue'], { HOME: homeDir });
+    const output = JSON.parse(result.stdout);
+
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(output.summary.totalAttention, 0);
+    assert.equal(output.tasks.length, 1);
+    assert.equal(output.tasks[0].attention.needed, false);
+  } finally {
+    fs.rmSync(homeDir, { recursive: true, force: true });
+  }
+});
+
+test('queue command includes recent integrated tasks within the configured window', () => {
+  const homeDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-queue-recent-completed-home-'));
+
+  try {
+    const now = Date.now();
+    const recentTaskDir = path.join(homeDir, '.ralph', 'tasks', 'recent-completed');
+    const oldTaskDir = path.join(homeDir, '.ralph', 'tasks', 'old-completed');
+    fs.mkdirSync(recentTaskDir, { recursive: true });
+    fs.mkdirSync(oldTaskDir, { recursive: true });
+    fs.writeFileSync(path.join(recentTaskDir, 'state.json'), JSON.stringify({
+      id: 'recent-completed',
+      prdPath: '/tmp/recent.json',
+      prdId: 'recent-prd',
+      status: 'completed',
+      startTime: now - 10_000,
+      completedUS: ['US-001'],
+      worktree: '/tmp/recent',
+      logPath: path.join(recentTaskDir, 'agent.log'),
+      agent: 'codex',
+      repoPath: '/tmp/repo',
+      integrationStatus: 'integrated',
+      updatedAt: now - 5_000,
+      loopCount: 0,
+      consecutiveNoProgress: 0,
+      consecutiveErrors: 0,
+      lastProgressTime: now - 5_000,
+      lastFilesChanged: 1,
+    }, null, 2));
+    fs.writeFileSync(path.join(oldTaskDir, 'state.json'), JSON.stringify({
+      id: 'old-completed',
+      prdPath: '/tmp/old.json',
+      prdId: 'old-prd',
+      status: 'completed',
+      startTime: now - 100_000,
+      completedUS: ['US-001'],
+      worktree: '/tmp/old',
+      logPath: path.join(oldTaskDir, 'agent.log'),
+      agent: 'codex',
+      repoPath: '/tmp/repo',
+      integrationStatus: 'integrated',
+      updatedAt: now - 50_000,
+      loopCount: 0,
+      consecutiveNoProgress: 0,
+      consecutiveErrors: 0,
+      lastProgressTime: now - 50_000,
+      lastFilesChanged: 1,
+    }, null, 2));
+
+    const result = runCli([
+      'queue',
+      '--recent-completed-window-seconds',
+      '10',
+      '--recent-completed-limit',
+      '3',
+    ], { HOME: homeDir });
+    const output = JSON.parse(result.stdout);
+
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(output.summary.recentCompletedCount, 1);
+    assert.equal(output.recentCompleted.length, 1);
+    assert.equal(output.recentCompleted[0].id, 'recent-completed');
+  } finally {
+    fs.rmSync(homeDir, { recursive: true, force: true });
+  }
+});
+
+test('doctor warns when overlap backlog exists but unattended integration is disabled', () => {
+  const homeDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-doctor-liveness-home-'));
+  const repoDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-doctor-liveness-repo-'));
+
+  try {
+    execFileSync('git', ['init', '-b', 'main'], { cwd: repoDir, stdio: 'ignore' });
+    fs.mkdirSync(path.join(homeDir, '.ralph', 'tasks', 'completed-blocker'), { recursive: true });
+    fs.writeFileSync(path.join(homeDir, '.ralph', 'tasks', 'completed-blocker', 'state.json'), JSON.stringify({
+      id: 'completed-blocker',
+      prdPath: '/tmp/prd.json',
+      status: 'completed',
+      startTime: Date.now(),
+      completedUS: ['US-001'],
+      worktree: '',
+      logPath: path.join(homeDir, '.ralph', 'tasks', 'completed-blocker', 'agent.log'),
+      agent: 'codex',
+      repoPath: repoDir,
+      integrationStatus: 'not_started',
+      coordinationStatus: 'blocked_observed_overlap',
+      coordinationBlockers: ['older-task'],
+      loopCount: 0,
+      consecutiveNoProgress: 0,
+      consecutiveErrors: 0,
+      lastProgressTime: Date.now(),
+      lastFilesChanged: 0,
+    }, null, 2));
+    fs.mkdirSync(path.join(homeDir, '.ralph'), { recursive: true });
+    fs.writeFileSync(path.join(homeDir, '.ralph', 'config.json'), JSON.stringify({
+      autoMerge: false,
+      merge: {
+        autoIntegrate: false,
+        useIntegrationWorktree: true,
+      },
+    }, null, 2));
+
+    const result = runCli(['doctor', '--repo', repoDir], { HOME: homeDir });
+    const output = JSON.parse(result.stdout);
+    const livenessCheck = output.checks.find((check) => check.name === 'config.integration-liveness');
+
+    assert.equal(result.status, 1);
+    assert.equal(livenessCheck.ok, false);
+    assert.match(livenessCheck.message, /completed tasks can stall unattended progress/i);
+  } finally {
+    fs.rmSync(homeDir, { recursive: true, force: true });
+    fs.rmSync(repoDir, { recursive: true, force: true });
+  }
+});
+
 test('doctor command returns preflight JSON', () => {
   const homeDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-doctor-home-'));
   const repoDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-doctor-repo-'));
@@ -131,6 +692,44 @@ test('manager-status command reports persisted manager heartbeat', () => {
       hostname: 'test-host',
       argv: ['ralph', 'manager'],
     }, null, 2));
+    const taskDirA = path.join(homeDir, '.ralph', 'tasks', 'task-a');
+    const taskDirB = path.join(homeDir, '.ralph', 'tasks', 'task-b');
+    fs.mkdirSync(taskDirA, { recursive: true });
+    fs.mkdirSync(taskDirB, { recursive: true });
+    fs.writeFileSync(path.join(taskDirA, 'state.json'), JSON.stringify({
+      id: 'task-a',
+      prdPath: '/tmp/a.json',
+      prdId: 'task-a',
+      status: 'running',
+      startTime: 1,
+      completedUS: [],
+      worktree: '/tmp/a',
+      logPath: path.join(taskDirA, 'agent.log'),
+      agent: 'codex',
+      repoPath: '/repo-a',
+      loopCount: 0,
+      consecutiveNoProgress: 0,
+      consecutiveErrors: 0,
+      lastProgressTime: 1,
+      lastFilesChanged: 0,
+    }, null, 2));
+    fs.writeFileSync(path.join(taskDirB, 'state.json'), JSON.stringify({
+      id: 'task-b',
+      prdPath: '/tmp/b.json',
+      prdId: 'task-b',
+      status: 'pending',
+      startTime: 2,
+      completedUS: [],
+      worktree: '',
+      logPath: path.join(taskDirB, 'agent.log'),
+      agent: 'codex',
+      repoPath: '/repo-b',
+      loopCount: 0,
+      consecutiveNoProgress: 0,
+      consecutiveErrors: 0,
+      lastProgressTime: 2,
+      lastFilesChanged: 0,
+    }, null, 2));
 
     const result = runCli(['manager-status'], { HOME: homeDir });
     const output = JSON.parse(result.stdout);
@@ -140,6 +739,378 @@ test('manager-status command reports persisted manager heartbeat', () => {
     assert.equal(output.active, true);
     assert.equal(output.state.agent, 'codex');
     assert.equal(output.state.backend, 'cli');
+    assert.equal(output.mixedRepos, true);
+    assert.equal(output.repoCount, 2);
+  } finally {
+    fs.rmSync(homeDir, { recursive: true, force: true });
+  }
+});
+
+test('manager-status command marks outdated manager code as not ok', () => {
+  const homeDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-manager-status-drift-home-'));
+  const managerDir = path.join(homeDir, '.ralph', 'manager');
+  const repoDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-manager-status-drift-repo-'));
+  const distDir = path.join(repoDir, 'dist');
+  const entryPath = path.join(distDir, 'cli.js');
+  const dependencyPath = path.join(distDir, 'core', 'finalize-repair-policy.js');
+
+  try {
+    fs.mkdirSync(managerDir, { recursive: true });
+    fs.mkdirSync(path.dirname(dependencyPath), { recursive: true });
+    fs.writeFileSync(entryPath, 'console.log("entry");\n');
+    fs.writeFileSync(dependencyPath, 'console.log("dep");\n');
+    fs.utimesSync(entryPath, 1, 1);
+    fs.utimesSync(dependencyPath, 5, 5);
+    fs.writeFileSync(path.join(managerDir, 'state.json'), JSON.stringify({
+      pid: process.pid,
+      status: 'running',
+      startedAt: 2000,
+      updatedAt: Date.now(),
+      lastHeartbeatAt: Date.now(),
+      pollIntervalMs: 10000,
+      autoIngestEnabled: false,
+      repo: '/tmp/repo',
+      agent: 'codex',
+      backend: 'cli',
+      hostname: 'test-host',
+      argv: ['node', entryPath, 'manager'],
+    }, null, 2));
+
+    const result = runCli(['manager-status'], { HOME: homeDir });
+    const output = JSON.parse(result.stdout);
+
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(output.ok, false);
+    assert.equal(output.codeDriftDetected, true);
+    assert.equal(output.managerCodeLatestPath, dependencyPath);
+  } finally {
+    fs.rmSync(homeDir, { recursive: true, force: true });
+    fs.rmSync(repoDir, { recursive: true, force: true });
+  }
+});
+
+test('doctor command reports mixed active repos in the Ralph home', () => {
+  const homeDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-doctor-mixed-home-'));
+  const repoDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-doctor-mixed-repo-'));
+
+  try {
+    execFileSync('git', ['init', '-b', 'main'], { cwd: repoDir, stdio: 'ignore' });
+    const taskDirA = path.join(homeDir, '.ralph', 'tasks', 'task-a');
+    const taskDirB = path.join(homeDir, '.ralph', 'tasks', 'task-b');
+    fs.mkdirSync(taskDirA, { recursive: true });
+    fs.mkdirSync(taskDirB, { recursive: true });
+    fs.writeFileSync(path.join(taskDirA, 'state.json'), JSON.stringify({
+      id: 'task-a',
+      prdPath: '/tmp/a.json',
+      prdId: 'task-a',
+      status: 'running',
+      startTime: 1,
+      completedUS: [],
+      worktree: '/tmp/a',
+      logPath: path.join(taskDirA, 'agent.log'),
+      agent: 'codex',
+      repoPath: '/repo-a',
+      loopCount: 0,
+      consecutiveNoProgress: 0,
+      consecutiveErrors: 0,
+      lastProgressTime: 1,
+      lastFilesChanged: 0,
+    }, null, 2));
+    fs.writeFileSync(path.join(taskDirB, 'state.json'), JSON.stringify({
+      id: 'task-b',
+      prdPath: '/tmp/b.json',
+      prdId: 'task-b',
+      status: 'pending',
+      startTime: 2,
+      completedUS: [],
+      worktree: '',
+      logPath: path.join(taskDirB, 'agent.log'),
+      agent: 'codex',
+      repoPath: '/repo-b',
+      loopCount: 0,
+      consecutiveNoProgress: 0,
+      consecutiveErrors: 0,
+      lastProgressTime: 2,
+      lastFilesChanged: 0,
+    }, null, 2));
+
+    const result = runCli(['doctor', '--repo', repoDir], { HOME: homeDir });
+    const output = JSON.parse(result.stdout);
+    const repoCheck = output.checks.find((check) => check.name === 'ralph.home.repos');
+
+    assert.equal(result.status, 1, result.stderr);
+    assert.equal(output.mixedRepos, true);
+    assert.equal(output.repoCount, 2);
+    assert.equal(repoCheck.ok, false);
+    assert.match(repoCheck.message, /multiple repos/);
+  } finally {
+    fs.rmSync(homeDir, { recursive: true, force: true });
+    fs.rmSync(repoDir, { recursive: true, force: true });
+  }
+});
+
+test('doctor command fails when the Ralph home is already active for a different repo', () => {
+  const homeDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-doctor-foreign-home-'));
+  const repoA = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-doctor-foreign-a-'));
+  const repoB = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-doctor-foreign-b-'));
+
+  try {
+    execFileSync('git', ['init', '-b', 'main'], { cwd: repoA, stdio: 'ignore' });
+    execFileSync('git', ['init', '-b', 'main'], { cwd: repoB, stdio: 'ignore' });
+    const taskDir = path.join(homeDir, '.ralph', 'tasks', 'task-a');
+    fs.mkdirSync(taskDir, { recursive: true });
+    fs.writeFileSync(path.join(taskDir, 'state.json'), JSON.stringify({
+      id: 'task-a',
+      prdPath: path.join(repoA, 'a.json'),
+      prdId: 'task-a',
+      status: 'running',
+      startTime: 1,
+      completedUS: [],
+      worktree: path.join(repoA, '.ralph-worktrees', 'task-a'),
+      logPath: path.join(taskDir, 'agent.log'),
+      agent: 'codex',
+      repoPath: repoA,
+      loopCount: 0,
+      consecutiveNoProgress: 0,
+      consecutiveErrors: 0,
+      lastProgressTime: 1,
+      lastFilesChanged: 0,
+    }, null, 2));
+
+    const result = runCli(['doctor', '--repo', repoB], { HOME: homeDir });
+    const output = JSON.parse(result.stdout);
+    const repoCheck = output.checks.find((check) => check.name === 'ralph.home.repos');
+
+    assert.equal(result.status, 1, result.stderr);
+    assert.equal(output.mixedRepos, false);
+    assert.equal(output.repoCount, 1);
+    assert.equal(repoCheck.ok, false);
+    assert.match(repoCheck.message, /different repo/i);
+  } finally {
+    fs.rmSync(homeDir, { recursive: true, force: true });
+    fs.rmSync(repoA, { recursive: true, force: true });
+    fs.rmSync(repoB, { recursive: true, force: true });
+  }
+});
+
+test('manager command refuses to start when the Ralph home mixes active repos', () => {
+  const homeDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-manager-mixed-home-'));
+
+  try {
+    const taskDirA = path.join(homeDir, '.ralph', 'tasks', 'task-a');
+    const taskDirB = path.join(homeDir, '.ralph', 'tasks', 'task-b');
+    fs.mkdirSync(taskDirA, { recursive: true });
+    fs.mkdirSync(taskDirB, { recursive: true });
+    fs.writeFileSync(path.join(taskDirA, 'state.json'), JSON.stringify({
+      id: 'task-a',
+      prdPath: '/tmp/a.json',
+      prdId: 'task-a',
+      status: 'running',
+      startTime: 1,
+      completedUS: [],
+      worktree: '/tmp/a',
+      logPath: path.join(taskDirA, 'agent.log'),
+      agent: 'codex',
+      repoPath: '/repo-a',
+      loopCount: 0,
+      consecutiveNoProgress: 0,
+      consecutiveErrors: 0,
+      lastProgressTime: 1,
+      lastFilesChanged: 0,
+    }, null, 2));
+    fs.writeFileSync(path.join(taskDirB, 'state.json'), JSON.stringify({
+      id: 'task-b',
+      prdPath: '/tmp/b.json',
+      prdId: 'task-b',
+      status: 'pending',
+      startTime: 2,
+      completedUS: [],
+      worktree: '',
+      logPath: path.join(taskDirB, 'agent.log'),
+      agent: 'codex',
+      repoPath: '/repo-b',
+      loopCount: 0,
+      consecutiveNoProgress: 0,
+      consecutiveErrors: 0,
+      lastProgressTime: 2,
+      lastFilesChanged: 0,
+    }, null, 2));
+
+    const result = runCli(['manager', '--repo', '/repo-a'], { HOME: homeDir });
+    const output = JSON.parse(result.stderr);
+
+    assert.equal(result.status, 1);
+    assert.match(output.error, /active tasks from multiple repos/i);
+    assert.match(output.error, /--allow-mixed-home/);
+  } finally {
+    fs.rmSync(homeDir, { recursive: true, force: true });
+  }
+});
+
+test('doctor command fails when manager code is older than current dist on disk', () => {
+  const homeDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-doctor-drift-home-'));
+  const repoDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-doctor-drift-repo-'));
+  const managerDir = path.join(homeDir, '.ralph', 'manager');
+  const distDir = path.join(repoDir, 'dist');
+  const entryPath = path.join(distDir, 'cli.js');
+  const dependencyPath = path.join(distDir, 'core', 'dependency-watcher.js');
+
+  try {
+    execFileSync('git', ['init', '-b', 'main'], { cwd: repoDir, stdio: 'ignore' });
+    fs.mkdirSync(managerDir, { recursive: true });
+    fs.mkdirSync(path.dirname(dependencyPath), { recursive: true });
+    fs.writeFileSync(entryPath, 'console.log("entry");\n');
+    fs.writeFileSync(dependencyPath, 'console.log("dep");\n');
+    fs.utimesSync(entryPath, 1, 1);
+    fs.utimesSync(dependencyPath, 5, 5);
+    fs.writeFileSync(path.join(managerDir, 'state.json'), JSON.stringify({
+      pid: process.pid,
+      status: 'running',
+      startedAt: 2000,
+      updatedAt: Date.now(),
+      lastHeartbeatAt: Date.now(),
+      pollIntervalMs: 10000,
+      autoIngestEnabled: false,
+      repo: repoDir,
+      agent: 'codex',
+      backend: 'cli',
+      hostname: 'test-host',
+      argv: ['node', entryPath, 'manager'],
+    }, null, 2));
+
+    const result = runCli(['doctor', '--repo', repoDir], { HOME: homeDir });
+    const output = JSON.parse(result.stdout);
+    const managerCheck = output.checks.find((check) => check.name === 'manager');
+
+    assert.equal(result.status, 1);
+    assert.equal(output.ok, false);
+    assert.equal(output.manager.codeDriftDetected, true);
+    assert.match(managerCheck.message, /older than current code on disk/);
+  } finally {
+    fs.rmSync(homeDir, { recursive: true, force: true });
+    fs.rmSync(repoDir, { recursive: true, force: true });
+  }
+});
+
+test('finalize command keeps task ready_to_finalize when blocked by an earlier overlapping task', () => {
+  const homeDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-finalize-coordination-home-'));
+
+  try {
+    const taskDirA = path.join(homeDir, '.ralph', 'tasks', 'task-a');
+    const taskDirB = path.join(homeDir, '.ralph', 'tasks', 'task-b');
+    fs.mkdirSync(taskDirA, { recursive: true });
+    fs.mkdirSync(taskDirB, { recursive: true });
+
+    fs.writeFileSync(path.join(taskDirA, 'state.json'), JSON.stringify({
+      id: 'task-a',
+      prdPath: '/tmp/a.json',
+      prdId: 'task-a',
+      status: 'ready_to_finalize',
+      startTime: 100,
+      enqueuedAt: 100,
+      completedUS: ['US-001'],
+      observedWriteSurface: ['packages/contracts/src/index.ts'],
+      worktree: '',
+      logPath: path.join(taskDirA, 'agent.log'),
+      agent: 'codex',
+      repoPath: '/tmp/repo',
+      loopCount: 0,
+      consecutiveNoProgress: 0,
+      consecutiveErrors: 0,
+      lastProgressTime: 100,
+      lastFilesChanged: 1,
+    }, null, 2));
+    fs.writeFileSync(path.join(taskDirB, 'state.json'), JSON.stringify({
+      id: 'task-b',
+      prdPath: '/tmp/b.json',
+      prdId: 'task-b',
+      status: 'ready_to_finalize',
+      startTime: 200,
+      enqueuedAt: 200,
+      completedUS: ['US-001'],
+      observedWriteSurface: ['packages/contracts/src/index.ts'],
+      worktree: '',
+      logPath: path.join(taskDirB, 'agent.log'),
+      agent: 'codex',
+      repoPath: '/tmp/repo',
+      loopCount: 0,
+      consecutiveNoProgress: 0,
+      consecutiveErrors: 0,
+      lastProgressTime: 200,
+      lastFilesChanged: 1,
+    }, null, 2));
+
+    const result = runCli(['finalize', 'task-b'], { HOME: homeDir });
+    const output = JSON.parse(result.stderr);
+    const state = JSON.parse(fs.readFileSync(path.join(taskDirB, 'state.json'), 'utf-8'));
+
+    assert.equal(result.status, 1);
+    assert.equal(output.blocked, true);
+    assert.deepEqual(output.blockers, ['task-a']);
+    assert.equal(state.status, 'ready_to_finalize');
+    assert.equal(state.coordinationStatus, 'blocked_observed_overlap');
+  } finally {
+    fs.rmSync(homeDir, { recursive: true, force: true });
+  }
+});
+
+test('merge command blocks completed task when an earlier overlapping task is not yet integrated', () => {
+  const homeDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-merge-coordination-home-'));
+
+  try {
+    const taskDirA = path.join(homeDir, '.ralph', 'tasks', 'task-a');
+    const taskDirB = path.join(homeDir, '.ralph', 'tasks', 'task-b');
+    fs.mkdirSync(taskDirA, { recursive: true });
+    fs.mkdirSync(taskDirB, { recursive: true });
+
+    fs.writeFileSync(path.join(taskDirA, 'state.json'), JSON.stringify({
+      id: 'task-a',
+      prdPath: '/tmp/a.json',
+      prdId: 'task-a',
+      status: 'completed',
+      startTime: 100,
+      enqueuedAt: 100,
+      completedUS: ['US-001'],
+      observedWriteSurface: ['packages/contracts/src/index.ts'],
+      worktree: '',
+      logPath: path.join(taskDirA, 'agent.log'),
+      agent: 'codex',
+      repoPath: '/tmp/repo',
+      loopCount: 0,
+      consecutiveNoProgress: 0,
+      consecutiveErrors: 0,
+      lastProgressTime: 100,
+      lastFilesChanged: 1,
+    }, null, 2));
+    fs.writeFileSync(path.join(taskDirB, 'state.json'), JSON.stringify({
+      id: 'task-b',
+      prdPath: '/tmp/b.json',
+      prdId: 'task-b',
+      status: 'completed',
+      startTime: 200,
+      enqueuedAt: 200,
+      completedUS: ['US-001'],
+      observedWriteSurface: ['packages/contracts/src/index.ts'],
+      worktree: '',
+      logPath: path.join(taskDirB, 'agent.log'),
+      agent: 'codex',
+      repoPath: '/tmp/repo',
+      loopCount: 0,
+      consecutiveNoProgress: 0,
+      consecutiveErrors: 0,
+      lastProgressTime: 200,
+      lastFilesChanged: 1,
+    }, null, 2));
+
+    const result = runCli(['merge', 'task-b'], { HOME: homeDir });
+    const output = JSON.parse(result.stderr.trim().split('\n').pop());
+    const state = JSON.parse(fs.readFileSync(path.join(taskDirB, 'state.json'), 'utf-8'));
+
+    assert.equal(result.status, 1);
+    assert.equal(output.blocked, true);
+    assert.deepEqual(output.blockers, ['task-a']);
+    assert.equal(state.status, 'completed');
+    assert.equal(state.coordinationStatus, 'blocked_observed_overlap');
   } finally {
     fs.rmSync(homeDir, { recursive: true, force: true });
   }

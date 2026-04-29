@@ -1,5 +1,6 @@
 import { Task } from '../types/task';
 import { MergeResult, MergeStrategy } from './merge';
+import { buildFailedMergeTaskUpdates } from './merge-task-updates';
 
 export type MergeFailureError = Error & {
   mergeResult?: MergeResult;
@@ -19,15 +20,7 @@ export function buildMergeFailureUpdates(
   targetBranch: string,
   strategy: MergeStrategy
 ): Partial<Task> {
-  return {
-    mergeTargetBranch: targetBranch,
-    mergeStrategy: strategy,
-    mergeError: result.message,
-    integrationBranch: result.integrationBranch,
-    integrationWorktree: result.integrationWorktree,
-    mergeConflictFiles: result.conflictFiles,
-    mergeConflictAt: result.hasConflicts ? Date.now() : undefined,
-  };
+  return buildFailedMergeTaskUpdates(result, targetBranch, strategy);
 }
 
 export function createMergeFailureError(

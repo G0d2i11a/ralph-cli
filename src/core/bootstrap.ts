@@ -17,6 +17,7 @@ export interface BootstrapOptions {
   logPath?: string;
   commandRunner?: CommandRunner;
   logger?: BootstrapLogger;
+  installIfNeeded?: boolean;
 }
 
 interface PackageManifest {
@@ -701,6 +702,15 @@ export function bootstrapWorktreeDeps(
       packageManager: inspection.packageManager,
       installRoot: inspection.installRoot,
       message: inspection.reason,
+    };
+  }
+
+  if (options.installIfNeeded === false) {
+    return {
+      bootstrapped: false,
+      packageManager: inspection.packageManager,
+      installRoot: inspection.installRoot,
+      message: `Dependency install skipped: ${inspection.reason}`,
     };
   }
 

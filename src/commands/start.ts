@@ -45,12 +45,33 @@ export async function startCommand(
     console.log(JSON.stringify({
       taskId,
       status: 'pending',
-      reason: pendingState.reason === 'dependencies' ? 'waiting for dependencies' : 'queued',
+      reason: pendingState.reason === 'dependencies'
+        ? pendingState.failedDependencies?.length
+          ? 'blocked by failed dependencies'
+          : 'waiting for dependencies'
+        : pendingState.reason === 'coordination'
+          ? pendingState.failedBlockers?.length
+            ? 'blocked by failed overlapping tasks'
+            : 'waiting for overlapping task integration'
+          : 'queued',
       backend: latestTask.backend,
       dependencies: pendingState.dependencies,
+      failedDependencies: pendingState.failedDependencies,
+      recoveringDependencies: pendingState.recoveringDependencies,
+      blockers: pendingState.blockers,
+      failedBlockers: pendingState.failedBlockers,
+      recoveringBlockers: pendingState.recoveringBlockers,
+      coordinationReason: pendingState.coordinationReason,
+      integrationLane: pendingState.integrationLane,
       concurrencyLimit: pendingState.maxConcurrent,
       message: pendingState.reason === 'dependencies'
-        ? 'Task will start automatically when dependencies are completed'
+        ? pendingState.failedDependencies?.length
+          ? 'Task is blocked until failed dependency PRDs are retried or repaired'
+          : 'Task will start automatically when dependencies are completed'
+        : pendingState.reason === 'coordination'
+          ? pendingState.failedBlockers?.length
+            ? 'Task is blocked until failed overlapping task(s) are retried or repaired'
+            : 'Task will start automatically after earlier overlapping tasks integrate'
         : 'Task queued and will start automatically when capacity is available',
     }));
   } catch (error) {

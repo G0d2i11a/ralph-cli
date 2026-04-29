@@ -1,5 +1,7 @@
+import { summarizeActiveRepoPaths } from '../core/task-home-summary';
 import { getManagerStatus } from '../core/manager-state';
 import { resolveRalphHome } from '../core/paths';
+import { StateManager } from '../core/state';
 
 interface ManagerStatusCommandOptions {
   staleAfterMs?: string | number;
@@ -20,9 +22,12 @@ export async function managerStatusCommand(
   const staleAfterMs = parsePositiveNumber(options.staleAfterMs);
   const ralphHome = resolveRalphHome();
   const status = getManagerStatus({ ralphHome, staleAfterMs });
+  const stateManager = new StateManager({ ralphHome });
+  const repoSummary = summarizeActiveRepoPaths(await stateManager.listTasks());
 
   console.log(JSON.stringify({
-    ok: !status.active || !status.heartbeatStale,
+    ok: !status.active || (!status.heartbeatStale && !status.codeDriftDetected),
+    ...repoSummary,
     ...status,
   }));
 }

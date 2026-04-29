@@ -59,9 +59,11 @@ test('ConfigManager defaults agent.backend to cli', withTempHome(async () => {
   const manager = new ConfigManager();
 
   assert.equal(manager.get('agent.backend'), 'cli');
+  assert.equal(manager.get('agent.codexConversationScope'), 'story');
   assert.equal(manager.has('agent.backend'), true);
   assert.equal(resolveConfiguredBackend(manager), 'cli');
   assert.equal(manager.get('autoMerge'), false);
+  assert.equal(manager.get('merge.autoIntegrate'), true);
   assert.equal(manager.get('merge.targetBranch'), 'main');
   assert.equal(manager.get('merge.useIntegrationWorktree'), true);
   assert.equal(manager.get('merge.integrationWorktreeDir'), '.ralph-integration');
@@ -71,6 +73,19 @@ test('ConfigManager defaults agent.backend to cli', withTempHome(async () => {
   assert.equal(manager.get('finalizer.maxNoProgressRepairRounds'), 2);
   assert.equal(manager.get('finalizer.repairDeadlineSeconds'), 7200);
   assert.equal(manager.get('finalizer.repairHardCap'), 20);
+  assert.equal(manager.get('runner.maxTransientRetriesPerStory'), 3);
+  assert.equal(manager.get('runner.transientRetryBaseDelaySeconds'), 15);
+  assert.equal(manager.get('runner.transientRetryMaxDelaySeconds'), 180);
+  assert.equal(manager.get('runner.maxTransientRecoveryRequeues'), 5);
+  assert.equal(manager.get('runner.transientRecoveryBaseDelaySeconds'), 120);
+  assert.equal(manager.get('runner.transientRecoveryMaxDelaySeconds'), 900);
+  assert.equal(manager.get('runner.transientRecoveryDeadlineSeconds'), 7200);
+  assert.equal(manager.get('runner.maxTransientRecoverySameSignature'), 3);
+  assert.equal(manager.get('runner.autoRecoveryHardCap'), 20);
+  assert.equal(manager.get('runner.autoRemediateFailedBlockers'), true);
+  assert.equal(manager.get('runner.maxFailedBlockerStoryRequeues'), 1);
+  assert.equal(manager.get('runner.failedBlockerRecoveryDeadlineSeconds'), 7200);
+  assert.equal(manager.get('runner.failedBlockerRecoveryHardCap'), 2);
 }));
 
 test('ConfigManager uses RALPH_HOME without appending an extra .ralph segment', withTempHome(async (homeDir) => {
@@ -94,6 +109,7 @@ test('ConfigManager loads auto-merge settings from config', withTempHome(async (
       autoMerge: true,
       autoMergeDelay: 5,
       merge: {
+        autoIntegrate: false,
         targetBranch: 'develop',
         strategy: 'theirs',
         pullLatest: false,
@@ -116,6 +132,7 @@ test('ConfigManager loads auto-merge settings from config', withTempHome(async (
 
   assert.equal(manager.get('autoMerge'), true);
   assert.equal(manager.get('autoMergeDelay'), 5);
+  assert.equal(manager.get('merge.autoIntegrate'), false);
   assert.equal(manager.get('merge.targetBranch'), 'develop');
   assert.equal(manager.get('merge.strategy'), 'theirs');
   assert.equal(manager.get('merge.pullLatest'), false);
@@ -127,6 +144,27 @@ test('ConfigManager loads auto-merge settings from config', withTempHome(async (
   assert.equal(manager.get('finalizer.maxNoProgressRepairRounds'), 4);
   assert.equal(manager.get('finalizer.repairDeadlineSeconds'), 90);
   assert.equal(manager.get('finalizer.repairHardCap'), 8);
+  assert.equal(manager.get('runner.maxTransientRetriesPerStory'), 3);
+  assert.equal(manager.get('runner.maxTransientRecoveryRequeues'), 5);
+}));
+
+test('ConfigManager derives merge.autoIntegrate from useIntegrationWorktree when not explicitly configured', withTempHome(async (homeDir) => {
+  const configDir = path.join(homeDir, '.ralph');
+  fs.mkdirSync(configDir, { recursive: true });
+  fs.writeFileSync(
+    path.join(configDir, 'config.json'),
+    JSON.stringify({
+      merge: {
+        useIntegrationWorktree: false,
+      },
+    }, null, 2),
+  );
+
+  const { ConfigManager } = require('../dist/config/manager.js');
+  const manager = new ConfigManager();
+
+  assert.equal(manager.get('merge.useIntegrationWorktree'), false);
+  assert.equal(manager.get('merge.autoIntegrate'), false);
 }));
 
 test('resolveConfiguredBackend maps legacy sdk-runner configs to agent-runners', withTempHome(async (homeDir) => {

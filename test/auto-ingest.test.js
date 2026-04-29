@@ -203,3 +203,51 @@ test('PrdAutoIngestor retries invalid JSON only after the file changes', async (
     fs.rmSync(watchDir, { recursive: true, force: true });
   }
 });
+
+test('PrdAutoIngestor marks PRDs without explicit title as invalid', async () => {
+  const watchDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-auto-ingest-title-'));
+  const untitledPrd = path.join(watchDir, 'ez4ielts-untitled.json');
+  const signatures = new Map();
+  const stateManager = new FakeStateManager();
+  const scheduler = new FakeScheduler(stateManager);
+  const previousHome = process.env.HOME;
+  let now = 0;
+
+  try {
+    process.env.HOME = watchDir;
+
+    const ingestor = new PrdAutoIngestor({
+      watchDir,
+      repoPath: '/repo',
+      agent: 'codex',
+      settleMs: 1000,
+    }, {
+      stateManager,
+      scheduler,
+      now: () => now,
+      statSignature: (filePath) => signatures.get(filePath) || 'missing',
+    });
+
+    await ingestor.initialize();
+
+    fs.writeFileSync(untitledPrd, JSON.stringify({
+      projectName: 'fallback-project-name',
+      description: '',
+      userStories: [],
+      dependencies: [],
+    }, null, 2));
+    signatures.set(untitledPrd, 'untitled-v1');
+
+    await ingestor.scan();
+    now = 1500;
+    const results = await ingestor.scan();
+
+    assert.equal(results.length, 1);
+    assert.equal(results[0].action, 'invalid');
+    assert.match(results[0].error, /must define a non-empty top-level title/i);
+    assert.equal((await stateManager.listTasks()).length, 0);
+  } finally {
+    process.env.HOME = previousHome;
+    fs.rmSync(watchDir, { recursive: true, force: true });
+  }
+});

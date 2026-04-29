@@ -104,3 +104,49 @@ test('StateManager isolates task storage by RALPH_HOME', async () => {
     fs.rmSync(homeDir, { recursive: true, force: true });
   }
 });
+
+test('StateManager updateTaskIf refuses stale conditional updates', async () => {
+  const homeDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-state-conditional-'));
+  const previousHome = process.env.HOME;
+  const previousRalphHome = process.env.RALPH_HOME;
+
+  try {
+    process.env.HOME = homeDir;
+    delete process.env.RALPH_HOME;
+    const stateManager = new StateManager();
+    await stateManager.saveTask(createTask({
+      id: 'conditional-task',
+      status: 'running',
+      pid: 1234,
+      leaseOwner: 'worker:1234',
+    }));
+
+    await stateManager.updateTask('conditional-task', {
+      status: 'ready_to_finalize',
+      pid: undefined,
+      leaseOwner: undefined,
+    });
+
+    const result = await stateManager.updateTaskIf(
+      'conditional-task',
+      (task) => task.status === 'running' && task.pid === 1234,
+      {
+        status: 'stagnant',
+        lastError: 'stale recovery write',
+      },
+    );
+
+    const latestTask = await stateManager.loadTask('conditional-task');
+    assert.equal(result.updated, false);
+    assert.equal(latestTask.status, 'ready_to_finalize');
+    assert.equal(latestTask.lastError, undefined);
+  } finally {
+    process.env.HOME = previousHome;
+    if (previousRalphHome === undefined) {
+      delete process.env.RALPH_HOME;
+    } else {
+      process.env.RALPH_HOME = previousRalphHome;
+    }
+    fs.rmSync(homeDir, { recursive: true, force: true });
+  }
+});
