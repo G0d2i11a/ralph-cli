@@ -48,6 +48,19 @@ function gitWithEnv(args, cwd, env) {
   }).trim();
 }
 
+function isProcessRunning(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function sleepSync(ms) {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
 function prependFakePnpmToPath(rootDir) {
   const binDir = path.join(rootDir, 'fake-bin');
   const pnpmPath = path.join(binDir, 'pnpm');
@@ -564,6 +577,188 @@ test('finalizeTaskOutput enforces configured quality gate timeouts', { concurren
       process.env.RALPH_HOME = previousRalphHome;
     }
 
+    fs.rmSync(tempHome, { recursive: true, force: true });
+    fs.rmSync(repoDir, { recursive: true, force: true });
+  }
+});
+
+test('finalizeTaskOutput isolates quality gate HOME and RALPH_HOME from live Ralph home', { concurrency: false }, () => {
+  const repoDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-finalizer-env-isolation-'));
+  const liveHome = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-live-home-'));
+  const liveRalphHome = path.join(liveHome, 'live-ralph-home');
+  const prdPath = path.join(repoDir, 'prd.json');
+  const previousHome = process.env.HOME;
+  const previousRalphHome = process.env.RALPH_HOME;
+
+  try {
+    process.env.HOME = liveHome;
+    process.env.RALPH_HOME = liveRalphHome;
+    fs.mkdirSync(liveRalphHome, { recursive: true });
+
+    git(['init'], repoDir);
+    git(['checkout', '-b', 'main'], repoDir);
+    git(['config', 'user.name', 'Ralph Test'], repoDir);
+    git(['config', 'user.email', 'ralph@example.com'], repoDir);
+
+    fs.writeFileSync(prdPath, JSON.stringify({
+      id: 'prd-env-isolation',
+      title: 'Environment Isolation Task',
+      description: 'Keep quality gates away from the live Ralph home',
+      userStories: [],
+      dependencies: [],
+    }, null, 2));
+    fs.writeFileSync(path.join(repoDir, 'gate-script.js'), `
+const fs = require('node:fs');
+const path = require('node:path');
+fs.writeFileSync('gate-env.json', JSON.stringify({
+  HOME: process.env.HOME,
+  RALPH_HOME: process.env.RALPH_HOME,
+  RALPH_QUALITY_GATE_HOME: process.env.RALPH_QUALITY_GATE_HOME,
+}, null, 2));
+fs.mkdirSync(path.join(process.env.RALPH_HOME, 'manager'), { recursive: true });
+fs.writeFileSync(path.join(process.env.RALPH_HOME, 'manager', 'state.json'), 'fake-manager');
+fs.mkdirSync(path.join(process.env.HOME, '.ralph', 'tasks'), { recursive: true });
+fs.writeFileSync(path.join(process.env.HOME, '.ralph', 'tasks', 'fake-task.json'), '{}');
+`);
+    fs.writeFileSync(path.join(repoDir, 'package.json'), JSON.stringify({
+      name: 'fixture',
+      version: '1.0.0',
+      scripts: {
+        test: 'node gate-script.js',
+      },
+    }, null, 2));
+    fs.writeFileSync(path.join(repoDir, 'feature.txt'), 'base\n');
+    git(['add', '.'], repoDir);
+    git(['commit', '-m', 'feat: initial'], repoDir);
+
+    const worktreePath = path.join(repoDir, '.ralph-worktrees', 'task-env-isolation');
+    fs.mkdirSync(path.dirname(worktreePath), { recursive: true });
+    git(['worktree', 'add', '-b', 'ralph/task-env-isolation', worktreePath, 'main'], repoDir);
+    fs.appendFileSync(path.join(worktreePath, 'feature.txt'), 'change\n');
+
+    const task = {
+      id: 'task-env-isolation',
+      prdPath,
+      status: 'ready_to_finalize',
+      startTime: Date.now(),
+      completedUS: [],
+      worktree: worktreePath,
+      logPath: path.join(repoDir, '.ralph', 'tasks', 'task-env-isolation', 'agent.log'),
+      agent: 'codex',
+      repoPath: repoDir,
+      loopCount: 0,
+      consecutiveNoProgress: 0,
+      consecutiveErrors: 0,
+      lastProgressTime: Date.now(),
+      lastFilesChanged: 1,
+    };
+
+    const result = finalizeTaskOutput(task);
+    const gateEnv = JSON.parse(fs.readFileSync(path.join(worktreePath, 'gate-env.json'), 'utf-8'));
+
+    assert.equal(result.success, true);
+    assert.notEqual(gateEnv.HOME, liveHome);
+    assert.notEqual(gateEnv.RALPH_HOME, liveRalphHome);
+    assert.equal(gateEnv.RALPH_HOME, gateEnv.RALPH_QUALITY_GATE_HOME);
+    assert.equal(fs.existsSync(path.join(liveRalphHome, 'manager', 'state.json')), false);
+    assert.equal(fs.existsSync(path.join(liveHome, '.ralph', 'tasks', 'fake-task.json')), false);
+  } finally {
+    process.env.HOME = previousHome;
+    if (previousRalphHome === undefined) {
+      delete process.env.RALPH_HOME;
+    } else {
+      process.env.RALPH_HOME = previousRalphHome;
+    }
+    fs.rmSync(liveHome, { recursive: true, force: true });
+    fs.rmSync(repoDir, { recursive: true, force: true });
+  }
+});
+
+test('finalizeTaskOutput kills descendant quality gate processes on timeout', { concurrency: false }, () => {
+  const repoDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-finalizer-timeout-tree-'));
+  const prdPath = path.join(repoDir, 'prd.json');
+  const previousRalphHome = process.env.RALPH_HOME;
+  const tempHome = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-finalizer-home-'));
+  const ralphHome = path.join(tempHome, '.ralph');
+
+  try {
+    process.env.RALPH_HOME = ralphHome;
+    fs.mkdirSync(ralphHome, { recursive: true });
+    fs.writeFileSync(path.join(ralphHome, 'config.json'), JSON.stringify({
+      finalizer: {
+        qualityGateTimeout: 1,
+        qualityGates: ['typecheck'],
+      },
+    }, null, 2));
+
+    git(['init'], repoDir);
+    git(['checkout', '-b', 'main'], repoDir);
+    git(['config', 'user.name', 'Ralph Test'], repoDir);
+    git(['config', 'user.email', 'ralph@example.com'], repoDir);
+
+    fs.writeFileSync(prdPath, JSON.stringify({
+      id: 'prd-timeout-tree',
+      title: 'Timeout Process Tree Task',
+      description: 'Kill timeout descendants',
+      userStories: [],
+      dependencies: [],
+    }, null, 2));
+    fs.writeFileSync(path.join(repoDir, 'spawn-child.js'), `
+const fs = require('node:fs');
+const { spawn } = require('node:child_process');
+const child = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' });
+fs.writeFileSync('child.pid', String(child.pid));
+setInterval(() => {}, 1000);
+`);
+    fs.writeFileSync(path.join(repoDir, 'package.json'), JSON.stringify({
+      name: 'fixture',
+      version: '1.0.0',
+      scripts: {
+        typecheck: 'node spawn-child.js',
+      },
+    }, null, 2));
+    fs.writeFileSync(path.join(repoDir, 'feature.txt'), 'base\n');
+    git(['add', '.'], repoDir);
+    git(['commit', '-m', 'feat: initial'], repoDir);
+
+    const worktreePath = path.join(repoDir, '.ralph-worktrees', 'task-timeout-tree');
+    fs.mkdirSync(path.dirname(worktreePath), { recursive: true });
+    git(['worktree', 'add', '-b', 'ralph/task-timeout-tree', worktreePath, 'main'], repoDir);
+    fs.appendFileSync(path.join(worktreePath, 'feature.txt'), 'change\n');
+
+    const task = {
+      id: 'task-timeout-tree',
+      prdPath,
+      status: 'ready_to_finalize',
+      startTime: Date.now(),
+      completedUS: [],
+      worktree: worktreePath,
+      logPath: path.join(repoDir, '.ralph', 'tasks', 'task-timeout-tree', 'agent.log'),
+      agent: 'codex',
+      repoPath: repoDir,
+      loopCount: 0,
+      consecutiveNoProgress: 0,
+      consecutiveErrors: 0,
+      lastProgressTime: Date.now(),
+      lastFilesChanged: 1,
+    };
+
+    assert.throws(
+      () => finalizeTaskOutput(task),
+      /Quality gate "typecheck" timed out after 1s/
+    );
+
+    const childPid = Number(fs.readFileSync(path.join(worktreePath, 'child.pid'), 'utf-8'));
+    for (let attempt = 0; attempt < 20 && isProcessRunning(childPid); attempt += 1) {
+      sleepSync(50);
+    }
+    assert.equal(isProcessRunning(childPid), false);
+  } finally {
+    if (previousRalphHome === undefined) {
+      delete process.env.RALPH_HOME;
+    } else {
+      process.env.RALPH_HOME = previousRalphHome;
+    }
     fs.rmSync(tempHome, { recursive: true, force: true });
     fs.rmSync(repoDir, { recursive: true, force: true });
   }

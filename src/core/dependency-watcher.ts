@@ -797,6 +797,7 @@ export class DependencyWatcher {
         lastErrorHadObjectiveProgress: undefined,
         mergeError: undefined,
         mergeConflictFiles: undefined,
+        mergeConflictPhase: undefined,
         mergeConflictAt: undefined,
         integrationBranch: mergeProofRecovery?.integrationBranch ?? task.integrationBranch,
         integrationWorktree: mergeProofRecovery?.integrationWorktree ?? task.integrationWorktree,
@@ -913,6 +914,7 @@ export class DependencyWatcher {
         lastErrorHadObjectiveProgress: false,
         mergeError: mergeProbeResult.mergeable ? undefined : mergeProbeResult.message,
         mergeConflictFiles: mergeProbeResult.mergeable ? undefined : mergeProbeResult.conflictFiles,
+        mergeConflictPhase: mergeProbeResult.mergeable ? undefined : mergeProbeResult.failurePhase,
         mergeConflictAt: mergeProbeResult.mergeable ? undefined : now,
         integrationBranch: mergeProbeResult.integrationBranch,
         integrationWorktree: mergeProbeResult.integrationWorktree,
@@ -1022,6 +1024,7 @@ export class DependencyWatcher {
           lastErrorHadObjectiveProgress: undefined,
           mergeError: undefined,
           mergeConflictFiles: undefined,
+          mergeConflictPhase: undefined,
           mergeConflictAt: undefined,
           repairContext: undefined,
           autoRecoveryKind: undefined,
@@ -1052,10 +1055,14 @@ export class DependencyWatcher {
 
       const currentTotalRequeues = task.mergeRepairRecoveryTotalRequeues ?? 0;
       const currentAutoRequeues = task.autoRecoveryTotalRequeues ?? 0;
+      const integrationSyncConflict = mergeProbeResult.failurePhase === 'integration_sync';
       let stopReason: string | undefined;
       let stopMessage: string | undefined;
 
-      if (deadlineAt <= now) {
+      if (integrationSyncConflict) {
+        stopReason = 'merge_repair_integration_sync_conflict';
+        stopMessage = 'Integration branch sync conflict must be resolved before task merge repair can continue';
+      } else if (deadlineAt <= now) {
         stopReason = 'merge_repair_deadline_exhausted';
         stopMessage = 'Worker merge repair deadline exhausted';
       } else if (currentTotalRequeues >= repairConfig.repairHardCap || currentAutoRequeues >= repairConfig.repairHardCap) {
@@ -1088,6 +1095,7 @@ export class DependencyWatcher {
           message: stopMessage,
           data: {
             stopReason,
+            failurePhase: mergeProbeResult.failurePhase,
             exactProbeMessage: mergeProbeResult.message,
             conflictFiles: mergeProbeResult.conflictFiles,
             consecutiveNoProgress: nextConsecutiveNoProgress,
@@ -1103,6 +1111,7 @@ export class DependencyWatcher {
         ...task,
         mergeError: mergeProbeResult.message,
         mergeConflictFiles: mergeProbeResult.conflictFiles,
+        mergeConflictPhase: mergeProbeResult.failurePhase,
         integrationBranch: mergeProbeResult.integrationBranch,
       });
       const resetState = resetSingleStory(task, repairStoryId, {
@@ -1150,6 +1159,7 @@ export class DependencyWatcher {
         data: {
           exactProbeMessage: mergeProbeResult.message,
           conflictFiles: mergeProbeResult.conflictFiles,
+          failurePhase: mergeProbeResult.failurePhase,
           consecutiveNoProgress: nextConsecutiveNoProgress,
           totalRequeues: nextMergeRepairRequeues,
           deadlineAt,
@@ -1694,6 +1704,7 @@ export class DependencyWatcher {
           lastError: undefined,
           mergeError: undefined,
           mergeConflictFiles: undefined,
+          mergeConflictPhase: undefined,
           mergeConflictAt: undefined,
           finalizerFailure: undefined,
           repairContext: undefined,
@@ -1925,6 +1936,7 @@ export class DependencyWatcher {
             integrationStatus: 'integrated',
             mergeError: undefined,
             mergeConflictFiles: undefined,
+            mergeConflictPhase: undefined,
             mergeConflictAt: undefined,
             postFinalizeMergeProbeRequired: undefined,
             integrationBranch: mergeProbeResult.integrationBranch,
@@ -1991,6 +2003,7 @@ export class DependencyWatcher {
               mergeMessage: undefined,
               mergeError: undefined,
               mergeConflictFiles: undefined,
+              mergeConflictPhase: undefined,
               mergeConflictAt: undefined,
               postFinalizeMergeProbeRequired: undefined,
               targetSyncedAt: undefined,
@@ -2038,6 +2051,7 @@ export class DependencyWatcher {
             lastErrorHadObjectiveProgress: undefined,
             mergeError: undefined,
             mergeConflictFiles: undefined,
+            mergeConflictPhase: undefined,
             mergeConflictAt: undefined,
             postFinalizeMergeProbeRequired: true,
             repairContext: undefined,
@@ -2216,6 +2230,7 @@ export class DependencyWatcher {
       mergeMessage: undefined,
       mergeError: message,
       mergeConflictFiles: undefined,
+      mergeConflictPhase: undefined,
       mergeConflictAt: undefined,
       integrationStatus: 'failed',
       targetSyncStatus: 'not_requested',
@@ -2455,6 +2470,7 @@ export class DependencyWatcher {
             finalizerCommittedAt,
             mergeError: undefined,
             mergeConflictFiles: undefined,
+            mergeConflictPhase: undefined,
             mergeConflictAt: undefined,
             postFinalizeMergeProbeRequired: undefined,
             finalizerFailure: undefined,
@@ -2802,6 +2818,7 @@ export class DependencyWatcher {
         finalizeRepairStopReason: undefined,
         mergeError: undefined,
         mergeConflictFiles: undefined,
+        mergeConflictPhase: undefined,
         mergeConflictAt: undefined,
         mergeRepairDisplayStatus: undefined,
         mergeRepairProof: undefined,

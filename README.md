@@ -4,6 +4,8 @@
 
 **Lightweight Ralph loop**: PRD → `ralph start` → autonomous execution → done. Simple CLI tool for PRD-driven development with Codex or Claude Code.
 
+Ralph CLI's main advantage is parallel local control: one CLI binary can run many isolated project managers, each with its own Ralph home, queue, locks, logs, integration worktree, and `runner.maxConcurrent` setting. Use it when you want Atta, ez4ielts, Ralph CLI itself, or any other repo moving at the same time without sharing one fragile global queue.
+
 Based on [Geoffrey Huntley's Ralph pattern](https://ghuntley.com/ralph/) and inspired by [ralph-mcp](https://github.com/G0d2i11a/ralph-mcp).
 
 Companion project: use [Ralph MCP](https://github.com/G0d2i11a/ralph-mcp) when you want the same Ralph workflow exposed as MCP tools inside Claude Code. Use Ralph CLI when you want a standalone terminal manager, launchd restart, lease/revision recovery, and a dedicated integration worktree.
@@ -43,17 +45,19 @@ ralph list
 | Manual git branch management | Automatic worktree isolation |
 | No visibility into progress | Real-time status monitoring |
 | Manual quality checks | Auto quality gates before finalize |
+| One task watched by hand | Multiple project queues running in parallel |
 
 ## Features
 
 - **Simple CLI Interface** - Start, stop, and monitor tasks from command line
+- **Parallel Multi-Project Control Plane** - Run one always-on manager per repo, each with an isolated Ralph home and independent concurrency
 - **Git Worktree Isolation** - Each task runs in its own worktree to avoid checkout collisions; merge conflicts can still happen later
 - **Provider + Backend Support** - Keep `claude|codex` provider semantics and choose `cli` or `agent-runners`
 - **State Persistence** - Task state survives restarts
 - **Immutable Task Intake** - PRD identity, dependencies, source hash, base ref, and merge target are captured when a task is enqueued
 - **Active PRD Dedupe** - The same active PRD is not queued twice for the same repo unless explicitly requested
 - **Quality Gates** - Runs available `typecheck`, `lint`, `test`, and `build` scripts before the final commit
-- **Batch Execution** - Start multiple PRDs at once with task-level parallelism
+- **Batch Execution** - Start multiple PRDs at once; Ralph queues dependencies and runs safe work up to each home's configured concurrency
 - **Repo-Scoped Integrated Dependencies** - PRD dependencies only resolve against integrated tasks from the same repository
 - **Declared Coordination Metadata** - Optional PRD `writeSurface`, `conflictDomains`, and `integrationLane` hints are captured at intake
 - **Repo-Scoped Overlap Protection** - Scheduler, finalize, and merge block only earlier overlapping tasks from the same repo
@@ -97,6 +101,39 @@ Resolution order is:
 Each Ralph home has its own `config.json`, `tasks/`, `manager/state.json`, `manager.lock`, `scheduler.lock`, `locks/`, `logs/`, queue view, and `runner.maxConcurrent`. This is the supported way to run two different repos on one machine with clean isolation while still sharing one Ralph CLI binary.
 
 If you intentionally share one Ralph home across repos, coordination remains repo-scoped, and `ralph queue`, `ralph manager-status`, and `ralph doctor` report `repoCount`, `mixedRepos`, and active `repoPaths` so the mixed control plane is visible.
+
+### Parallel Ralph
+
+Ralph CLI is meant to be used as a small local control plane, not as a single foreground command that blocks one repository at a time.
+
+- Use one Ralph CLI installation for every project on the machine.
+- Use one `RALPH_HOME` per project to keep queues, locks, logs, manager state, and integration worktrees isolated.
+- Run one manager per project, either in separate terminals or through `manager-install` launchd services.
+- Set `runner.maxConcurrent` per home so heavy repos can run fewer workers and lighter repos can run more.
+- Within one repo, Ralph still serializes unsafe integration through dependencies, overlap detection, and integration lane locks.
+
+Example:
+
+```bash
+# Terminal or launchd service 1
+ralph --home ~/.ralph-homes/atta manager --repo ~/Project/atta
+
+# Terminal or launchd service 2
+ralph --home ~/.ralph-homes/ez4ielts manager --repo ~/Project/ez4ielts
+
+# Terminal or launchd service 3
+ralph --home ~/.ralph-homes/ralph-cli manager --repo ~/Project/ralph-cli
+
+# Feed each project independently
+ralph --home ~/.ralph-homes/atta batch-start ~/Project/atta/docs/ralph-prds/*.json --repo ~/Project/atta
+ralph --home ~/.ralph-homes/ez4ielts batch-start ~/Project/ez4ielts/tasks/*.md --repo ~/Project/ez4ielts
+
+# Watch each control plane without spawning repeated status commands
+ralph --home ~/.ralph-homes/atta queue --watch
+ralph --home ~/.ralph-homes/ez4ielts queue --watch
+```
+
+This is the intended "parallel Ralph" workflow: many isolated managers, many queued PRDs, bounded per-project concurrency, and one shared CLI binary.
 
 ### Start a new task
 
@@ -642,12 +679,12 @@ src/
 |---------|-----------|-----------|
 | **Interface** | Command line and always-on manager | MCP tools plus background runner |
 | **Agent Support** | Claude Code, Codex via `cli` or `agent-runners` | Codex or Claude via `cli`, with SDK fallback |
-| **Parallel Execution** | Automatic queueing up to configured concurrency | Automatic runner concurrency |
+| **Parallel Execution** | Multi-project managers plus per-home queueing up to configured concurrency | Automatic runner concurrency |
 | **Dependency Management** | Repo-scoped integrated dependencies | Runner-managed dependencies |
 | **Stagnation Detection** | Lease recovery, revision safety, and manager health | Automatic runner progress detection |
 | **Auto-Ingestion** | `ralph watch --auto-ingest-ez4ielts` | `ralph-runner --watch-prds` |
 | **Notifications** | None | Windows Toast |
-| **Best For** | Terminal-first automation, Codex-first workflows, finalizer/integration worktree safety | MCP-native Claude Code workflows |
+| **Best For** | Terminal-first parallel automation, Codex-first workflows, finalizer/integration worktree safety | MCP-native Claude Code workflows |
 
 ## Troubleshooting
 

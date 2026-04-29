@@ -30,6 +30,7 @@ test('buildFailedMergeTaskUpdates marks conflicts as blocked integration and lea
     success: false,
     hasConflicts: true,
     conflictFiles: ['src/app.ts'],
+    failurePhase: 'integration_sync',
     integrationBranch: 'ralph/integration/main',
     integrationWorktree: '/tmp/integration',
     message: 'Merge conflicts detected: src/app.ts',
@@ -39,5 +40,6 @@ test('buildFailedMergeTaskUpdates marks conflicts as blocked integration and lea
   assert.equal(updates.targetSyncStatus, 'not_requested');
   assert.equal(updates.mergeCommitSha, undefined);
   assert.deepEqual(updates.mergeConflictFiles, ['src/app.ts']);
+  assert.equal(updates.mergeConflictPhase, 'integration_sync');
   assert.ok(typeof updates.mergeConflictAt === 'number');
 });

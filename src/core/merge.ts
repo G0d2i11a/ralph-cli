@@ -26,6 +26,7 @@ export interface MergeResult {
   targetSynced?: boolean;
   targetSyncMessage?: string;
   conflictFiles?: string[];
+  failurePhase?: MergeFailurePhase;
   sourceBranch?: string;
   targetBranch?: string;
   baseCommitSha?: string;
@@ -38,12 +39,14 @@ export interface MergeabilityProbeResult {
   integrationBranch: string;
   integrationWorktree: string;
   conflictFiles?: string[];
+  failurePhase?: MergeFailurePhase;
   sourceKind?: MergeProofSourceKind;
   worktreeMergeState?: WorktreeMergeState;
 }
 
 export type WorktreeMergeStateKind = 'none' | 'unresolved' | 'resolved_pending_commit';
 export type MergeProofSourceKind = 'branch_head' | 'worktree_snapshot' | 'resolved_pending_merge';
+export type MergeFailurePhase = 'integration_sync' | 'source_merge' | 'worktree_unresolved';
 
 export interface WorktreeMergeState {
   kind: WorktreeMergeStateKind;
@@ -774,6 +777,7 @@ function mergeConflictResult(
   repoPath: string,
   conflicts: string[],
   details: Partial<Pick<MergeResult, 'sourceBranch' | 'targetBranch' | 'baseCommitSha'>> = {},
+  failurePhase: MergeFailurePhase = 'source_merge',
 ): MergeResult {
   tryAbortMerge(repoPath);
   return {
@@ -781,6 +785,7 @@ function mergeConflictResult(
     hasConflicts: true,
     message: `Merge conflicts detected: ${conflicts.join(', ')}`,
     conflictFiles: conflicts,
+    failurePhase,
     ...details,
   };
 }
@@ -925,6 +930,7 @@ async function mergeBranchInIntegrationWorktree(
         hasConflicts: true,
         message: `Task worktree still has unresolved merge entries: ${worktreeMergeState.unmergedFiles.join(', ')}`,
         conflictFiles: worktreeMergeState.unmergedFiles,
+        failurePhase: 'worktree_unresolved',
         integrationBranch: integration.integrationBranch,
         integrationWorktree: integration.integrationWorktree,
         sourceBranch: branchName,
@@ -953,7 +959,7 @@ async function mergeBranchInIntegrationWorktree(
             sourceBranch: normalizedTarget,
             targetBranch: integration.integrationBranch,
             baseCommitSha: task.baseCommitSha,
-          }),
+          }, 'integration_sync'),
           integrationBranch: integration.integrationBranch,
           integrationWorktree: integration.integrationWorktree,
         };
@@ -1041,7 +1047,7 @@ async function mergeBranchInIntegrationWorktree(
             sourceBranch: sourceLabel,
             targetBranch: integration.integrationBranch,
             baseCommitSha: task.baseCommitSha,
-          }),
+          }, 'source_merge'),
           integrationBranch: integration.integrationBranch,
           integrationWorktree: integration.integrationWorktree,
         };
@@ -1136,11 +1142,12 @@ async function probeBranchMergeabilityInIntegrationWorktree(
         return {
           mergeable: false,
           alreadyIntegrated: false,
-          message: `Integration branch sync failed with conflicts: ${conflicts.join(', ')}`,
-          conflictFiles: conflicts,
-          integrationBranch: integration.integrationBranch,
-          integrationWorktree: integration.integrationWorktree,
-          sourceKind,
+        message: `Integration branch sync failed with conflicts: ${conflicts.join(', ')}`,
+        conflictFiles: conflicts,
+        failurePhase: 'integration_sync',
+        integrationBranch: integration.integrationBranch,
+        integrationWorktree: integration.integrationWorktree,
+        sourceKind,
           worktreeMergeState,
         };
       }
@@ -1149,6 +1156,7 @@ async function probeBranchMergeabilityInIntegrationWorktree(
         mergeable: false,
         alreadyIntegrated: false,
         message: `Integration branch sync failed: ${error instanceof Error ? error.message : String(error)}`,
+        failurePhase: 'integration_sync',
         integrationBranch: integration.integrationBranch,
         integrationWorktree: integration.integrationWorktree,
         sourceKind,
@@ -1203,6 +1211,7 @@ async function probeBranchMergeabilityInIntegrationWorktree(
           alreadyIntegrated: false,
           message: `Merge conflicts detected: ${conflicts.join(', ')}`,
           conflictFiles: conflicts,
+          failurePhase: 'source_merge',
           integrationBranch: integration.integrationBranch,
           integrationWorktree: integration.integrationWorktree,
           sourceKind,
@@ -1214,6 +1223,7 @@ async function probeBranchMergeabilityInIntegrationWorktree(
         mergeable: false,
         alreadyIntegrated: false,
         message: `Merge probe failed: ${error instanceof Error ? error.message : String(error)}`,
+        failurePhase: 'source_merge',
         integrationBranch: integration.integrationBranch,
         integrationWorktree: integration.integrationWorktree,
         sourceKind,
@@ -1282,6 +1292,7 @@ export async function probeTaskWorktreeMergeability(
         alreadyIntegrated: false,
         message: `Task worktree still has unresolved merge entries: ${worktreeMergeState.unmergedFiles.join(', ')}`,
         conflictFiles: worktreeMergeState.unmergedFiles,
+        failurePhase: 'worktree_unresolved',
         integrationBranch: integration.integrationBranch,
         integrationWorktree: integration.integrationWorktree,
         sourceKind: 'worktree_snapshot',

@@ -1802,6 +1802,88 @@ test('dependency watcher stops failed merge repair when the unresolved worktree 
   assert.equal(task.mergeRepairDisplayStatus, 'stopped');
 });
 
+test('dependency watcher stops task repair immediately on integration sync conflicts', async () => {
+  const stateManager = new FakeStateManager([
+    {
+      id: 'failed-worker-integration-sync-conflict',
+      prdPath: '/tmp/prd.json',
+      status: 'failed',
+      startTime: 100,
+      completedUS: ['US-001'],
+      storyProgress: [
+        { id: 'US-001', status: 'passed', attempts: 1, updatedAt: 1 },
+        { id: 'US-002', status: 'failed', attempts: 2, lastError: 'merge failed', updatedAt: 1 },
+      ],
+      worktree: '/repo/.ralph-worktrees/failed-worker-integration-sync-conflict',
+      logPath: '/tmp/failed-worker-integration-sync-conflict.log',
+      agent: 'codex',
+      repoPath: '/repo',
+      loopCount: 4,
+      consecutiveNoProgress: 1,
+      consecutiveErrors: 1,
+      lastProgressTime: 100,
+      lastFilesChanged: 0,
+      lastError: 'Integration branch sync failed with conflicts: docs/TODO.md',
+      lastErrorObservedAt: Date.now() - 1000,
+      repairContext: {
+        mode: 'merge',
+        storyId: 'US-002',
+        createdAt: Date.now() - 10_000,
+        reason: 'Merge repair required by Ralph.',
+      },
+      mergeError: 'Integration branch sync failed with conflicts: docs/TODO.md',
+      mergeConflictFiles: ['docs/TODO.md'],
+      postFinalizeMergeProbeRequired: true,
+      mergeRepairRecoveryStartedAt: Date.now() - 5_000,
+      mergeRepairRecoveryDeadlineAt: Date.now() + 60_000,
+      mergeRepairRecoveryConsecutiveNoProgress: 0,
+      mergeRepairRecoveryLastConflictSignature: 'docs/TODO.md',
+    },
+  ]);
+
+  const watcher = new DependencyWatcher(
+    {},
+    {
+      stateManager,
+      configManager: createConfigManager(),
+      scheduler: {
+        schedulePendingTasks: async () => [],
+      },
+      sleep: async () => undefined,
+      logger: { log() {}, error() {} },
+      probeWorktreeMergeability: async () => ({
+        mergeable: false,
+        alreadyIntegrated: false,
+        message: 'Integration branch sync failed with conflicts: docs/TODO.md',
+        conflictFiles: ['docs/TODO.md'],
+        failurePhase: 'integration_sync',
+        integrationBranch: 'ralph/integration/main',
+        integrationWorktree: '/tmp/integration',
+        sourceKind: 'worktree_snapshot',
+        worktreeMergeState: {
+          kind: 'none',
+          usesGitLocal: false,
+          gitDir: '/repo/.git/worktrees/failed-worker-integration-sync-conflict',
+          headSha: 'abc123',
+          mergeParents: [],
+          unmergedFiles: [],
+          changedFiles: ['src/task.ts'],
+          statusPorcelain: ' M src/task.ts',
+          statusSignature: 'task-state',
+        },
+      }),
+    },
+  );
+
+  await watcher.recoverFailedWorkerMergeRepairTasks();
+  const task = stateManager.tasks.get('failed-worker-integration-sync-conflict');
+  assert.equal(task.status, 'failed');
+  assert.equal(task.mergeRepairRecoveryStopReason, 'merge_repair_integration_sync_conflict');
+  assert.equal(task.mergeConflictPhase, 'integration_sync');
+  assert.equal(task.mergeRepairRecoveryTotalRequeues, undefined);
+  assert.equal(task.mergeRepairDisplayStatus, 'stopped');
+});
+
 test('dependency watcher refuses worker merge repair recovery when another story is incomplete', async () => {
   const stateManager = new FakeStateManager([
     {

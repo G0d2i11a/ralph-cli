@@ -2,6 +2,8 @@
 
 Ralph CLI 是一个面向 PRD 驱动开发的轻量命令行工具：`PRD -> ralph start -> 自动执行 -> finalize`。
 
+它的核心亮点是“并行 Ralph”：同一个 Ralph CLI 二进制可以同时驱动多个项目，每个项目使用独立的 Ralph Home、manager、queue、lock、log、integration worktree 和 `runner.maxConcurrent`。这样 Atta、ez4ielts、Ralph CLI 自己或其他 repo 可以同时推进，而不是挤在一个脆弱的全局队列里。
+
 配套项目：[Ralph MCP](https://github.com/G0d2i11a/ralph-mcp) 把同一套 Ralph 工作流暴露成 Claude Code 里的 MCP 工具。需要独立命令行 manager、launchd 重启、lease/revision 恢复和独立 integration worktree 时，用 Ralph CLI；需要在 Claude Code/MCP 对话里执行 `ralph_start` / `ralph_status` 时，用 Ralph MCP。
 
 ## 快速开始
@@ -33,6 +35,39 @@ ralph stats <task-id>
 ralph stats --all
 ralph finalize <task-id>
 ```
+
+## 并行 Ralph
+
+Ralph CLI 不是只能前台盯一个任务的工具，而是一个本地控制面：
+
+- 一台机器只需要安装一个 Ralph CLI。
+- 每个项目使用独立 `RALPH_HOME`，隔离 queue、lock、log、manager state 和 integration worktree。
+- 每个项目运行一个 manager，可以用不同终端启动，也可以用 `manager-install` 注册成 launchd 常驻服务。
+- 每个 Ralph Home 单独配置 `runner.maxConcurrent`，重项目可以保守一点，轻项目可以更高并发。
+- 同一个 repo 内部仍会通过 dependency、overlap detection 和 integration lane lock 排序，避免不安全合并。
+
+示例：
+
+```bash
+# manager 1
+ralph --home ~/.ralph-homes/atta manager --repo ~/Project/atta
+
+# manager 2
+ralph --home ~/.ralph-homes/ez4ielts manager --repo ~/Project/ez4ielts
+
+# manager 3
+ralph --home ~/.ralph-homes/ralph-cli manager --repo ~/Project/ralph-cli
+
+# 每个项目独立喂 PRD
+ralph --home ~/.ralph-homes/atta batch-start ~/Project/atta/docs/ralph-prds/*.json --repo ~/Project/atta
+ralph --home ~/.ralph-homes/ez4ielts batch-start ~/Project/ez4ielts/tasks/*.md --repo ~/Project/ez4ielts
+
+# 每个控制面可以独立 watch，避免反复 spawn status 命令
+ralph --home ~/.ralph-homes/atta queue --watch
+ralph --home ~/.ralph-homes/ez4ielts queue --watch
+```
+
+这就是推荐的并行使用方式：多个隔离 manager、多批 PRD 队列、按项目限制并发、共用一个 Ralph CLI 二进制。
 
 ## Ralph Home 隔离
 

@@ -4,7 +4,7 @@ const os = require('node:os');
 const path = require('node:path');
 
 const testHome = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-cli-test-home-'));
-const testFiles = fs.readdirSync(path.join(__dirname))
+const testFiles = fs.readdirSync(__dirname)
   .filter((file) => file.endsWith('.test.js'))
   .sort()
   .map((file) => path.join('test', file));
@@ -13,6 +13,9 @@ try {
   const env = {
     ...process.env,
     HOME: testHome,
+    USERPROFILE: testHome,
+    XDG_CONFIG_HOME: path.join(testHome, '.config'),
+    XDG_CACHE_HOME: path.join(testHome, '.cache'),
   };
   delete env.RALPH_HOME;
 

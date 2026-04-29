@@ -4,12 +4,14 @@ import {
   FinalizerFailureDetails,
   TaskRepairContext,
   TaskRepairMode,
+  TaskMergeConflictPhase,
 } from '../types/task';
 
 interface RepairContextTaskView {
   repairContext?: TaskRepairContext;
   finalizerFailure?: FinalizerFailureDetails;
   mergeConflictFiles?: string[];
+  mergeConflictPhase?: TaskMergeConflictPhase;
   observedWriteSurface?: string[];
   observedPackageSurface?: string[];
   prdId?: string;
@@ -19,6 +21,7 @@ interface RepairContextTaskView {
 type MergeRepairContextTaskView = Pick<
   RepairContextTaskView,
   'mergeConflictFiles'
+  | 'mergeConflictPhase'
 > & Pick<
   TaskRepairContextTaskState,
   'integrationBranch' | 'mergeTargetBranch' | 'intendedMergeTarget' | 'lastError' | 'mergeError'
@@ -55,6 +58,18 @@ export function buildMergeRepairReason(task: MergeRepairContextTaskView): string
     ? task.mergeConflictFiles.join(', ')
     : 'unknown conflict files';
   const integrationTarget = task.integrationBranch || task.mergeTargetBranch || task.intendedMergeTarget || 'main';
+  if (task.mergeConflictPhase === 'integration_sync') {
+    return [
+      'Integration branch sync repair required by Ralph.',
+      `Conflict files: ${conflictFiles}.`,
+      `Integration target: ${integrationTarget}.`,
+      'The integration branch cannot sync the merge target before this task is checked.',
+      'Resolve the conflict between the integration branch and the merge target first; editing only the task branch may not change the probe result.',
+      'Do not compare against origin/main unless it is the configured merge target.',
+      task.mergeError || task.lastError ? `Original merge error: ${task.mergeError || task.lastError}` : undefined,
+    ].filter(Boolean).join(' ');
+  }
+
   const reason = [
     'Merge repair required by Ralph.',
     `Conflict files: ${conflictFiles}.`,
@@ -154,13 +169,21 @@ function buildMergeRepairStory(
   lastStoryError?: string,
 ): UserStory {
   const mergeFiles = formatInlineList(task.mergeConflictFiles);
+  const isIntegrationSyncRepair = task.mergeConflictPhase === 'integration_sync'
+    || /Integration branch sync failed/i.test(task.repairContext?.reason || lastStoryError || '');
   const descriptionLines = [
     'Ralph is asking for merge repair, not a new feature pass.',
     'All PRD stories for this task have already passed. This user story is only the scheduling anchor for the repair.',
-    'Resolve the integration conflict semantically. Preserve both the already-integrated target behavior and this task\'s intended behavior.',
-    'Ralph will only accept this repair when the actual task branch/worktree itself passes the exact mergeability probe against the integration target.',
-    'Do not stop at a temp clone, a manual merge transcript, a merge-tree grep, or a narrative about how the conflict could be resolved. Apply the resolution in this task worktree/branch.',
-    'If you validate in a temp clone, treat that as advisory only. The real proof must still be the task worktree/branch becoming directly mergeable without further manual edits.',
+    isIntegrationSyncRepair
+      ? 'The current failure is in the integration-branch sync phase, before this task branch is merged. Inspect the configured integration branch and merge target instead of defaulting to origin/main.'
+      : 'Resolve the integration conflict semantically. Preserve both the already-integrated target behavior and this task\'s intended behavior.',
+    isIntegrationSyncRepair
+      ? 'Ralph will only accept this repair after the integration branch can sync the configured merge target and then the task branch/worktree passes the exact mergeability probe.'
+      : 'Ralph will only accept this repair when the actual task branch/worktree itself passes the exact mergeability probe against the integration target.',
+    isIntegrationSyncRepair
+      ? 'Materialize the repair in the branch/worktree that the exact probe uses. Do not stop at a temp clone, merge-tree transcript, or origin/main comparison.'
+      : 'Do not stop at a temp clone, a manual merge transcript, a merge-tree grep, or a narrative about how the conflict could be resolved. Apply the resolution in this task worktree/branch.',
+    'If you validate in a temp clone, treat that as advisory only. The real proof must still be the exact probe becoming clean without further manual edits.',
     `Repair reason: ${task.repairContext?.reason || lastStoryError || 'Merge repair required.'}`,
   ];
 
@@ -191,8 +214,10 @@ function buildMergeRepairStory(
     acceptanceCriteria: [
       'Resolve the merge conflict without dropping either side\'s intended behavior.',
       'Keep all already-passed story behavior intact and do not expand scope.',
-      'Demonstrate that the actual task branch/worktree can merge into the integration target without content conflicts; tests alone are not sufficient.',
-      'A temp clone or manual merge rehearsal is not sufficient unless the same resolution is materialized in this task branch/worktree.',
+      isIntegrationSyncRepair
+        ? 'Demonstrate that the integration branch can sync the configured merge target, then that the task branch/worktree can merge without content conflicts; tests alone are not sufficient.'
+        : 'Demonstrate that the actual task branch/worktree can merge into the integration target without content conflicts; tests alone are not sufficient.',
+      'A temp clone or manual merge rehearsal is not sufficient unless the same resolution is materialized where Ralph probes it.',
       'Leave the task branch ready for restricted finalization.',
       ...story.acceptanceCriteria.map((criterion) => `Preserve original requirement: ${criterion}`),
     ],
