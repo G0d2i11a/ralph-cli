@@ -58,6 +58,55 @@ Body only.
   ]);
 });
 
+test('parsePRD supports markdown frontmatter execution metadata and top-level acceptance criteria', () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-prd-frontmatter-'));
+  const prdPath = path.join(tempDir, 'prd.md');
+
+  try {
+    fs.writeFileSync(prdPath, `---
+id: prd-markdown-frontmatter
+title: Markdown Frontmatter Intake
+status: ready
+priority: P1
+dependencies:
+  - upstream-prd
+declaredWriteSurface:
+  - src/core/task-intake.ts
+declaredConflictDomains:
+  - prd-ingestion
+integrationLane: intake
+acceptanceCriteria:
+  - Start enqueues the markdown PRD
+  - Batch start enqueues the markdown PRD
+---
+
+## Context
+
+Implementation details live in prose, but acceptance criteria are explicit.
+`);
+
+    const prd = parsePRD(prdPath);
+
+    assert.equal(prd.id, 'prd-markdown-frontmatter');
+    assert.equal(prd.title, 'Markdown Frontmatter Intake');
+    assert.equal(prd.status, 'ready');
+    assert.equal(prd.priority, 'P1');
+    assert.deepEqual(prd.dependencies, ['upstream-prd']);
+    assert.deepEqual(prd.writeSurface, ['src/core/task-intake.ts']);
+    assert.deepEqual(prd.conflictDomains, ['prd-ingestion']);
+    assert.equal(prd.integrationLane, 'intake');
+    assert.deepEqual(prd.acceptanceCriteria, [
+      'Start enqueues the markdown PRD',
+      'Batch start enqueues the markdown PRD',
+    ]);
+    assert.equal(prd.userStories.length, 1);
+    assert.equal(prd.userStories[0].id, 'US-001');
+    assert.deepEqual(prd.userStories[0].acceptanceCriteria, prd.acceptanceCriteria);
+  } finally {
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+});
+
 test('parsePRD falls back to projectName for JSON PRDs without title', () => {
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-prd-json-'));
   const prdPath = path.join(tempDir, 'recording-prd.json');

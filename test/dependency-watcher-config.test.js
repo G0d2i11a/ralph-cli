@@ -1,5 +1,8 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const os = require('node:os');
+const path = require('node:path');
 
 const { DependencyWatcher } = require('../dist/core/dependency-watcher.js');
 
@@ -64,4 +67,37 @@ test('DependencyWatcher requires a watch directory before enabling ez4ielts auto
       }
     );
   }, /watch directory/);
+});
+
+test('DependencyWatcher enables configured PRD globs without an ez4ielts watch directory', () => {
+  const repoDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-configured-prd-glob-repo-'));
+
+  try {
+    const watcher = new DependencyWatcher(
+      {},
+      {
+        stateManager: new FakeStateManager(),
+        scheduler: {
+          schedulePendingTasks: async () => [],
+        },
+        configManager: {
+          get: (key) => ({
+            'runner.pollInterval': 7,
+            'ingestion.prds.enabled': true,
+            'ingestion.prds.globs': [
+              {
+                repo: repoDir,
+                glob: 'tasks/prd-*.md',
+              },
+            ],
+            'ingestion.prds.settleMs': 0,
+          })[key],
+        },
+      }
+    );
+
+    assert.equal(watcher.isAutoIngestEnabled(), true);
+  } finally {
+    fs.rmSync(repoDir, { recursive: true, force: true });
+  }
 });

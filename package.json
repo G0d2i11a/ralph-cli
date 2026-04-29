@@ -10,7 +10,7 @@
     "build": "tsc",
     "build:menubar": "bash ./tools/ralph-menubar/build.sh",
     "dev": "tsc --watch",
-    "test": "npm run build && node --test test/*.test.js",
+    "test": "npm run build && sh -c 'ORIGINAL_HOME=$HOME; HOME=/tmp/ralph-cli-test-home-$$ RALPH_HOME= COREPACK_HOME=${COREPACK_HOME:-$ORIGINAL_HOME/.cache/node/corepack} node --test test/*.test.js'",
     "prepare": "npm run build"
   },
   "keywords": [

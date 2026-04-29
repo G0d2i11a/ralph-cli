@@ -139,24 +139,27 @@ Tasks beyond the configured concurrency limit stay `pending` and start automatic
 
 Queued tasks are pinned to the repo base ref captured at intake. Changing the repo checkout later does not change the base used when the queued task eventually starts.
 
-### Watch pending tasks and auto-ingest new ez4ielts PRDs
+### Watch pending tasks and auto-ingest new PRDs
 
 ```bash
 # Queue safety-net only
 ralph watch
 
-# Queue safety-net + auto-ingest brand new ez4ielts PRDs
+# Queue safety-net + auto-ingest brand new legacy ez4ielts PRDs
 ralph watch --auto-ingest-ez4ielts
 ```
 
 When `--auto-ingest-ez4ielts` is enabled, Ralph polls the configured ez4ielts PRD directory (pass `--ez4ielts-dir`, set `RALPH_EZ4IELTS_WATCH_DIR`, or configure `ingestion.ez4ielts.watchDir` in `~/.ralph/config.json`) for new files matching `ez4ielts-*.json` and sends them through the same queue/start flow as `ralph start`.
 
+For non-ez4ielts projects, set `ingestion.prds.enabled=true` and configure `ingestion.prds.globs` in that Ralph home's config, for example `{ "repo": "/path/to/project", "glob": "tasks/prd-*.md" }`.
+
 - Existing matching files are treated as backlog and skipped when the watcher starts.
 - Each new file is ingested once, even if it is modified again later.
 - Auto-ingested tasks default to Codex unless `--agent claude` is passed.
 - Auto-ingested tasks default to the `cli` backend unless `--backend agent-runners` is passed.
-- Auto-ingested tasks default to the watched docs directory parent as their repo unless `--repo` is passed.
-- Auto-ingest requires an explicit watch directory via `--ez4ielts-dir`, `RALPH_EZ4IELTS_WATCH_DIR`, or `ingestion.ez4ielts.watchDir` in `RALPH_HOME/config.json`.
+- Legacy ez4ielts auto-ingested tasks default to the watched docs directory parent as their repo unless `--repo` is passed.
+- Generic PRD glob entries resolve relative globs from their configured `repo` / `repoPath`, or from `--repo` when no repo is set on the entry.
+- Legacy ez4ielts auto-ingest requires an explicit watch directory via `--ez4ielts-dir`, `RALPH_EZ4IELTS_WATCH_DIR`, or `ingestion.ez4ielts.watchDir` in `RALPH_HOME/config.json`.
 - New files still respect dependency checks and the configured concurrency limit.
 
 You can also enable the same mode through `RALPH_HOME/config.json` (default: `~/.ralph/config.json`) and then run plain `ralph watch`.
@@ -541,6 +544,16 @@ Ralph CLI stores configuration in `~/.ralph/config.json`:
     "repairHardCap": 20
   },
   "ingestion": {
+    "prds": {
+      "enabled": false,
+      "globs": [
+        {
+          "repo": "/absolute/path/to/your/project",
+          "glob": "tasks/prd-*.md"
+        }
+      ],
+      "settleMs": 2000
+    },
     "ez4ielts": {
       "enabled": false,
       "watchDir": "/absolute/path/to/your/ez4ielts-prds",
@@ -580,6 +593,26 @@ Enable ez4ielts auto-ingestion by changing `ingestion.ez4ielts.enabled` to `true
   }
 }
 ```
+
+For project-specific PRD locations, configure generic watched PRD globs per Ralph home instead:
+
+```json
+{
+  "ingestion": {
+    "prds": {
+      "enabled": true,
+      "globs": [
+        {
+          "repo": "/absolute/path/to/your/project",
+          "glob": "tasks/prd-*.md"
+        }
+      ]
+    }
+  }
+}
+```
+
+Relative PRD globs are resolved from the configured `repo` (or `repoPath`). The legacy `ingestion.ez4ielts` JSON watcher remains supported for existing configs.
 
 ## Development
 

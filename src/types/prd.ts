@@ -12,6 +12,10 @@ export interface PRD {
   id: string;
   title: string;
   description: string;
+  status?: string;
+  priority?: string;
+  executable?: boolean;
+  acceptanceCriteria?: string[];
   userStories: UserStory[];
   dependencies?: string[];
   writeSurface?: string[];
