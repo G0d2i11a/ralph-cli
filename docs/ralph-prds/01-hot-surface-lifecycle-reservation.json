@@ -1,0 +1,53 @@
+{
+  "id": "ralph-hot-surface-lifecycle-reservation",
+  "title": "Reserve hot write surfaces across the full task lifecycle",
+  "description": "Prevent overlapping tasks from overtaking each other once a write surface becomes hot. Extend coordination so declared and observed write surfaces reserve a conflict cluster from start through running, finalize, merge repair, blocked conflict, retry, stop, or terminal integration.",
+  "declaredWriteSurface": [
+    "src/core/scheduler.ts",
+    "src/core/task-coordination.ts",
+    "src/core/dependency-watcher.ts",
+    "src/commands/queue.ts",
+    "src/types/task.ts",
+    "test/scheduler.test.js",
+    "test/task-coordination.test.js",
+    "test/queue-status.test.js"
+  ],
+  "declaredConflictDomains": [
+    "scheduler",
+    "coordination",
+    "merge-repair"
+  ],
+  "integrationLane": "scheduler",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Reserve observed conflict clusters while work is active",
+      "description": "Use declared and observed write surfaces to hold a conflict cluster while a task is pending, running, ready to finalize, finalizing, or merge repairing.",
+      "acceptanceCriteria": [
+        "A later task with overlapping declared or observed surfaces remains pending while an earlier owner is non-terminal.",
+        "The queue summary explains the owner task and conflict surface that caused the block.",
+        "Non-overlapping tasks in the same repo can still run up to the configured concurrency limit."
+      ]
+    },
+    {
+      "id": "US-002",
+      "title": "Release reservations only on explicit terminal states",
+      "description": "Release hot-surface ownership only when the owner task integrates, is archived/stopped as terminal, or is explicitly demoted by retry policy.",
+      "acceptanceCriteria": [
+        "Completed integrated tasks release their conflict cluster.",
+        "Failed or blocked-conflict tasks keep the cluster reserved until retry, stop, or explicit recovery changes state.",
+        "Tests cover running, ready_to_finalize, blocked_conflict, failed, stopped, and completed integrated transitions."
+      ]
+    },
+    {
+      "id": "US-003",
+      "title": "Expose cluster state for operators",
+      "description": "Make hot-surface reservations visible in queue/status output so operators can see why a task is not starting.",
+      "acceptanceCriteria": [
+        "Queue compact JSON includes coordination owner, phase, lane, and reason for hot-surface waits.",
+        "Human queue output keeps the message short and actionable.",
+        "npm test passes with scheduler and queue regression coverage."
+      ]
+    }
+  ]
+}

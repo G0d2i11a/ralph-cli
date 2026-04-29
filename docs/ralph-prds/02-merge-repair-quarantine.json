@@ -1,0 +1,56 @@
+{
+  "id": "ralph-merge-repair-quarantine",
+  "title": "Quarantine failed merge-repair blockers before downstream work starts",
+  "description": "Turn failed merge-repair and blocked-conflict tasks into explicit quarantine owners. Downstream overlapping PRDs must wait until the owner is retried, manually resolved, stopped, demoted, or proven integrated.",
+  "dependencies": [
+    "ralph-hot-surface-lifecycle-reservation"
+  ],
+  "declaredWriteSurface": [
+    "src/core/dependency-watcher.ts",
+    "src/core/auto-recovery-policy.ts",
+    "src/core/repair-context.ts",
+    "src/commands/retry.ts",
+    "src/commands/queue.ts",
+    "test/failed-recovery.test.js",
+    "test/retry-cli.test.js",
+    "test/queue-status.test.js"
+  ],
+  "declaredConflictDomains": [
+    "merge-repair",
+    "auto-recovery",
+    "coordination"
+  ],
+  "integrationLane": "scheduler",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Keep failed merge-repair owners blocking overlap",
+      "description": "A failed task with merge-repair context or blocked-conflict integration state must continue to own its hot surface.",
+      "acceptanceCriteria": [
+        "Later overlapping tasks are not started behind a failed merge-repair owner.",
+        "The queue attention reason distinguishes quarantine from generic failure.",
+        "A non-overlapping task can still start while the quarantine exists."
+      ]
+    },
+    {
+      "id": "US-002",
+      "title": "Provide bounded exits from quarantine",
+      "description": "Retry, stop, demote, or exact integration proof should be explicit ways out of quarantine.",
+      "acceptanceCriteria": [
+        "Retry preserves anchored merge repair context when the conflict is still present.",
+        "Exact mergeability or already-integrated proof clears quarantine without redoing unrelated stories.",
+        "Stop or explicit demotion releases or transfers ownership with an auditable queue reason."
+      ]
+    },
+    {
+      "id": "US-003",
+      "title": "Test repeated no-progress and progress cases",
+      "description": "Avoid fixed attempt loops that stop despite objective progress, while still stopping true repeated failures.",
+      "acceptanceCriteria": [
+        "Repeated identical failed merge-repair observations stop according to policy.",
+        "Shrinking conflicts or changed proof signatures refresh recovery state.",
+        "npm test passes with quarantine and retry regressions."
+      ]
+    }
+  ]
+}

@@ -1,0 +1,56 @@
+{
+  "id": "ralph-markdown-prd-ingestion",
+  "title": "Ingest Markdown PRDs from project task directories",
+  "description": "Support controlled ingestion of Markdown PRDs such as ez4ielts tasks/prd-*.md. The ingestor must parse frontmatter, avoid duplicate active tasks, respect dependencies, and not assume the old ez4ielts JSON-only watch pattern.",
+  "dependencies": [
+    "ralph-hot-surface-lifecycle-reservation"
+  ],
+  "declaredWriteSurface": [
+    "src/core/prd-auto-ingest.ts",
+    "src/core/task-intake.ts",
+    "src/utils/helpers.ts",
+    "src/types/prd.ts",
+    "src/commands/watch.ts",
+    "src/commands/manager.ts",
+    "test/auto-ingest.test.js",
+    "test/prd-parser.test.js",
+    "test/task-intake.test.js"
+  ],
+  "declaredConflictDomains": [
+    "prd-ingestion",
+    "task-intake"
+  ],
+  "integrationLane": "intake",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Parse Markdown PRDs with frontmatter safely",
+      "description": "Extract id, title, status, priority, dependencies, declared surfaces, and acceptance criteria from Markdown PRDs without treating prose-only strategy docs as implementation tasks by default.",
+      "acceptanceCriteria": [
+        "Markdown PRDs with valid frontmatter can be enqueued by start and batch-start.",
+        "Umbrella or strategy PRDs can be marked non-executable and are skipped by auto-ingest.",
+        "Missing title or invalid dependency metadata fails intake with a clear message."
+      ]
+    },
+    {
+      "id": "US-002",
+      "title": "Watch configured task directories",
+      "description": "Allow managers to watch project-specific task globs such as tasks/prd-*.md without hardcoding ez4ielts JSON names.",
+      "acceptanceCriteria": [
+        "Config can declare watched PRD globs per Ralph home.",
+        "Auto-ingest dedupes by repo and PRD id.",
+        "Existing JSON PRD ingestion behavior remains compatible."
+      ]
+    },
+    {
+      "id": "US-003",
+      "title": "Cover Markdown ingestion with regression tests",
+      "description": "Add tests for new files, modified invalid files, dependency extraction, duplicate suppression, and non-executable strategy documents.",
+      "acceptanceCriteria": [
+        "Tests cover Markdown and JSON PRD intake paths.",
+        "Queue state records the immutable PRD source hash for Markdown PRDs.",
+        "npm test passes."
+      ]
+    }
+  ]
+}

@@ -1,0 +1,56 @@
+{
+  "id": "ralph-validation-evidence-manifest",
+  "title": "Persist validation evidence manifests for finalized tasks",
+  "description": "Record validation commands, pass/fail evidence, quality gates, and skipped-gate reasons as structured task delivery metadata. Operators should be able to inspect what proved a task safe before integration.",
+  "dependencies": [
+    "ralph-hot-surface-lifecycle-reservation"
+  ],
+  "declaredWriteSurface": [
+    "src/core/finalizer.ts",
+    "src/core/merge-task-updates.ts",
+    "src/types/task.ts",
+    "src/commands/status.ts",
+    "src/commands/queue.ts",
+    "test/finalizer-quality-gates.test.js",
+    "test/task-delivery.test.js",
+    "test/queue-status.test.js"
+  ],
+  "declaredConflictDomains": [
+    "finalizer",
+    "task-delivery",
+    "quality-gates"
+  ],
+  "integrationLane": "delivery",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Capture structured validation evidence",
+      "description": "Persist command, cwd, duration, exit code, stdout/stderr summary, and quality gate classification for each validation run used by finalization.",
+      "acceptanceCriteria": [
+        "Completed tasks include a validation evidence manifest in task state or a linked artifact.",
+        "Failed gates record enough diagnostic data for repair without storing excessive logs inline.",
+        "Skipped gates require explicit reason metadata."
+      ]
+    },
+    {
+      "id": "US-002",
+      "title": "Expose evidence in status and queue views",
+      "description": "Operators can see which gates passed, failed, or were skipped without opening raw logs.",
+      "acceptanceCriteria": [
+        "status JSON includes validation evidence summary.",
+        "queue compact output includes whether terminal tasks have validation evidence.",
+        "Human output stays concise."
+      ]
+    },
+    {
+      "id": "US-003",
+      "title": "Use evidence for future repair and audits",
+      "description": "Make evidence available to retry, repair prompts, and Oracle packets without recomputing stale diagnostics.",
+      "acceptanceCriteria": [
+        "Retry/finalize repair can include the latest validation evidence summary.",
+        "Tests cover passed, failed, timed-out, and skipped validation evidence.",
+        "npm test passes."
+      ]
+    }
+  ]
+}

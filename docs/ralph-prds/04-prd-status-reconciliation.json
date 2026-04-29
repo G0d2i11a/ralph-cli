@@ -1,0 +1,54 @@
+{
+  "id": "ralph-prd-status-reconciliation",
+  "title": "Reconcile stale PRD status before enqueueing",
+  "description": "Detect PRDs that are marked pending but appear already implemented, completed, archived, or broad umbrella strategy documents. Ralph should require a narrow remaining-delta PRD before starting duplicate work.",
+  "dependencies": [
+    "ralph-markdown-prd-ingestion"
+  ],
+  "declaredWriteSurface": [
+    "src/core/task-intake.ts",
+    "src/core/prd-auto-ingest.ts",
+    "src/commands/start.ts",
+    "src/commands/batch-start.ts",
+    "src/commands/doctor.ts",
+    "test/task-intake.test.js",
+    "test/cli-new-commands.test.js"
+  ],
+  "declaredConflictDomains": [
+    "prd-ingestion",
+    "doctor"
+  ],
+  "integrationLane": "intake",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Detect non-executable or stale PRDs",
+      "description": "Refuse or warn on PRDs that are umbrella strategy docs, already completed according to frontmatter, or clearly stale against task history.",
+      "acceptanceCriteria": [
+        "Completed or archived PRDs are not auto-ingested.",
+        "Umbrella PRDs require an explicit allow flag or executable frontmatter.",
+        "The refusal message tells the operator to create a narrow delta PRD."
+      ]
+    },
+    {
+      "id": "US-002",
+      "title": "Surface dependency and duplicate risks",
+      "description": "Before enqueueing a batch, show missing dependencies, active duplicates, completed duplicates, and broad write-surface overlap.",
+      "acceptanceCriteria": [
+        "batch-start reports skipped, blocked, and enqueued PRDs separately.",
+        "doctor can check a PRD folder for stale status and duplicate active tasks.",
+        "The default path remains conservative and does not start ambiguous work."
+      ]
+    },
+    {
+      "id": "US-003",
+      "title": "Validate against ez4ielts-style Markdown task indexes",
+      "description": "Use task index and frontmatter evidence to keep Markdown PRD status aligned before work enters the queue.",
+      "acceptanceCriteria": [
+        "Tests include pending, completed, in_progress, and non-executable Markdown samples.",
+        "Status reconciliation does not mutate user docs unless an explicit command is added.",
+        "npm test passes."
+      ]
+    }
+  ]
+}
