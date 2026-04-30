@@ -75,9 +75,48 @@ func storySummary(_ task: TaskState) -> String? {
   let counts = storyCounts(task)
   guard counts.total > 0 else { return nil }
   if let currentUS = task.currentUS, !currentUS.isEmpty {
-    return "Story progress \(counts.completed)/\(counts.total), current \(currentUS)"
+    return "\(counts.completed)/\(counts.total) stories passed, now \(currentUS)"
   }
-  return "Story progress \(counts.completed)/\(counts.total)"
+  return "\(counts.completed)/\(counts.total) stories passed"
+}
+
+func prdIdentity(_ task: TaskState) -> String? {
+  if let prdId = task.prdId, !prdId.isEmpty {
+    return prdId
+  }
+  return pathStem(task.prdPath)
+}
+
+func taskStageSummary(_ task: TaskState) -> String? {
+  if let nextAction = trimSingleLine(task.nextAction, limit: 140) {
+    return nextAction
+  }
+
+  switch task.status {
+  case "running":
+    if let currentUS = task.currentUS, !currentUS.isEmpty {
+      return "Working on \(currentUS)"
+    }
+    return "Worker is making changes"
+  case "pending":
+    return "Waiting in queue"
+  case "ready_to_finalize":
+    return "Ready for finalizer"
+  case "finalizing":
+    return "Finalizer is validating and integrating"
+  case "completed":
+    return isIntegratedCompletion(task) ? "Integrated into the project branch" : "Completed"
+  case "failed", "failed_finalize", "stagnant":
+    return trimSingleLine(task.errorMessage ?? task.mergeError ?? task.attentionReason, limit: 140)
+  default:
+    return nil
+  }
+}
+
+func storyStatusLabel(_ story: StoryProgress) -> String {
+  guard let id = story.id else { return story.status ?? "unknown" }
+  guard let status = story.status else { return id }
+  return "\(id): \(status.replacingOccurrences(of: "_", with: " "))"
 }
 
 func trimSingleLine(_ text: String?, limit: Int = 180) -> String? {

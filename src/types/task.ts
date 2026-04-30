@@ -13,7 +13,7 @@ export type FinalizeFailureClass =
   | 'typescript_diagnostics'
   | 'quality_gate_failure'
   | 'unknown';
-export type TaskErrorClass = 'transient_backend' | 'transport' | 'browser_automation' | 'semantic' | 'quality_gate' | 'merge_conflict' | 'stagnation' | 'unknown';
+export type TaskErrorClass = 'transient_backend' | 'transport' | 'browser_automation' | 'semantic' | 'quality_gate' | 'merge_conflict' | 'stagnation' | 'orphaned_worker' | 'unknown';
 export type TaskIntegrationStatus = 'not_started' | 'integrated' | 'blocked_conflict' | 'failed';
 export type TaskTargetSyncStatus = 'not_requested' | 'synced' | 'deferred_dirty_checkout' | 'disabled' | 'failed';
 export type TaskCoordinationStatus = 'clear' | 'blocked_predicted_overlap' | 'blocked_observed_overlap';
