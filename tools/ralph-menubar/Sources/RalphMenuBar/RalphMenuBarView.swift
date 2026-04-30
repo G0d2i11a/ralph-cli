@@ -149,18 +149,28 @@ struct RalphMenuBarView: View {
           }
 
           TaskSectionView(
-            title: "Running Now",
-            subtitle: store.snapshot.active.isEmpty
-              ? "Ralph is idle."
-              : "Queued, running, and finalizing work",
-            tasks: store.snapshot.active,
+            title: "In Progress",
+            subtitle: inProgressTasks.isEmpty
+              ? "No PRDs are actively executing."
+              : "PRDs currently running, validating, or finalizing",
+            tasks: inProgressTasks,
             style: .active,
             store: store
           )
 
           TaskSectionView(
-            title: "Recent Integrated",
-            subtitle: "Latest merged outcomes",
+            title: "Queued / Blocked",
+            subtitle: queuedTasks.isEmpty
+              ? "No PRDs are waiting for dependencies or slots."
+              : "PRDs waiting for dependencies, integration, or capacity",
+            tasks: queuedTasks,
+            style: .queued,
+            store: store
+          )
+
+          TaskSectionView(
+            title: "PRD History",
+            subtitle: "Recently integrated PRDs",
             tasks: store.snapshot.recentCompleted,
             style: .completed,
             store: store
@@ -187,6 +197,14 @@ struct RalphMenuBarView: View {
           .padding(.bottom, 12)
       }
     }
+  }
+
+  private var inProgressTasks: [TaskState] {
+    store.snapshot.active.filter { $0.status != "pending" }
+  }
+
+  private var queuedTasks: [TaskState] {
+    store.snapshot.active.filter { $0.status == "pending" }
   }
 
   private var header: some View {
@@ -237,9 +255,10 @@ struct RalphMenuBarView: View {
       }
 
       HStack(spacing: 10) {
-        SummaryPill(title: "Running", value: store.snapshot.activeCount, tint: .blue)
+        SummaryPill(title: "Doing", value: inProgressTasks.count, tint: .blue)
+        SummaryPill(title: "Queued", value: queuedTasks.count, tint: .gray)
         SummaryPill(title: "Attention", value: store.snapshot.attentionCount, tint: .orange)
-        SummaryPill(title: "Integrated", value: store.snapshot.recentCompletedCount, tint: .green)
+        SummaryPill(title: "History", value: store.snapshot.recentCompletedCount, tint: .green)
       }
 
       if !store.snapshot.repoPaths.isEmpty {
@@ -494,9 +513,11 @@ struct TaskSectionView: View {
     case .attention:
       return "Nothing is blocked right now."
     case .active:
-      return "No active work in this Ralph home."
+      return "No PRDs are actively executing."
+    case .queued:
+      return "No PRDs are waiting in this Ralph home."
     case .completed:
-      return "No recent integrated tasks in the current window."
+      return "No completed PRDs in the current history window."
     }
   }
 }
@@ -514,6 +535,39 @@ struct EmptySectionCard: View {
         RoundedRectangle(cornerRadius: 8, style: .continuous)
           .fill(Color.primary.opacity(0.05))
       )
+  }
+}
+
+struct StoryStripView: View {
+  let stories: [StoryProgress]
+
+  var body: some View {
+    HStack(spacing: 3) {
+      ForEach(Array(stories.enumerated()), id: \.offset) { _, story in
+        Capsule(style: .continuous)
+          .fill(storyColor(story.status))
+          .frame(width: 18, height: 5)
+          .help(storyStatusLabel(story))
+      }
+    }
+    .frame(height: 8)
+  }
+
+  private func storyColor(_ status: String?) -> Color {
+    switch status ?? "" {
+    case "passed":
+      return .green
+    case "in_progress":
+      return .blue
+    case "needs_repair":
+      return .orange
+    case "failed":
+      return .red
+    case "pending":
+      return .gray.opacity(0.55)
+    default:
+      return .secondary.opacity(0.5)
+    }
   }
 }
 
@@ -552,11 +606,29 @@ struct TaskRowView: View {
           .font(.system(size: style == .completed ? 13 : 14, weight: .semibold))
           .fixedSize(horizontal: false, vertical: true)
 
+        if let prd = prdIdentity(task) {
+          HStack(spacing: 5) {
+            Image(systemName: "doc.text")
+              .font(.system(size: 10, weight: .semibold))
+            Text(prd)
+              .font(.system(size: 11, weight: .medium, design: .monospaced))
+              .lineLimit(1)
+              .truncationMode(.middle)
+          }
+          .foregroundStyle(.secondary)
+        }
+
         if let summary = storySummary(task) {
           VStack(alignment: .leading, spacing: 6) {
-            Text(summary)
-              .font(.system(size: 12, weight: .medium))
-              .foregroundStyle(.secondary)
+            HStack(spacing: 8) {
+              if let stories = task.storyProgress, !stories.isEmpty {
+                StoryStripView(stories: stories)
+              }
+
+              Text(summary)
+                .font(.system(size: 12, weight: .medium))
+                .foregroundStyle(.secondary)
+            }
 
             let counts = storyCounts(task)
             if counts.total > 0 {
@@ -567,7 +639,21 @@ struct TaskRowView: View {
           }
         }
 
-        if let errorSnippet = trimSingleLine(task.errorMessage ?? task.mergeError ?? task.nextAction ?? task.attentionReason) {
+        if let stageSummary = taskStageSummary(task) {
+          HStack(alignment: .top, spacing: 6) {
+            Image(systemName: stageSymbol)
+              .font(.system(size: 10, weight: .semibold))
+              .foregroundStyle(stageTint)
+              .frame(width: 12, height: 12)
+
+            Text(stageSummary)
+              .font(.system(size: 11, weight: .medium))
+              .foregroundStyle(style == .attention ? .orange : .secondary)
+              .lineLimit(3)
+          }
+        }
+
+        if let errorSnippet = secondaryErrorSnippet {
           Text(errorSnippet)
             .font(.system(size: 11, weight: .medium))
             .foregroundStyle(style == .attention ? .orange : .secondary)
@@ -624,11 +710,53 @@ struct TaskRowView: View {
     switch style {
     case .active:
       return .blue
+    case .queued:
+      return .gray
     case .attention:
       return .orange
     case .completed:
       return .green
     }
+  }
+
+  private var stageSymbol: String {
+    switch task.status {
+    case "pending":
+      return "clock"
+    case "running":
+      return "bolt.fill"
+    case "ready_to_finalize", "finalizing":
+      return "arrow.triangle.merge"
+    case "completed":
+      return "checkmark.circle.fill"
+    case "failed", "failed_finalize", "stagnant":
+      return "exclamationmark.triangle.fill"
+    default:
+      return "info.circle"
+    }
+  }
+
+  private var stageTint: Color {
+    switch style {
+    case .active:
+      return .blue
+    case .queued:
+      return .gray
+    case .attention:
+      return .orange
+    case .completed:
+      return .green
+    }
+  }
+
+  private var secondaryErrorSnippet: String? {
+    guard let errorSnippet = trimSingleLine(task.errorMessage ?? task.mergeError ?? task.attentionReason) else {
+      return nil
+    }
+    if errorSnippet == taskStageSummary(task) {
+      return nil
+    }
+    return errorSnippet
   }
 
   private var primaryAction: (title: String, systemImage: String, action: () -> Void)? {

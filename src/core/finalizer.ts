@@ -1,5 +1,6 @@
 import { execFileSync, spawnSync } from 'child_process';
 import * as fs from 'fs';
+import * as os from 'os';
 import * as path from 'path';
 import { ConfigManager } from '../config/manager';
 import {
@@ -70,6 +71,130 @@ interface ParsedLintDiagnostic {
 interface QualityGateRunResult {
   executedScripts: string[];
   validationEvidence: TaskValidationEvidenceManifest;
+}
+
+interface QualityGateSandbox {
+  env: NodeJS.ProcessEnv;
+  cleanup: () => void;
+}
+
+interface ManagedSpawnResult {
+  stdout: string;
+  stderr: string;
+  status: number | null;
+  signal: NodeJS.Signals | null;
+  error?: Error;
+  timedOut: boolean;
+}
+
+function sanitizeTempName(value: string): string {
+  return value.replace(/[^a-zA-Z0-9_.-]+/g, '-').slice(0, 80) || 'task';
+}
+
+function createQualityGateSandbox(task: Task): QualityGateSandbox {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), `ralph-quality-gate-${sanitizeTempName(task.id)}-`));
+  const home = path.join(root, 'home');
+  const ralphHome = path.join(root, 'ralph-home');
+
+  fs.mkdirSync(home, { recursive: true });
+  fs.mkdirSync(ralphHome, { recursive: true });
+
+  return {
+    env: {
+      ...process.env,
+      HOME: home,
+      USERPROFILE: home,
+      RALPH_HOME: ralphHome,
+      XDG_CONFIG_HOME: path.join(home, '.config'),
+      XDG_CACHE_HOME: path.join(home, '.cache'),
+      RALPH_QUALITY_GATE_HOME: ralphHome,
+    },
+    cleanup: () => fs.rmSync(root, { recursive: true, force: true }),
+  };
+}
+
+function closeFd(fd: number | undefined): void {
+  if (fd === undefined) {
+    return;
+  }
+
+  try {
+    fs.closeSync(fd);
+  } catch {
+    // Best-effort cleanup; keep the original quality gate result authoritative.
+  }
+}
+
+function readFileIfExists(filePath: string): string {
+  return fs.existsSync(filePath) ? fs.readFileSync(filePath, 'utf-8') : '';
+}
+
+function killProcessTree(pid: number): void {
+  try {
+    if (process.platform === 'win32') {
+      spawnSync('taskkill', ['/PID', String(pid), '/T', '/F'], { stdio: 'ignore' });
+      return;
+    }
+
+    process.kill(-pid, 'SIGKILL');
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ESRCH') {
+      // Process-tree cleanup is best effort and should not mask gate failure.
+    }
+  }
+}
+
+function runManagedQualityGateCommand(
+  file: string,
+  args: string[],
+  options: {
+    cwd: string;
+    env: NodeJS.ProcessEnv;
+    timeoutMs: number;
+  }
+): ManagedSpawnResult {
+  const captureDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-quality-gate-output-'));
+  const stdoutPath = path.join(captureDir, 'stdout.log');
+  const stderrPath = path.join(captureDir, 'stderr.log');
+  let stdoutFd: number | undefined;
+  let stderrFd: number | undefined;
+
+  try {
+    stdoutFd = fs.openSync(stdoutPath, 'w');
+    stderrFd = fs.openSync(stderrPath, 'w');
+    const spawnOptions = {
+      cwd: options.cwd,
+      env: options.env,
+      timeout: options.timeoutMs,
+      killSignal: 'SIGKILL',
+      detached: process.platform !== 'win32',
+      stdio: ['ignore', stdoutFd, stderrFd],
+    } as Parameters<typeof spawnSync>[2] & { detached?: boolean };
+    const result = spawnSync(file, args, spawnOptions);
+    closeFd(stdoutFd);
+    closeFd(stderrFd);
+    stdoutFd = undefined;
+    stderrFd = undefined;
+
+    const error = result.error as NodeJS.ErrnoException | undefined;
+    const timedOut = error?.code === 'ETIMEDOUT';
+    if (timedOut && typeof result.pid === 'number') {
+      killProcessTree(result.pid);
+    }
+
+    return {
+      stdout: readFileIfExists(stdoutPath),
+      stderr: readFileIfExists(stderrPath),
+      status: result.status,
+      signal: result.signal,
+      error: result.error,
+      timedOut,
+    };
+  } finally {
+    closeFd(stdoutFd);
+    closeFd(stderrFd);
+    fs.rmSync(captureDir, { recursive: true, force: true });
+  }
 }
 
 function resolveExistingPath(targetPath: string): string {
@@ -902,7 +1027,9 @@ function runQualityGates(task: Task, timeoutMs: number, configuredScripts: Quali
     manifest,
     changedFiles,
   );
+  const sandbox = createQualityGateSandbox(task);
 
+  try {
   for (const preparation of preparations) {
     appendFinalizeLog(
       task,
@@ -910,11 +1037,10 @@ function runQualityGates(task: Task, timeoutMs: number, configuredScripts: Quali
     );
     const command = `${packageManager} run ${preparation.actualScript}`;
     const startedAt = Date.now();
-    const result = spawnSync(packageManager, ['run', preparation.actualScript], {
+    const result = runManagedQualityGateCommand(packageManager, ['run', preparation.actualScript], {
       cwd: preparation.cwd,
-      encoding: 'utf-8',
-      env: process.env,
-      timeout: timeoutMs,
+      env: sandbox.env,
+      timeoutMs,
     });
     const completedAt = Date.now();
     const durationMs = completedAt - startedAt;
@@ -926,25 +1052,25 @@ function runQualityGates(task: Task, timeoutMs: number, configuredScripts: Quali
       appendFinalizeLog(task, result.stderr.trim());
     }
 
-    if (result.error) {
-      if ((result.error as NodeJS.ErrnoException).code === 'ETIMEDOUT') {
-        throw createQualityGateFailure(task, configuredScripts, evidenceRuns, 'quality_gate_preparation', {
-          requestedScript: 'typecheck',
-          actualScript: preparation.actualScript,
-          cwd: preparation.cwd,
-          packageLabel: preparation.label,
-          command,
-          rawMessage: `Quality gate preparation "${preparation.actualScript}" timed out after ${formatTimeoutSeconds(timeoutMs)}s`,
-          stdout: result.stdout,
-          stderr: result.stderr,
-          exitCode: result.status,
-          durationMs,
-          startedAt,
-          completedAt,
-          timedOut: true,
-        });
-      }
+    if (result.timedOut) {
+      throw createQualityGateFailure(task, configuredScripts, evidenceRuns, 'quality_gate_preparation', {
+        requestedScript: 'typecheck',
+        actualScript: preparation.actualScript,
+        cwd: preparation.cwd,
+        packageLabel: preparation.label,
+        command,
+        rawMessage: `Quality gate preparation "${preparation.actualScript}" timed out after ${formatTimeoutSeconds(timeoutMs)}s`,
+        stdout: result.stdout,
+        stderr: result.stderr,
+        exitCode: result.status,
+        durationMs,
+        startedAt,
+        completedAt,
+        timedOut: true,
+      });
+    }
 
+    if (result.error) {
       throw createQualityGateFailure(task, configuredScripts, evidenceRuns, 'quality_gate_preparation', {
         requestedScript: 'typecheck',
         actualScript: preparation.actualScript,
@@ -1025,11 +1151,10 @@ function runQualityGates(task: Task, timeoutMs: number, configuredScripts: Quali
       );
       const command = `${packageManager} run ${scriptExecution.actualScript}`;
       const startedAt = Date.now();
-      const result = spawnSync(packageManager, ['run', scriptExecution.actualScript], {
+      const result = runManagedQualityGateCommand(packageManager, ['run', scriptExecution.actualScript], {
         cwd: target.cwd,
-        encoding: 'utf-8',
-        env: process.env,
-        timeout: timeoutMs,
+        env: sandbox.env,
+        timeoutMs,
       });
       const completedAt = Date.now();
       const durationMs = completedAt - startedAt;
@@ -1041,24 +1166,25 @@ function runQualityGates(task: Task, timeoutMs: number, configuredScripts: Quali
         appendFinalizeLog(task, result.stderr.trim());
       }
 
+      if (result.timedOut) {
+        throw createQualityGateFailure(task, configuredScripts, evidenceRuns, 'quality_gate', {
+          requestedScript: scriptExecution.requestedScript,
+          actualScript: scriptExecution.actualScript,
+          cwd: target.cwd,
+          packageLabel: target.label,
+          command,
+          rawMessage: `Quality gate "${scriptExecution.actualScript}" timed out after ${formatTimeoutSeconds(timeoutMs)}s`,
+          stdout: result.stdout,
+          stderr: result.stderr,
+          exitCode: result.status,
+          durationMs,
+          startedAt,
+          completedAt,
+          timedOut: true,
+        });
+      }
+
       if (result.error) {
-        if ((result.error as NodeJS.ErrnoException).code === 'ETIMEDOUT') {
-          throw createQualityGateFailure(task, configuredScripts, evidenceRuns, 'quality_gate', {
-            requestedScript: scriptExecution.requestedScript,
-            actualScript: scriptExecution.actualScript,
-            cwd: target.cwd,
-            packageLabel: target.label,
-            command,
-            rawMessage: `Quality gate "${scriptExecution.actualScript}" timed out after ${formatTimeoutSeconds(timeoutMs)}s`,
-            stdout: result.stdout,
-            stderr: result.stderr,
-            exitCode: result.status,
-            durationMs,
-            startedAt,
-            completedAt,
-            timedOut: true,
-          });
-        }
         throw createQualityGateFailure(task, configuredScripts, evidenceRuns, 'quality_gate', {
           requestedScript: scriptExecution.requestedScript,
           actualScript: scriptExecution.actualScript,
@@ -1158,6 +1284,9 @@ function runQualityGates(task: Task, timeoutMs: number, configuredScripts: Quali
     executedScripts,
     validationEvidence: buildValidationEvidenceManifest(task, configuredScripts, evidenceRuns),
   };
+  } finally {
+    sandbox.cleanup();
+  }
 }
 
 export function finalizeTaskOutput(task: Task): FinalizeResult {

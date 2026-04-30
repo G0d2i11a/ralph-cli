@@ -35,6 +35,15 @@ export interface RalphConfig {
     failedBlockerRecoveryHardCap: number;
   };
   ingestion: {
+    prds: {
+      enabled: boolean;
+      globs: Array<string | {
+        glob: string;
+        repo?: string;
+        repoPath?: string;
+      }>;
+      settleMs: number;
+    };
     ez4ielts: {
       enabled: boolean;
       watchDir: string;
@@ -101,6 +110,11 @@ const DEFAULT_CONFIG: RalphConfig = {
     failedBlockerRecoveryHardCap: 2,
   },
   ingestion: {
+    prds: {
+      enabled: false,
+      globs: [],
+      settleMs: 2000,
+    },
     ez4ielts: {
       enabled: false,
       watchDir: process.env.RALPH_EZ4IELTS_WATCH_DIR || '',

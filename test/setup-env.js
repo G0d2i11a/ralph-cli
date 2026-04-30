@@ -38,6 +38,6 @@ process.env.HOME = testHome;
 process.env.PATH = `${testBin}${path.delimiter}${process.env.PATH || ''}`;
 delete process.env.RALPH_HOME;
 
-process.on('exit', () => {
+process.once('exit', () => {
   fs.rmSync(testHome, { recursive: true, force: true });
 });

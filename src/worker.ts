@@ -562,6 +562,7 @@ async function runWorker(taskId: string) {
             const observedAt = Date.now();
             task.mergeError = mergeRepairVerification?.probeResult?.message ?? lastStoryError;
             task.mergeConflictFiles = mergeRepairVerification?.probeResult?.conflictFiles;
+            task.mergeConflictPhase = mergeRepairVerification?.probeResult?.failurePhase;
             task.mergeConflictAt = mergeRepairVerification?.probeResult?.conflictFiles?.length
               ? observedAt
               : undefined;
@@ -591,6 +592,7 @@ async function runWorker(taskId: string) {
             lastError: lastStoryError,
             mergeError: task.mergeError,
             mergeConflictFiles: task.mergeConflictFiles,
+            mergeConflictPhase: task.mergeConflictPhase,
             mergeConflictAt: task.mergeConflictAt,
             integrationBranch: task.integrationBranch,
             integrationWorktree: task.integrationWorktree,
@@ -655,6 +657,7 @@ async function runWorker(taskId: string) {
           task.transientRetryLastDelayMs = undefined;
           task.mergeError = undefined;
           task.mergeConflictFiles = undefined;
+          task.mergeConflictPhase = undefined;
           task.mergeConflictAt = undefined;
           task.autoRecoveryKind = undefined;
           task.autoRecoveryNextEligibleAt = undefined;
@@ -683,6 +686,7 @@ async function runWorker(taskId: string) {
             transientRetryLastDelayMs: task.transientRetryLastDelayMs,
             mergeError: undefined,
             mergeConflictFiles: undefined,
+            mergeConflictPhase: undefined,
             mergeConflictAt: undefined,
             autoRecoveryKind: task.autoRecoveryKind,
             autoRecoveryNextEligibleAt: task.autoRecoveryNextEligibleAt,

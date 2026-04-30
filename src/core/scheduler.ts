@@ -8,15 +8,19 @@ import { checkDependencies, DependencyBlocker, DependencyCheckResult, isProcessR
 import { bootstrapWorktreeDeps } from './bootstrap';
 import { appendTaskEvent } from './events';
 import { evaluateAutoRecovery } from './auto-recovery-state';
+import { buildQuarantineReleaseUpdates } from './quarantine';
 import {
   captureObservedTaskSurface,
+  CoordinationOverlapMatch,
   findCoordinationBlockers,
   hasHotConflictReservation,
+  isHotConflictQuarantineOwner,
 } from './task-coordination';
-import { getRalphPaths, RalphHomeOptions, resolveRalphHome } from './paths';
+import { RalphHomeOptions, resolveRalphHome } from './paths';
 import { StateManager } from './state';
 import { resolveTaskIntegrationStatus } from './task-delivery';
 import { WorktreeManager } from './worktree';
+import { getManagerStatus } from './manager-state';
 
 const DEFAULT_MAX_CONCURRENT = 3;
 const LOCK_RETRY_MS = 50;
@@ -36,6 +40,10 @@ type DependencyChecker = (
   options?: { repoPath?: string; task?: Task }
 ) => Promise<DependencyResult>;
 type ProcessChecker = (pid: number) => boolean;
+interface ProcessInfo {
+  ppid?: number;
+  command?: string;
+}
 
 export interface SchedulerDeps extends RalphHomeOptions {
   stateManager?: StateManager;
@@ -50,7 +58,9 @@ export interface SchedulerDeps extends RalphHomeOptions {
     options?: ForkOptions
   ) => ChildProcess;
   isProcessRunning?: ProcessChecker;
+  getProcessInfo?: (pid: number) => ProcessInfo | undefined;
   terminateProcess?: (pid: number, signal?: NodeJS.Signals | number) => void;
+  managerOwnedScheduling?: boolean;
   lockDir?: string;
   now?: () => number;
   sleep?: (ms: number) => Promise<void>;
@@ -64,9 +74,11 @@ export interface PendingTaskState {
   recoveringDependencies?: string[];
   missingDependencies?: string[];
   blockers: string[];
+  quarantinedBlockers?: string[];
   failedBlockers?: string[];
   recoveringBlockers?: string[];
   coordinationReason?: string;
+  coordinationConflicts?: CoordinationOverlapMatch[];
   integrationLane?: string;
   maxConcurrent: number;
   running: number;
@@ -108,6 +120,38 @@ function toTimeoutMs(value: unknown, fallbackMs: number): number {
   return numericValue * 1000;
 }
 
+function readProcessInfo(pid: number): ProcessInfo | undefined {
+  if (process.platform === 'win32') {
+    return undefined;
+  }
+
+  try {
+    const output = execFileSync('ps', ['-p', String(pid), '-o', 'ppid=', '-o', 'command='], {
+      encoding: 'utf-8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+    }).trim();
+    const match = output.match(/^(\d+)\s+([\s\S]*)$/);
+    if (!match) {
+      return undefined;
+    }
+
+    return {
+      ppid: Number(match[1]),
+      command: match[2],
+    };
+  } catch {
+    return undefined;
+  }
+}
+
+function resolveSchedulerRalphHome(deps: SchedulerDeps): string {
+  if (deps.ralphHome || deps.homeDir) {
+    return resolveRalphHome(deps);
+  }
+
+  return deps.stateManager?.getRalphHome?.() ?? resolveRalphHome(deps);
+}
+
 function isFailedCoordinationBlocker(task: Task): boolean {
   if (task.status === 'failed' || task.status === 'stagnant' || task.status === 'failed_finalize') {
     return true;
@@ -134,15 +178,17 @@ export class TaskScheduler {
     options?: ForkOptions
   ) => ChildProcess;
   private readonly isProcessRunningFn: ProcessChecker;
+  private readonly getProcessInfoFn: (pid: number) => ProcessInfo | undefined;
   private readonly terminateProcessFn: (pid: number, signal?: NodeJS.Signals | number) => void;
   private readonly now: () => number;
   private readonly sleep: (ms: number) => Promise<void>;
   private readonly lockDir: string;
   private readonly lockInfoPath: string;
   private readonly ralphHome: string;
+  private readonly managerOwnedScheduling: boolean;
 
   constructor(deps: SchedulerDeps = {}) {
-    this.ralphHome = resolveRalphHome(deps);
+    this.ralphHome = resolveSchedulerRalphHome(deps);
     this.stateManager = deps.stateManager ?? new StateManager(deps);
     this.worktreeManager = deps.worktreeManager ?? new WorktreeManager();
     this.configManager = deps.configManager ?? new ConfigManager(deps);
@@ -151,11 +197,13 @@ export class TaskScheduler {
     this.checkDependenciesFn = deps.checkDependencies ?? checkDependencies;
     this.forkProcessFn = deps.forkProcess ?? fork;
     this.isProcessRunningFn = deps.isProcessRunning ?? isProcessRunning;
+    this.getProcessInfoFn = deps.getProcessInfo ?? readProcessInfo;
     this.terminateProcessFn = deps.terminateProcess ?? ((pid, signal) => process.kill(pid, signal));
     this.now = deps.now ?? (() => Date.now());
     this.sleep = deps.sleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
-    this.lockDir = deps.lockDir ?? getRalphPaths(deps).schedulerLockDir;
+    this.lockDir = deps.lockDir ?? path.join(this.ralphHome, 'scheduler.lock');
     this.lockInfoPath = path.join(this.lockDir, 'owner.json');
+    this.managerOwnedScheduling = deps.managerOwnedScheduling === true;
   }
 
   getConcurrencyLimit(): number {
@@ -212,6 +260,29 @@ export class TaskScheduler {
     }
 
     return false;
+  }
+
+  private isOrphanedManagedWorker(task: Task): boolean {
+    if (typeof task.pid !== 'number' || task.leaseOwner !== `worker:${task.pid}`) {
+      return false;
+    }
+
+    const processInfo = this.getProcessInfoFn(task.pid);
+    if (typeof processInfo?.ppid !== 'number' || processInfo.ppid === process.pid) {
+      return false;
+    }
+
+    const manager = getManagerStatus({
+      ralphHome: this.ralphHome,
+      isProcessRunning: this.isProcessRunningFn,
+      now: this.now,
+    });
+    if (manager.active && processInfo.ppid === manager.state?.pid) {
+      return false;
+    }
+
+    const command = processInfo.command || '';
+    return command.includes('worker.js') && command.includes(task.id);
   }
 
   private async terminateWorkerForRecovery(task: Pick<Task, 'id' | 'pid'>, reason: string): Promise<boolean> {
@@ -304,6 +375,47 @@ export class TaskScheduler {
       }
 
       if (this.isProcessRunningFn(latestTask.pid)) {
+        if (this.isOrphanedManagedWorker(latestTask)) {
+          const lastError = `Worker process ${latestTask.pid} is orphaned from the current manager; task was returned to pending for a fresh worker`;
+          console.error(`Recovering orphaned running task ${latestTask.id}: ${lastError}`);
+          const terminated = await this.terminateWorkerForRecovery(latestTask, lastError);
+
+          if (!terminated) {
+            activeTasks.push(latestTask);
+            continue;
+          }
+
+          const observedPid = latestTask.pid;
+          const observedLeaseOwner = latestTask.leaseOwner;
+          const updateResult = await this.stateManager.updateTaskIf(latestTask.id, (candidate) => (
+            candidate.status === 'running'
+            && candidate.pid === observedPid
+            && candidate.leaseOwner === observedLeaseOwner
+          ), {
+            status: 'pending',
+            endTime: undefined,
+            currentUS: undefined,
+            pid: undefined,
+            leaseOwner: undefined,
+            leaseHeartbeatAt: undefined,
+            leaseExpiresAt: undefined,
+            lastError,
+            lastErrorKind: 'orphaned_worker',
+            lastErrorClass: 'orphaned_worker',
+            lastErrorRetryable: true,
+            lastErrorObservedAt: this.now(),
+          });
+          if (updateResult.updated) {
+            appendTaskEvent(updateResult.task ?? latestTask, {
+              type: 'task_recovered_orphaned_worker',
+              status: 'pending',
+              message: lastError,
+              data: { pid: latestTask.pid },
+            });
+          }
+          continue;
+        }
+
         if (
           Number.isFinite(stagnationTimeoutMs)
           && typeof latestTask.lastProgressTime === 'number'
@@ -470,9 +582,11 @@ export class TaskScheduler {
         reason: 'coordination',
         dependencies: [],
         blockers: coordinationState.blockers,
+        quarantinedBlockers: coordinationState.quarantinedBlockers,
         failedBlockers: coordinationState.failedBlockers,
         recoveringBlockers: coordinationState.recoveringBlockers,
         coordinationReason: coordinationState.reason,
+        coordinationConflicts: coordinationState.conflicts,
         integrationLane: coordinationState.lane,
         maxConcurrent,
         running,
@@ -490,14 +604,17 @@ export class TaskScheduler {
 
   private async describeCoordinationBlockedTask(task: Task): Promise<{
     blockers: string[];
+    quarantinedBlockers: string[];
     failedBlockers: string[];
     recoveringBlockers: string[];
     reason?: string;
+    conflicts: CoordinationOverlapMatch[];
     lane: string;
   } | null> {
     const tasks = await this.stateManager.listTasks();
     const result = findCoordinationBlockers(task, tasks, 'start');
     const tasksById = new Map(tasks.map((entry) => [entry.id, entry]));
+    const quarantinedBlockers: string[] = [];
     const failedBlockers: string[] = [];
     const recoveringBlockers: string[] = [];
 
@@ -512,6 +629,11 @@ export class TaskScheduler {
         continue;
       }
 
+      if (isHotConflictQuarantineOwner(blocker)) {
+        quarantinedBlockers.push(blockerId);
+        continue;
+      }
+
       if (isFailedCoordinationBlocker(blocker)) {
         failedBlockers.push(blockerId);
       }
@@ -520,12 +642,18 @@ export class TaskScheduler {
     return result.blocked
       ? {
           blockers: result.blockers,
+          quarantinedBlockers,
           failedBlockers,
           recoveringBlockers,
           reason: result.reason,
+          conflicts: result.matches,
           lane: result.lane,
         }
       : null;
+  }
+
+  private serializeCoordinationConflicts(conflicts?: CoordinationOverlapMatch[]): string {
+    return JSON.stringify(conflicts ?? []);
   }
 
   private coordinationUpdatesChanged(task: Task, updates: Partial<Task>): boolean {
@@ -538,12 +666,17 @@ export class TaskScheduler {
       || task.coordinationReason !== updates.coordinationReason
       || task.declaredWriteSurface?.join('\n') !== updates.declaredWriteSurface?.join('\n')
       || task.declaredConflictDomains?.join('\n') !== updates.declaredConflictDomains?.join('\n')
-      || currentBlockers.join('\n') !== nextBlockers.join('\n');
+      || currentBlockers.join('\n') !== nextBlockers.join('\n')
+      || this.serializeCoordinationConflicts(task.coordinationConflicts) !== this.serializeCoordinationConflicts(updates.coordinationConflicts);
   }
 
   async schedulePendingTasks(): Promise<Task[]> {
     return this.withLock(async () => {
       const startedTasks: Task[] = [];
+      if (this.shouldDeferSchedulingToActiveManager()) {
+        return startedTasks;
+      }
+
       const maxConcurrent = this.getConcurrencyLimit();
       await this.recoverStaleTasksUnlocked();
       let runningCount = await this.countRunningTasks();
@@ -588,6 +721,7 @@ export class TaskScheduler {
                 data: {
                   phase: coordinationState.phase,
                   blockers: coordinationState.blockers,
+                  conflicts: coordinationState.matches,
                   lane: coordinationState.lane,
                 },
               });
@@ -613,6 +747,20 @@ export class TaskScheduler {
 
       return startedTasks;
     });
+  }
+
+  private shouldDeferSchedulingToActiveManager(): boolean {
+    if (this.managerOwnedScheduling) {
+      return false;
+    }
+
+    const manager = getManagerStatus({
+      ralphHome: this.ralphHome,
+      isProcessRunning: this.isProcessRunningFn,
+      now: this.now,
+    });
+
+    return manager.active && manager.state?.pid !== process.pid;
   }
 
   private async startTask(task: Task): Promise<Task | null> {
@@ -665,6 +813,7 @@ export class TaskScheduler {
         coordinationStatus: undefined,
         coordinationPhase: undefined,
         coordinationBlockers: undefined,
+        coordinationConflicts: undefined,
         coordinationReason: undefined,
       });
       currentTask = {
@@ -820,6 +969,11 @@ export async function finalizeTask(
   const conflictReservationSurface = status === 'failed' && task.worktree && hasHotConflictReservation(task)
     ? captureObservedTaskSurface(task)
     : {};
+  const quarantineReleaseReason = task.quarantineReleaseReason
+    || 'Task stopped by explicit user request';
+  const quarantineRelease = status === 'stopped' && hasHotConflictReservation(task)
+    ? buildQuarantineReleaseUpdates('stop', quarantineReleaseReason, now())
+    : {};
 
   task.status = status;
   task.endTime = now();
@@ -838,6 +992,7 @@ export async function finalizeTask(
     leaseHeartbeatAt: undefined,
     leaseExpiresAt: undefined,
     ...conflictReservationSurface,
+    ...quarantineRelease,
   });
   appendTaskEvent(task, {
     type: 'task_terminal',

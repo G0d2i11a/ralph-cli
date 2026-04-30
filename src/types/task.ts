@@ -1,4 +1,4 @@
-export type TaskStatus = 'pending' | 'running' | 'ready_to_finalize' | 'finalizing' | 'completed' | 'failed' | 'failed_finalize' | 'stagnant';
+export type TaskStatus = 'pending' | 'running' | 'ready_to_finalize' | 'finalizing' | 'completed' | 'failed' | 'failed_finalize' | 'stagnant' | 'stopped';
 export type TaskMergeStrategy = 'manual' | 'ours' | 'theirs';
 export type StoryStatus = 'pending' | 'in_progress' | 'needs_repair' | 'passed' | 'failed';
 export type FinalizeRepairFailureKind = 'merge_conflict' | 'quality_gate' | 'finalizer_error';
@@ -13,14 +13,17 @@ export type FinalizeFailureClass =
   | 'typescript_diagnostics'
   | 'quality_gate_failure'
   | 'unknown';
-export type TaskErrorClass = 'transient_backend' | 'transport' | 'browser_automation' | 'semantic' | 'quality_gate' | 'merge_conflict' | 'stagnation' | 'unknown';
+export type TaskErrorClass = 'transient_backend' | 'transport' | 'browser_automation' | 'semantic' | 'quality_gate' | 'merge_conflict' | 'stagnation' | 'orphaned_worker' | 'unknown';
 export type TaskIntegrationStatus = 'not_started' | 'integrated' | 'blocked_conflict' | 'failed';
 export type TaskTargetSyncStatus = 'not_requested' | 'synced' | 'deferred_dirty_checkout' | 'disabled' | 'failed';
 export type TaskCoordinationStatus = 'clear' | 'blocked_predicted_overlap' | 'blocked_observed_overlap';
 export type TaskCoordinationPhase = 'start' | 'finalize' | 'merge';
+export type TaskCoordinationOverlapKind = 'conflict_domain' | 'write_surface';
 export type TaskMergeRepairDisplayStatus = 'unresolved' | 'resolved_pending_finalize' | 'probe_mergeable' | 'requeued' | 'stopped';
 export type TaskMergeProofSourceKind = 'branch_head' | 'worktree_snapshot' | 'resolved_pending_merge';
 export type TaskWorktreeMergeStateKind = 'none' | 'unresolved' | 'resolved_pending_commit';
+export type TaskMergeConflictPhase = 'integration_sync' | 'source_merge' | 'worktree_unresolved';
+export type TaskQuarantineExitKind = 'stop' | 'demote' | 'exact_mergeability' | 'already_integrated';
 
 export interface StoryProgress {
   id: string;
@@ -182,10 +185,18 @@ export interface TaskRepairContext {
   validationEvidenceSummary?: TaskValidationEvidenceSummary;
 }
 
+export interface TaskCoordinationConflict {
+  taskId: string;
+  overlapKinds: TaskCoordinationOverlapKind[];
+  overlappingDomains: string[];
+  overlappingPaths: string[];
+}
+
 export interface TaskMergeRepairProof {
   observedAt: number;
   sourceKind?: TaskMergeProofSourceKind;
   worktreeMergeKind?: TaskWorktreeMergeStateKind;
+  failurePhase?: TaskMergeConflictPhase;
   message: string;
   conflictFiles?: string[];
   changedFiles?: string[];
@@ -302,6 +313,7 @@ export interface Task {
   coordinationStatus?: TaskCoordinationStatus;
   coordinationPhase?: TaskCoordinationPhase;
   coordinationBlockers?: string[];
+  coordinationConflicts?: TaskCoordinationConflict[];
   coordinationReason?: string;
   mergeCommitSha?: string;
   mergeTargetBranch?: string;
@@ -309,6 +321,7 @@ export interface Task {
   mergeMessage?: string;
   mergeError?: string;
   mergeConflictFiles?: string[];
+  mergeConflictPhase?: TaskMergeConflictPhase;
   mergeConflictAt?: number;
   mergeRepairAttempts?: number;
   mergeRepairBranch?: string;
@@ -326,4 +339,8 @@ export interface Task {
   mergeRepairRecoveryStoppedAt?: number;
   mergeRepairRecoveryStopReason?: string;
   postFinalizeMergeProbeRequired?: boolean;
+  quarantineExitKind?: TaskQuarantineExitKind;
+  quarantineReleasedAt?: number;
+  quarantineReleaseReason?: string;
+  quarantineTransferredTo?: string;
 }

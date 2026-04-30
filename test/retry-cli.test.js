@@ -463,8 +463,9 @@ test('retry preserves anchored merge repair for failed merge-conflict tasks', ()
     assert.equal(state.repairContext.validationEvidenceSummary.gates[1].timedOut, true);
     assert.equal(state.integrationStatus, 'not_started');
     assert.equal(state.postFinalizeMergeProbeRequired, true);
-    assert.equal(state.mergeError, undefined);
-    assert.equal(state.mergeConflictFiles, undefined);
+    assert.equal(state.mergeError, 'Merge conflicts detected: src/one.ts, src/two.ts');
+    assert.deepEqual(state.mergeConflictFiles, ['src/one.ts', 'src/two.ts']);
+    assert.equal(state.mergeRepairDisplayStatus, 'requeued');
     assert.equal(state.mergeRepairAttempts, 0);
   } finally {
     fs.rmSync(homeDir, { recursive: true, force: true });
@@ -700,8 +701,9 @@ test('retry sends failed_finalize merge conflicts back to anchored merge repair 
     assert.match(state.repairContext.reason, /src\/one\.ts, src\/two\.ts/);
     assert.equal(state.integrationStatus, 'not_started');
     assert.equal(state.postFinalizeMergeProbeRequired, true);
-    assert.equal(state.mergeError, undefined);
-    assert.equal(state.mergeConflictFiles, undefined);
+    assert.equal(state.mergeError, 'Merge conflicts detected: src/one.ts, src/two.ts');
+    assert.deepEqual(state.mergeConflictFiles, ['src/one.ts', 'src/two.ts']);
+    assert.equal(state.mergeRepairDisplayStatus, 'requeued');
     assert.equal(state.finalizerAttempts, 0);
     assert.equal(state.mergeRepairAttempts, 0);
   } finally {
@@ -791,8 +793,9 @@ test('retry sends completed blocked_conflict tasks back to anchored merge repair
     assert.match(state.repairContext.reason, /src\/one\.ts, src\/two\.ts/);
     assert.equal(state.integrationStatus, 'not_started');
     assert.equal(state.postFinalizeMergeProbeRequired, true);
-    assert.equal(state.mergeError, undefined);
-    assert.equal(state.mergeConflictFiles, undefined);
+    assert.equal(state.mergeError, 'Merge conflicts detected: src/one.ts, src/two.ts');
+    assert.deepEqual(state.mergeConflictFiles, ['src/one.ts', 'src/two.ts']);
+    assert.equal(state.mergeRepairDisplayStatus, 'requeued');
     assert.equal(state.finalizerAttempts, 0);
     assert.equal(state.mergeRepairAttempts, 0);
   } finally {
@@ -884,8 +887,9 @@ test('retry preserves anchored merge repair for stagnant blocked_conflict tasks'
     assert.match(state.repairContext.reason, /src\/one\.ts, src\/two\.ts/);
     assert.equal(state.integrationStatus, 'not_started');
     assert.equal(state.postFinalizeMergeProbeRequired, true);
-    assert.equal(state.mergeError, undefined);
-    assert.equal(state.mergeConflictFiles, undefined);
+    assert.equal(state.mergeError, 'Merge conflicts detected: src/one.ts, src/two.ts');
+    assert.deepEqual(state.mergeConflictFiles, ['src/one.ts', 'src/two.ts']);
+    assert.equal(state.mergeRepairDisplayStatus, 'requeued');
     assert.equal(state.mergeRepairAttempts, 0);
   } finally {
     fs.rmSync(homeDir, { recursive: true, force: true });

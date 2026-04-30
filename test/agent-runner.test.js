@@ -84,6 +84,11 @@ function restoreRunnerEnv(previous) {
   }
 }
 
+function useTempRalphHome(tempRoot) {
+  process.env.HOME = tempRoot;
+  process.env.RALPH_HOME = path.join(tempRoot, '.ralph');
+}
+
 test('AgentRunner defaults Codex to the direct CLI backend', async () => {
   const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-agent-codex-'));
   const worktreePath = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-agent-worktree-'));
