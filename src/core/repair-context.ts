@@ -5,11 +5,15 @@ import {
   TaskMergeConflictPhase,
   TaskRepairContext,
   TaskRepairMode,
+  TaskValidationEvidenceManifest,
+  TaskValidationEvidenceSummary,
 } from '../types/task';
+import { buildValidationEvidenceSummary } from './task-delivery';
 
 interface RepairContextTaskView {
   repairContext?: TaskRepairContext;
   finalizerFailure?: FinalizerFailureDetails;
+  validationEvidence?: TaskValidationEvidenceManifest;
   mergeConflictFiles?: string[];
   mergeConflictPhase?: TaskMergeConflictPhase;
   observedWriteSurface?: string[];
@@ -40,13 +44,20 @@ export function buildTaskRepairContext(input: {
   mode: TaskRepairMode;
   reason: string;
   createdAt?: number;
+  validationEvidenceSummary?: TaskValidationEvidenceSummary;
 }): TaskRepairContext {
-  return {
+  const repairContext: TaskRepairContext = {
     mode: input.mode,
     storyId: input.storyId,
     createdAt: input.createdAt ?? Date.now(),
     reason: input.reason,
   };
+
+  if (input.validationEvidenceSummary) {
+    repairContext.validationEvidenceSummary = input.validationEvidenceSummary;
+  }
+
+  return repairContext;
 }
 
 export function clearTaskRepairContext(): undefined {
@@ -134,6 +145,8 @@ function buildFinalizeRepairStory(
     descriptionLines.push(`Latest failure summary: ${lastStoryError}`);
   }
 
+  descriptionLines.push(...buildValidationEvidenceLines(task));
+
   const packageSurface = formatInlineList(task.observedPackageSurface);
   if (packageSurface) {
     descriptionLines.push(`Observed package surface: ${packageSurface}`);
@@ -190,6 +203,8 @@ function buildMergeRepairStory(
   if (mergeFiles) {
     descriptionLines.push(`Conflict files: ${mergeFiles}`);
   }
+
+  descriptionLines.push(...buildValidationEvidenceLines(task));
 
   const packageSurface = formatInlineList(task.observedPackageSurface);
   if (packageSurface) {
@@ -259,6 +274,53 @@ function buildFinalizerFailureLines(failure: FinalizerFailureDetails): string[] 
     lines.push(...diagnostics.map((diagnostic) => `- ${diagnostic}`));
   } else if (failure.rawMessage) {
     lines.push(`Failure summary: ${truncate(failure.rawMessage, 1200)}`);
+  }
+
+  return lines;
+}
+
+function buildValidationEvidenceLines(task: RepairContextTaskView): string[] {
+  const summary = buildValidationEvidenceSummary(task);
+  if (!summary) {
+    return [];
+  }
+
+  const configuredGates = formatInlineList(summary.configuredGates, 8);
+  const headline = [
+    `Latest validation evidence: total=${summary.total}`,
+    `passed=${summary.passed}`,
+    `failed=${summary.failed}`,
+    `skipped=${summary.skipped}`,
+    summary.generatedAt ? `generatedAt=${summary.generatedAt}` : undefined,
+    configuredGates ? `configuredGates=${configuredGates}` : undefined,
+  ].filter(Boolean).join('; ');
+  const lines = [headline];
+  const gateLines = summary.gates.slice(0, 8).map((gate) => {
+    const labels = [
+      gate.phase,
+      `${gate.requestedGate}->${gate.gate}`,
+      gate.packageLabel,
+    ].filter(Boolean).join(' ');
+    const details = [
+      gate.status,
+      gate.classification !== gate.status ? gate.classification : undefined,
+      gate.timedOut ? 'timed out' : undefined,
+      gate.startFailed ? 'start failed' : undefined,
+      gate.exitCode !== undefined ? `exit=${gate.exitCode}` : undefined,
+      gate.durationMs !== undefined ? `duration=${gate.durationMs}ms` : undefined,
+      gate.diagnosticCount !== undefined ? `diagnostics=${gate.diagnosticCount}` : undefined,
+      gate.reason ? truncate(gate.reason, 180) : undefined,
+    ].filter(Boolean).join(', ');
+    return `- ${labels}: ${details}`;
+  });
+
+  if (gateLines.length > 0) {
+    lines.push('Validation gate outcomes:');
+    lines.push(...gateLines);
+  }
+
+  if (summary.gates.length > gateLines.length) {
+    lines.push(`... ${summary.gates.length - gateLines.length} more validation gate(s) omitted`);
   }
 
   return lines;

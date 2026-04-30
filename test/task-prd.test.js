@@ -94,3 +94,95 @@ dependencies: []
     fs.rmSync(homeDir, { recursive: true, force: true });
   }
 });
+
+test('status command includes concise validation evidence summary', async () => {
+  const previousHome = process.env.HOME;
+  const homeDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-status-evidence-home-'));
+  const prdPath = path.join(homeDir, 'prd.json');
+  const originalConsoleLog = console.log;
+  const output = [];
+
+  fs.writeFileSync(prdPath, JSON.stringify({
+    id: 'prd-validation-summary',
+    title: 'Validation Summary',
+    description: 'Expose validation evidence in status output',
+    userStories: [],
+    dependencies: [],
+  }, null, 2));
+
+  try {
+    process.env.HOME = homeDir;
+    console.log = (message) => output.push(String(message));
+
+    const stateManager = new StateManager();
+    await stateManager.saveTask({
+      ...createTask(homeDir, prdPath),
+      id: 'task-validation-summary',
+      status: 'completed',
+      validationEvidence: {
+        schemaVersion: 1,
+        source: 'finalizer',
+        taskId: 'task-validation-summary',
+        generatedAt: 1_700_000_000_000,
+        configuredGates: ['typecheck', 'lint'],
+        summary: {
+          total: 2,
+          passed: 1,
+          failed: 0,
+          skipped: 1,
+          classifications: {
+            passed: 1,
+            skipped: 1,
+          },
+        },
+        runs: [
+          {
+            phase: 'quality_gate',
+            requestedGate: 'typecheck',
+            gate: 'typecheck',
+            status: 'passed',
+            classification: 'passed',
+            packageLabel: 'app',
+            command: 'npm run typecheck',
+            exitCode: 0,
+            durationMs: 42,
+            stdoutSummary: { byteLength: 2048, lineCount: 80, truncated: true, excerpt: 'verbose output' },
+          },
+          {
+            phase: 'quality_gate',
+            requestedGate: 'lint',
+            gate: 'lint',
+            status: 'skipped',
+            classification: 'skipped',
+            packageLabel: 'app',
+            reason: 'script "lint" is not defined for app',
+          },
+        ],
+      },
+    });
+
+    await statusCommand('task-validation-summary');
+    const status = JSON.parse(output[0]);
+
+    assert.equal(status.validationEvidenceSummary.total, 2);
+    assert.equal(status.validationEvidenceSummary.passed, 1);
+    assert.equal(status.validationEvidenceSummary.skipped, 1);
+    assert.deepEqual(status.validationEvidenceSummary.configuredGates, ['typecheck', 'lint']);
+    assert.deepEqual(
+      status.validationEvidenceSummary.gates.map((gate) => ({
+        requestedGate: gate.requestedGate,
+        status: gate.status,
+      })),
+      [
+        { requestedGate: 'typecheck', status: 'passed' },
+        { requestedGate: 'lint', status: 'skipped' },
+      ],
+    );
+    assert.equal(status.validationEvidenceSummary.gates[0].stdoutSummary, undefined);
+    assert.equal(status.validationEvidenceSummary.gates[1].reason, 'script "lint" is not defined for app');
+  } finally {
+    console.log = originalConsoleLog;
+    process.env.HOME = previousHome;
+    fs.rmSync(homeDir, { recursive: true, force: true });
+  }
+});

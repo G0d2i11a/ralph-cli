@@ -559,6 +559,7 @@ function createTemporaryWorktreeCommit(
   const privateObjectDirs = uniqueExistingObjectDirs(
     worktreeObjectDirs.filter((dir) => !repoObjectsDir || path.resolve(dir) !== path.resolve(repoObjectsDir)),
   );
+  const tempObjectDir = worktreeMergeState.usesGitLocal ? undefined : repoObjectsDir;
   const sourceEnv = privateObjectDirs.length > 0
     ? {
         ...process.env,
@@ -614,7 +615,7 @@ function createTemporaryWorktreeCommit(
     ...worktreeGitEnv,
     ...resolveTempCommitEnv(),
     GIT_INDEX_FILE: tempIndexPath,
-    ...(repoObjectsDir ? { GIT_OBJECT_DIRECTORY: repoObjectsDir } : {}),
+    ...(tempObjectDir ? { GIT_OBJECT_DIRECTORY: tempObjectDir } : {}),
     ...buildAlternateObjectEnv(worktreeGitEnv, privateObjectDirs),
   };
 

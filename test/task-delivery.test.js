@@ -4,6 +4,7 @@ const assert = require('node:assert/strict');
 const {
   buildAutoRecoveryState,
   buildDeliveryState,
+  buildValidationEvidenceSummary,
   deriveTaskDeliveryStatus,
   resolveTaskIntegrationStatus,
 } = require('../dist/core/task-delivery.js');
@@ -100,4 +101,121 @@ test('auto recovery state exposes typed stopped fields at top level', () => {
   assert.equal(recovery.stoppedAt, new Date(100).toISOString());
   assert.equal(recovery.stopReason, 'same unresolved state');
   assert.equal(recovery.mergeRepair.stoppedAt, new Date(100).toISOString());
+});
+
+test('validation evidence summary covers passed, failed, timed-out, and skipped gates', () => {
+  const summary = buildValidationEvidenceSummary({
+    validationEvidence: {
+      schemaVersion: 1,
+      source: 'finalizer',
+      taskId: 'evidence-task',
+      generatedAt: 1_700_000_000_000,
+      configuredGates: ['typecheck', 'test', 'lint'],
+      summary: {
+        total: 4,
+        passed: 1,
+        failed: 2,
+        skipped: 1,
+        classifications: {
+          passed: 1,
+          typescript_diagnostics: 1,
+          quality_gate_timeout: 1,
+          skipped: 1,
+        },
+      },
+      runs: [
+        {
+          phase: 'quality_gate',
+          requestedGate: 'typecheck',
+          gate: 'typecheck',
+          status: 'passed',
+          classification: 'passed',
+          packageLabel: 'app',
+          command: 'npm run typecheck',
+          exitCode: 0,
+          durationMs: 15,
+          stdoutSummary: { byteLength: 11, lineCount: 1, truncated: false, excerpt: 'ok' },
+        },
+        {
+          phase: 'quality_gate',
+          requestedGate: 'typecheck',
+          gate: 'typecheck',
+          status: 'failed',
+          classification: 'typescript_diagnostics',
+          packageLabel: 'app',
+          command: 'npm run typecheck',
+          exitCode: 2,
+          durationMs: 25,
+          diagnosticCount: 3,
+          stderrSummary: { byteLength: 100, lineCount: 5, truncated: true, excerpt: 'TS2322' },
+        },
+        {
+          phase: 'quality_gate',
+          requestedGate: 'test',
+          gate: 'test',
+          status: 'failed',
+          classification: 'quality_gate_timeout',
+          packageLabel: 'app',
+          command: 'npm test',
+          durationMs: 10_000,
+          timedOut: true,
+        },
+        {
+          phase: 'quality_gate',
+          requestedGate: 'lint',
+          gate: 'lint',
+          status: 'skipped',
+          classification: 'skipped',
+          packageLabel: 'app',
+          reason: 'script "lint" is not defined for app',
+        },
+      ],
+    },
+  });
+
+  assert.equal(summary.generatedAt, new Date(1_700_000_000_000).toISOString());
+  assert.equal(summary.total, 4);
+  assert.equal(summary.passed, 1);
+  assert.equal(summary.failed, 2);
+  assert.equal(summary.skipped, 1);
+  assert.deepEqual(summary.configuredGates, ['typecheck', 'test', 'lint']);
+  assert.deepEqual(summary.gates.map((gate) => gate.status), ['passed', 'failed', 'failed', 'skipped']);
+  assert.equal(summary.gates[0].stdoutSummary, undefined);
+  assert.equal(summary.gates[1].diagnosticCount, 3);
+  assert.equal(summary.gates[2].timedOut, true);
+  assert.equal(summary.gates[3].reason, 'script "lint" is not defined for app');
+});
+
+test('validation evidence summary can fall back to repair context snapshot', () => {
+  const validationEvidenceSummary = {
+    generatedAt: new Date(123).toISOString(),
+    configuredGates: ['test'],
+    total: 1,
+    passed: 0,
+    failed: 1,
+    skipped: 0,
+    classifications: { quality_gate_timeout: 1 },
+    gates: [
+      {
+        phase: 'quality_gate',
+        requestedGate: 'test',
+        gate: 'test',
+        status: 'failed',
+        classification: 'quality_gate_timeout',
+        timedOut: true,
+      },
+    ],
+  };
+
+  const summary = buildValidationEvidenceSummary({
+    repairContext: {
+      mode: 'finalize',
+      storyId: 'US-001',
+      createdAt: 1,
+      reason: 'retry',
+      validationEvidenceSummary,
+    },
+  });
+
+  assert.deepEqual(summary, validationEvidenceSummary);
 });

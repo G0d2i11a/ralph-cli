@@ -3,7 +3,14 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import { ConfigManager } from '../config/manager';
-import { Task } from '../types/task';
+import {
+  FinalizerFailureDetails,
+  Task,
+  TaskValidationEvidenceManifest,
+  ValidationEvidencePhase,
+  ValidationEvidenceRun,
+  ValidationEvidenceStatus,
+} from '../types/task';
 import { bootstrapWorktreeDeps, detectPackageManager, findInstallRoot } from './bootstrap';
 import {
   buildGitInternalExcludePathspecs,
@@ -17,6 +24,8 @@ import {
 import {
   classifyQualityGateFailure,
   QualityGateFailure,
+  QualityGateFailureInput,
+  summarizeValidationOutput,
 } from './finalize-failure-classifier';
 import { resolveWorkspacePackageDirs } from './workspaces';
 import { parsePRD } from '../utils/helpers';
@@ -27,6 +36,7 @@ export interface FinalizeResult {
   message: string;
   commitMessage?: string;
   commitSha?: string;
+  validationEvidence: TaskValidationEvidenceManifest;
 }
 
 interface PackageManifest {
@@ -56,6 +66,11 @@ interface ParsedLintDiagnostic {
   line: number;
   severity: 'error' | 'warning';
   message: string;
+}
+
+interface QualityGateRunResult {
+  executedScripts: string[];
+  validationEvidence: TaskValidationEvidenceManifest;
 }
 
 interface QualityGateSandbox {
@@ -294,6 +309,154 @@ function readPackageManifest(installRoot: string): PackageManifest | null {
   }
 
   return JSON.parse(fs.readFileSync(packageJsonPath, 'utf-8')) as PackageManifest;
+}
+
+function buildValidationEvidenceManifest(
+  task: Pick<Task, 'id'>,
+  configuredGates: string[],
+  runs: ValidationEvidenceRun[],
+): TaskValidationEvidenceManifest {
+  const classifications: Record<string, number> = {};
+
+  for (const run of runs) {
+    classifications[run.classification] = (classifications[run.classification] ?? 0) + 1;
+  }
+
+  return {
+    schemaVersion: 1,
+    source: 'finalizer',
+    taskId: task.id,
+    generatedAt: Date.now(),
+    configuredGates: [...configuredGates],
+    summary: {
+      total: runs.length,
+      passed: runs.filter((run) => run.status === 'passed').length,
+      failed: runs.filter((run) => run.status === 'failed').length,
+      skipped: runs.filter((run) => run.status === 'skipped').length,
+      classifications,
+    },
+    runs: runs.map((run) => ({ ...run })),
+  };
+}
+
+function createSkippedValidationRun(input: {
+  phase: ValidationEvidencePhase;
+  requestedGate: string;
+  gate?: string;
+  packageLabel?: string;
+  cwd?: string;
+  reason: string;
+}): ValidationEvidenceRun {
+  return {
+    phase: input.phase,
+    requestedGate: input.requestedGate,
+    gate: input.gate ?? input.requestedGate,
+    status: 'skipped',
+    classification: 'skipped',
+    packageLabel: input.packageLabel,
+    cwd: input.cwd,
+    reason: input.reason,
+  };
+}
+
+function createSkippedGateRuns(
+  requestedScripts: QualityGateScript[],
+  cwd: string,
+  packageLabel: string,
+  reason: string,
+): ValidationEvidenceRun[] {
+  const gates = requestedScripts.length > 0 ? requestedScripts : ['quality_gates'];
+
+  return gates.map((requestedGate) => createSkippedValidationRun({
+    phase: 'quality_gate',
+    requestedGate,
+    packageLabel,
+    cwd,
+    reason,
+  }));
+}
+
+function createCompletedValidationRun(input: {
+  phase: ValidationEvidencePhase;
+  requestedGate: string;
+  gate: string;
+  packageLabel: string;
+  cwd: string;
+  command: string;
+  status?: Extract<ValidationEvidenceStatus, 'passed'>;
+  classification?: 'passed' | 'legacy_debt';
+  reason?: string;
+  stdout?: string;
+  stderr?: string;
+  exitCode?: number | null;
+  durationMs: number;
+  startedAt: number;
+  completedAt: number;
+}): ValidationEvidenceRun {
+  return {
+    phase: input.phase,
+    requestedGate: input.requestedGate,
+    gate: input.gate,
+    status: input.status ?? 'passed',
+    classification: input.classification ?? 'passed',
+    packageLabel: input.packageLabel,
+    cwd: input.cwd,
+    command: input.command,
+    exitCode: typeof input.exitCode === 'number' ? input.exitCode : undefined,
+    durationMs: input.durationMs,
+    startedAt: input.startedAt,
+    completedAt: input.completedAt,
+    reason: input.reason,
+    stdoutSummary: summarizeValidationOutput(input.stdout),
+    stderrSummary: summarizeValidationOutput(input.stderr),
+  };
+}
+
+function createFailedValidationRun(
+  details: FinalizerFailureDetails,
+  phase: ValidationEvidencePhase,
+): ValidationEvidenceRun {
+  return {
+    phase,
+    requestedGate: details.requestedGate,
+    gate: details.gate,
+    status: 'failed',
+    classification: details.class,
+    packageLabel: details.packageLabel,
+    cwd: details.cwd,
+    command: details.command,
+    exitCode: details.exitCode,
+    durationMs: details.durationMs,
+    startedAt: details.startedAt,
+    completedAt: details.completedAt,
+    timedOut: details.timedOut,
+    startFailed: details.startFailed,
+    reason: details.rawMessage,
+    stdoutSummary: details.stdoutSummary,
+    stderrSummary: details.stderrSummary,
+    diagnosticCount: details.diagnosticCount,
+    diagnosticSignature: details.diagnosticSignature,
+    failedFiles: details.failedFiles,
+    failedCodes: details.failedCodes,
+    failedSymbols: details.failedSymbols,
+    diagnostics: details.diagnostics,
+  };
+}
+
+function createQualityGateFailure(
+  task: Task,
+  configuredScripts: QualityGateScript[],
+  evidenceRuns: ValidationEvidenceRun[],
+  phase: ValidationEvidencePhase,
+  input: QualityGateFailureInput,
+): QualityGateFailure {
+  const details = classifyQualityGateFailure(input);
+  const failedRun = createFailedValidationRun(details, phase);
+  const nextRuns = [...evidenceRuns, failedRun];
+  return new QualityGateFailure(
+    details,
+    buildValidationEvidenceManifest(task, configuredScripts, nextRuns),
+  );
 }
 
 function filterFinalizerOperationalPaths(paths: string[]): string[] {
@@ -801,23 +964,56 @@ function resolveConfiguredQualityGates(config: Pick<ConfigManager, 'get'>): Qual
   return [...QUALITY_GATE_SCRIPTS];
 }
 
-function runQualityGates(task: Task, timeoutMs: number, configuredScripts: QualityGateScript[]): string[] {
+function runQualityGates(task: Task, timeoutMs: number, configuredScripts: QualityGateScript[]): QualityGateRunResult {
+  const evidenceRuns: ValidationEvidenceRun[] = [];
+  const requestedScripts = configuredScripts.length > 0 ? configuredScripts : [];
+  if (requestedScripts.length === 0) {
+    const reason = 'finalizer.qualityGates is empty';
+    appendFinalizeLog(task, `Skipped quality gates (${reason})`);
+    evidenceRuns.push(createSkippedValidationRun({
+      phase: 'quality_gate',
+      requestedGate: 'quality_gates',
+      gate: 'quality_gates',
+      cwd: task.worktree,
+      packageLabel: path.basename(task.worktree),
+      reason,
+    }));
+    return {
+      executedScripts: [],
+      validationEvidence: buildValidationEvidenceManifest(task, configuredScripts, evidenceRuns),
+    };
+  }
+
   const installRoot = findInstallRoot(task.worktree, task.repoPath);
   if (!installRoot) {
-    appendFinalizeLog(task, 'Skipped quality gates (no package.json detected)');
-    return [];
+    const reason = 'no package.json detected';
+    appendFinalizeLog(task, `Skipped quality gates (${reason})`);
+    evidenceRuns.push(...createSkippedGateRuns(
+      requestedScripts,
+      task.worktree,
+      path.basename(task.worktree),
+      reason,
+    ));
+    return {
+      executedScripts: [],
+      validationEvidence: buildValidationEvidenceManifest(task, configuredScripts, evidenceRuns),
+    };
   }
 
   const manifest = readPackageManifest(installRoot);
   if (!manifest?.scripts) {
-    appendFinalizeLog(task, `Skipped quality gates (no scripts in ${installRoot})`);
-    return [];
-  }
-
-  const requestedScripts = configuredScripts.length > 0 ? configuredScripts : [];
-  if (requestedScripts.length === 0) {
-    appendFinalizeLog(task, 'Skipped quality gates (finalizer.qualityGates is empty)');
-    return [];
+    const reason = `no scripts in ${installRoot}`;
+    appendFinalizeLog(task, `Skipped quality gates (${reason})`);
+    evidenceRuns.push(...createSkippedGateRuns(
+      requestedScripts,
+      installRoot,
+      path.basename(installRoot),
+      reason,
+    ));
+    return {
+      executedScripts: [],
+      validationEvidence: buildValidationEvidenceManifest(task, configuredScripts, evidenceRuns),
+    };
   }
 
   const changedFiles = listChangedFiles(task.worktree, task.baseCommitSha);
@@ -834,17 +1030,134 @@ function runQualityGates(task: Task, timeoutMs: number, configuredScripts: Quali
   const sandbox = createQualityGateSandbox(task);
 
   try {
-    for (const preparation of preparations) {
+  for (const preparation of preparations) {
+    appendFinalizeLog(
+      task,
+      `Running quality gate preparation: ${packageManager} run ${preparation.actualScript} (reason: ${preparation.reason}, cwd: ${preparation.cwd})`
+    );
+    const command = `${packageManager} run ${preparation.actualScript}`;
+    const startedAt = Date.now();
+    const result = runManagedQualityGateCommand(packageManager, ['run', preparation.actualScript], {
+      cwd: preparation.cwd,
+      env: sandbox.env,
+      timeoutMs,
+    });
+    const completedAt = Date.now();
+    const durationMs = completedAt - startedAt;
+
+    if (result.stdout?.trim()) {
+      appendFinalizeLog(task, result.stdout.trim());
+    }
+    if (result.stderr?.trim()) {
+      appendFinalizeLog(task, result.stderr.trim());
+    }
+
+    if (result.timedOut) {
+      throw createQualityGateFailure(task, configuredScripts, evidenceRuns, 'quality_gate_preparation', {
+        requestedScript: 'typecheck',
+        actualScript: preparation.actualScript,
+        cwd: preparation.cwd,
+        packageLabel: preparation.label,
+        command,
+        rawMessage: `Quality gate preparation "${preparation.actualScript}" timed out after ${formatTimeoutSeconds(timeoutMs)}s`,
+        stdout: result.stdout,
+        stderr: result.stderr,
+        exitCode: result.status,
+        durationMs,
+        startedAt,
+        completedAt,
+        timedOut: true,
+      });
+    }
+
+    if (result.error) {
+      throw createQualityGateFailure(task, configuredScripts, evidenceRuns, 'quality_gate_preparation', {
+        requestedScript: 'typecheck',
+        actualScript: preparation.actualScript,
+        cwd: preparation.cwd,
+        packageLabel: preparation.label,
+        command,
+        rawMessage: `Quality gate preparation "${preparation.actualScript}" failed to start: ${result.error.message}`,
+        stdout: result.stdout,
+        stderr: result.stderr,
+        exitCode: result.status,
+        durationMs,
+        startedAt,
+        completedAt,
+        startFailed: true,
+      });
+    }
+
+    if (result.status !== 0) {
+      const errorMessage = result.stderr?.trim() || result.stdout?.trim() || `exit code ${result.status}`;
+      throw createQualityGateFailure(task, configuredScripts, evidenceRuns, 'quality_gate_preparation', {
+        requestedScript: 'typecheck',
+        actualScript: preparation.actualScript,
+        cwd: preparation.cwd,
+        packageLabel: preparation.label,
+        command,
+        rawMessage: `Quality gate preparation "${preparation.actualScript}" failed: ${errorMessage}`,
+        stdout: result.stdout,
+        stderr: result.stderr,
+        exitCode: result.status,
+        durationMs,
+        startedAt,
+        completedAt,
+      });
+    }
+
+    evidenceRuns.push(createCompletedValidationRun({
+      phase: 'quality_gate_preparation',
+      requestedGate: 'typecheck',
+      gate: preparation.actualScript,
+      packageLabel: preparation.label,
+      cwd: preparation.cwd,
+      command,
+      stdout: result.stdout,
+      stderr: result.stderr,
+      exitCode: result.status,
+      durationMs,
+      startedAt,
+      completedAt,
+      reason: preparation.reason,
+    }));
+    executedScripts.push(`${preparation.label}:${preparation.actualScript}[prepare]`);
+  }
+
+  for (const target of targets) {
+    const availableScripts = resolveScriptExecutions(target, requestedScripts);
+    const resolvedRequestedScripts = new Set(availableScripts.map((script) => script.requestedScript));
+    const skippedScripts = requestedScripts.filter((requestedScript) => !resolvedRequestedScripts.has(requestedScript));
+
+    for (const requestedScript of skippedScripts) {
+      evidenceRuns.push(createSkippedValidationRun({
+        phase: 'quality_gate',
+        requestedGate: requestedScript,
+        packageLabel: target.label,
+        cwd: target.cwd,
+        reason: `script "${requestedScript}" is not defined for ${target.label}`,
+      }));
+    }
+
+    if (availableScripts.length === 0) {
+      appendFinalizeLog(task, `Skipped quality gates for ${target.label} (none of ${requestedScripts.join(', ')} exist)`);
+      continue;
+    }
+
+    for (const scriptExecution of availableScripts) {
       appendFinalizeLog(
         task,
-        `Running quality gate preparation: ${packageManager} run ${preparation.actualScript} (reason: ${preparation.reason}, cwd: ${preparation.cwd})`
+        `Running quality gate: ${packageManager} run ${scriptExecution.actualScript} (requested: ${scriptExecution.requestedScript}, cwd: ${target.cwd})`
       );
-      const command = `${packageManager} run ${preparation.actualScript}`;
-      const result = runManagedQualityGateCommand(packageManager, ['run', preparation.actualScript], {
-        cwd: preparation.cwd,
+      const command = `${packageManager} run ${scriptExecution.actualScript}`;
+      const startedAt = Date.now();
+      const result = runManagedQualityGateCommand(packageManager, ['run', scriptExecution.actualScript], {
+        cwd: target.cwd,
         env: sandbox.env,
         timeoutMs,
       });
+      const completedAt = Date.now();
+      const durationMs = completedAt - startedAt;
 
       if (result.stdout?.trim()) {
         appendFinalizeLog(task, result.stdout.trim());
@@ -854,152 +1167,123 @@ function runQualityGates(task: Task, timeoutMs: number, configuredScripts: Quali
       }
 
       if (result.timedOut) {
-          throw new QualityGateFailure(classifyQualityGateFailure({
-            requestedScript: 'typecheck',
-            actualScript: preparation.actualScript,
-            cwd: preparation.cwd,
-            packageLabel: preparation.label,
-            command,
-            rawMessage: `Quality gate preparation "${preparation.actualScript}" timed out after ${formatTimeoutSeconds(timeoutMs)}s`,
-            stdout: result.stdout,
-            stderr: result.stderr,
-            exitCode: result.status,
-            timedOut: true,
-          }));
+        throw createQualityGateFailure(task, configuredScripts, evidenceRuns, 'quality_gate', {
+          requestedScript: scriptExecution.requestedScript,
+          actualScript: scriptExecution.actualScript,
+          cwd: target.cwd,
+          packageLabel: target.label,
+          command,
+          rawMessage: `Quality gate "${scriptExecution.actualScript}" timed out after ${formatTimeoutSeconds(timeoutMs)}s`,
+          stdout: result.stdout,
+          stderr: result.stderr,
+          exitCode: result.status,
+          durationMs,
+          startedAt,
+          completedAt,
+          timedOut: true,
+        });
       }
 
       if (result.error) {
-        throw new QualityGateFailure(classifyQualityGateFailure({
-          requestedScript: 'typecheck',
-          actualScript: preparation.actualScript,
-          cwd: preparation.cwd,
-          packageLabel: preparation.label,
+        throw createQualityGateFailure(task, configuredScripts, evidenceRuns, 'quality_gate', {
+          requestedScript: scriptExecution.requestedScript,
+          actualScript: scriptExecution.actualScript,
+          cwd: target.cwd,
+          packageLabel: target.label,
           command,
-          rawMessage: `Quality gate preparation "${preparation.actualScript}" failed to start: ${result.error.message}`,
+          rawMessage: `Quality gate "${scriptExecution.actualScript}" failed to start: ${result.error.message}`,
           stdout: result.stdout,
           stderr: result.stderr,
           exitCode: result.status,
+          durationMs,
+          startedAt,
+          completedAt,
           startFailed: true,
-        }));
+        });
       }
 
       if (result.status !== 0) {
+        const combinedOutput = [result.stdout?.trim(), result.stderr?.trim()].filter(Boolean).join('\n');
         const errorMessage = result.stderr?.trim() || result.stdout?.trim() || `exit code ${result.status}`;
-        throw new QualityGateFailure(classifyQualityGateFailure({
-          requestedScript: 'typecheck',
-          actualScript: preparation.actualScript,
-          cwd: preparation.cwd,
-          packageLabel: preparation.label,
+        if (scriptExecution.requestedScript === 'lint') {
+          const lintFailure = shouldTreatLintFailureAsLegacyDebt(
+            task,
+            target,
+            combinedOutput || errorMessage,
+            changedFileSet,
+            changedLineMap,
+          );
+          if (lintFailure.suppressFailure) {
+            if (lintFailure.summary) {
+              appendFinalizeLog(task, lintFailure.summary);
+            }
+            evidenceRuns.push(createCompletedValidationRun({
+              phase: 'quality_gate',
+              requestedGate: scriptExecution.requestedScript,
+              gate: scriptExecution.actualScript,
+              packageLabel: target.label,
+              cwd: target.cwd,
+              command,
+              stdout: result.stdout,
+              stderr: result.stderr,
+              exitCode: result.status,
+              durationMs,
+              startedAt,
+              completedAt,
+              classification: 'legacy_debt',
+              reason: lintFailure.summary,
+            }));
+            executedScripts.push(`${target.label}:${scriptExecution.actualScript}[legacy-debt]`);
+            continue;
+          }
+        }
+        throw createQualityGateFailure(task, configuredScripts, evidenceRuns, 'quality_gate', {
+          requestedScript: scriptExecution.requestedScript,
+          actualScript: scriptExecution.actualScript,
+          cwd: target.cwd,
+          packageLabel: target.label,
           command,
-          rawMessage: `Quality gate preparation "${preparation.actualScript}" failed: ${errorMessage}`,
+          rawMessage: `Quality gate "${scriptExecution.actualScript}" failed: ${errorMessage}`,
           stdout: result.stdout,
           stderr: result.stderr,
           exitCode: result.status,
-        }));
-      }
-
-      executedScripts.push(`${preparation.label}:${preparation.actualScript}[prepare]`);
-    }
-
-    for (const target of targets) {
-      const availableScripts = resolveScriptExecutions(target, requestedScripts);
-      if (availableScripts.length === 0) {
-        appendFinalizeLog(task, `Skipped quality gates for ${target.label} (none of ${requestedScripts.join(', ')} exist)`);
-        continue;
-      }
-
-      for (const scriptExecution of availableScripts) {
-        appendFinalizeLog(
-          task,
-          `Running quality gate: ${packageManager} run ${scriptExecution.actualScript} (requested: ${scriptExecution.requestedScript}, cwd: ${target.cwd})`
-        );
-        const command = `${packageManager} run ${scriptExecution.actualScript}`;
-        const result = runManagedQualityGateCommand(packageManager, ['run', scriptExecution.actualScript], {
-          cwd: target.cwd,
-          env: sandbox.env,
-          timeoutMs,
+          durationMs,
+          startedAt,
+          completedAt,
         });
-
-        if (result.stdout?.trim()) {
-          appendFinalizeLog(task, result.stdout.trim());
-        }
-        if (result.stderr?.trim()) {
-          appendFinalizeLog(task, result.stderr.trim());
-        }
-
-        if (result.timedOut) {
-          throw new QualityGateFailure(classifyQualityGateFailure({
-            requestedScript: scriptExecution.requestedScript,
-            actualScript: scriptExecution.actualScript,
-            cwd: target.cwd,
-            packageLabel: target.label,
-            command,
-            rawMessage: `Quality gate "${scriptExecution.actualScript}" timed out after ${formatTimeoutSeconds(timeoutMs)}s`,
-            stdout: result.stdout,
-            stderr: result.stderr,
-            exitCode: result.status,
-            timedOut: true,
-          }));
-        }
-
-        if (result.error) {
-          throw new QualityGateFailure(classifyQualityGateFailure({
-            requestedScript: scriptExecution.requestedScript,
-            actualScript: scriptExecution.actualScript,
-            cwd: target.cwd,
-            packageLabel: target.label,
-            command,
-            rawMessage: `Quality gate "${scriptExecution.actualScript}" failed to start: ${result.error.message}`,
-            stdout: result.stdout,
-            stderr: result.stderr,
-            exitCode: result.status,
-            startFailed: true,
-          }));
-        }
-
-        if (result.status !== 0) {
-          const combinedOutput = [result.stdout?.trim(), result.stderr?.trim()].filter(Boolean).join('\n');
-          const errorMessage = result.stderr?.trim() || result.stdout?.trim() || `exit code ${result.status}`;
-          if (scriptExecution.requestedScript === 'lint') {
-            const lintFailure = shouldTreatLintFailureAsLegacyDebt(
-              task,
-              target,
-              combinedOutput || errorMessage,
-              changedFileSet,
-              changedLineMap,
-            );
-            if (lintFailure.suppressFailure) {
-              if (lintFailure.summary) {
-                appendFinalizeLog(task, lintFailure.summary);
-              }
-              executedScripts.push(`${target.label}:${scriptExecution.actualScript}[legacy-debt]`);
-              continue;
-            }
-          }
-          throw new QualityGateFailure(classifyQualityGateFailure({
-            requestedScript: scriptExecution.requestedScript,
-            actualScript: scriptExecution.actualScript,
-            cwd: target.cwd,
-            packageLabel: target.label,
-            command,
-            rawMessage: `Quality gate "${scriptExecution.actualScript}" failed: ${errorMessage}`,
-            stdout: result.stdout,
-            stderr: result.stderr,
-            exitCode: result.status,
-          }));
-        }
-
-        executedScripts.push(`${target.label}:${scriptExecution.actualScript}`);
       }
-    }
 
-    if (executedScripts.length === 0) {
-      appendFinalizeLog(task, `Skipped quality gates (none of ${requestedScripts.join(', ')} exist in changed targets)`);
-      return [];
+      evidenceRuns.push(createCompletedValidationRun({
+        phase: 'quality_gate',
+        requestedGate: scriptExecution.requestedScript,
+        gate: scriptExecution.actualScript,
+        packageLabel: target.label,
+        cwd: target.cwd,
+        command,
+        stdout: result.stdout,
+        stderr: result.stderr,
+        exitCode: result.status,
+        durationMs,
+        startedAt,
+        completedAt,
+      }));
+      executedScripts.push(`${target.label}:${scriptExecution.actualScript}`);
     }
+  }
 
-    appendFinalizeLog(task, `Quality gates passed: ${executedScripts.join(', ')}`);
-    return executedScripts;
+  if (executedScripts.length === 0) {
+    appendFinalizeLog(task, `Skipped quality gates (none of ${requestedScripts.join(', ')} exist in changed targets)`);
+    return {
+      executedScripts,
+      validationEvidence: buildValidationEvidenceManifest(task, configuredScripts, evidenceRuns),
+    };
+  }
+
+  appendFinalizeLog(task, `Quality gates passed: ${executedScripts.join(', ')}`);
+  return {
+    executedScripts,
+    validationEvidence: buildValidationEvidenceManifest(task, configuredScripts, evidenceRuns),
+  };
   } finally {
     sandbox.cleanup();
   }
@@ -1023,14 +1307,22 @@ export function finalizeTaskOutput(task: Task): FinalizeResult {
   const changedFilesBeforeFinalize = listChangedFiles(worktreePath);
 
   if (changedFilesBeforeFinalize.length === 0 && !existingCommitState.hasExistingCommit && !localMergeEnv) {
+    const reason = 'no changes or existing task commits detected before finalization';
     return {
       success: true,
       committed: false,
       message: 'No changes to commit',
+      validationEvidence: buildValidationEvidenceManifest(
+        task,
+        qualityGateScripts,
+        createSkippedGateRuns(qualityGateScripts, worktreePath, path.basename(worktreePath), reason),
+      ),
     };
   }
 
-  const qualityGates = runQualityGates(task, qualityGateTimeoutMs, qualityGateScripts);
+  const qualityGateResult = runQualityGates(task, qualityGateTimeoutMs, qualityGateScripts);
+  const qualityGates = qualityGateResult.executedScripts;
+  const validationEvidence = qualityGateResult.validationEvidence;
 
   if (localMergeEnv) {
     const unmergedFiles = listUnmergedFiles(worktreePath, localMergeEnv);
@@ -1068,6 +1360,7 @@ export function finalizeTaskOutput(task: Task): FinalizeResult {
         message: `Committed resolved local merge successfully${qualityGateSuffix}`,
         commitMessage,
         commitSha,
+        validationEvidence,
       };
     }
   }
@@ -1090,6 +1383,7 @@ export function finalizeTaskOutput(task: Task): FinalizeResult {
       message: `Validated existing task commits${qualityGateSuffix}`,
       commitMessage: latestCommitMessage,
       commitSha: existingCommitState.headCommit,
+      validationEvidence,
     };
   }
 
@@ -1101,6 +1395,7 @@ export function finalizeTaskOutput(task: Task): FinalizeResult {
       success: true,
       committed: false,
       message: 'No staged changes to commit',
+      validationEvidence,
     };
   }
 
@@ -1117,5 +1412,6 @@ export function finalizeTaskOutput(task: Task): FinalizeResult {
     message: `Committed task changes successfully${qualityGateSuffix}`,
     commitMessage,
     commitSha: tryRunGit(worktreePath, ['rev-parse', 'HEAD']),
+    validationEvidence,
   };
 }

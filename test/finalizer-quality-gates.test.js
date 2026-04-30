@@ -6,6 +6,7 @@ const path = require('node:path');
 const { execFileSync } = require('node:child_process');
 
 const { finalizeTaskOutput } = require('../dist/core/finalizer.js');
+const { QualityGateFailure } = require('../dist/core/finalize-failure-classifier.js');
 
 const originalRalphHome = process.env.RALPH_HOME;
 let activeRalphHomeRoot;
@@ -147,11 +148,170 @@ test('finalizeTaskOutput runs available quality gates before commit', { concurre
     assert.equal(result.success, true);
     assert.equal(result.committed, true);
     assert.match(result.message, /quality gates/);
+    assert.equal(result.validationEvidence.schemaVersion, 1);
+    assert.deepEqual(result.validationEvidence.configuredGates, ['typecheck', 'lint', 'test', 'build']);
+    assert.equal(result.validationEvidence.summary.total, 4);
+    assert.equal(result.validationEvidence.summary.passed, 4);
+    assert.equal(result.validationEvidence.summary.failed, 0);
+    assert.equal(result.validationEvidence.summary.skipped, 0);
+    assert.equal(result.validationEvidence.runs[0].command, 'npm run typecheck');
+    assert.equal(path.resolve(result.validationEvidence.runs[0].cwd), fs.realpathSync.native(worktreePath));
+    assert.equal(result.validationEvidence.runs[0].exitCode, 0);
+    assert.equal(result.validationEvidence.runs[0].classification, 'passed');
+    assert.equal(typeof result.validationEvidence.runs[0].durationMs, 'number');
+    assert.equal(typeof result.validationEvidence.runs[0].stdoutSummary.byteLength, 'number');
     assert.equal(fs.existsSync(path.join(worktreePath, 'typecheck.txt')), true);
     assert.equal(fs.existsSync(path.join(worktreePath, 'lint.txt')), true);
     assert.equal(fs.existsSync(path.join(worktreePath, 'test.txt')), true);
     assert.equal(fs.existsSync(path.join(worktreePath, 'build.txt')), true);
     assert.match(git(['log', '--oneline', '-1'], worktreePath), /feat\(ralph\): complete quality gates task/);
+  } finally {
+    fs.rmSync(repoDir, { recursive: true, force: true });
+  }
+});
+
+test('finalizeTaskOutput records skipped quality gates with explicit reasons', { concurrency: false }, () => {
+  const repoDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-finalizer-skipped-gates-'));
+  const prdPath = path.join(repoDir, 'prd.json');
+
+  try {
+    git(['init'], repoDir);
+    git(['checkout', '-b', 'main'], repoDir);
+    git(['config', 'user.name', 'Ralph Test'], repoDir);
+    git(['config', 'user.email', 'ralph@example.com'], repoDir);
+
+    fs.writeFileSync(prdPath, JSON.stringify({
+      id: 'prd-skipped-gates',
+      title: 'Skipped Gates Task',
+      description: 'Capture skipped quality gate evidence',
+      userStories: [],
+      dependencies: [],
+    }, null, 2));
+    fs.writeFileSync(path.join(repoDir, 'feature.txt'), 'base\n');
+    git(['add', '.'], repoDir);
+    git(['commit', '-m', 'feat: initial'], repoDir);
+
+    const worktreePath = path.join(repoDir, '.ralph-worktrees', 'task-skipped-gates');
+    fs.mkdirSync(path.dirname(worktreePath), { recursive: true });
+    git(['worktree', 'add', '-b', 'ralph/task-skipped-gates', worktreePath, 'main'], repoDir);
+
+    fs.appendFileSync(path.join(worktreePath, 'feature.txt'), 'change\n');
+
+    const task = {
+      id: 'task-skipped-gates',
+      prdPath,
+      status: 'ready_to_finalize',
+      startTime: Date.now(),
+      completedUS: [],
+      worktree: worktreePath,
+      logPath: path.join(repoDir, '.ralph', 'tasks', 'task-skipped-gates', 'agent.log'),
+      agent: 'codex',
+      repoPath: repoDir,
+      loopCount: 0,
+      consecutiveNoProgress: 0,
+      consecutiveErrors: 0,
+      lastProgressTime: Date.now(),
+      lastFilesChanged: 1,
+    };
+
+    const result = finalizeTaskOutput(task);
+
+    assert.equal(result.success, true);
+    assert.equal(result.validationEvidence.summary.skipped, 4);
+    assert.equal(result.validationEvidence.summary.failed, 0);
+    assert.deepEqual(
+      result.validationEvidence.runs.map((run) => run.status),
+      ['skipped', 'skipped', 'skipped', 'skipped'],
+    );
+    assert.ok(result.validationEvidence.runs.every((run) => run.reason && /no package\.json detected/.test(run.reason)));
+  } finally {
+    fs.rmSync(repoDir, { recursive: true, force: true });
+  }
+});
+
+test('finalizeTaskOutput records failed gate diagnostics with capped output summaries', { concurrency: false }, () => {
+  const repoDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-finalizer-failed-evidence-'));
+  const prdPath = path.join(repoDir, 'prd.json');
+
+  try {
+    git(['init'], repoDir);
+    git(['checkout', '-b', 'main'], repoDir);
+    git(['config', 'user.name', 'Ralph Test'], repoDir);
+    git(['config', 'user.email', 'ralph@example.com'], repoDir);
+
+    fs.writeFileSync(prdPath, JSON.stringify({
+      id: 'prd-failed-evidence',
+      title: 'Failed Evidence Task',
+      description: 'Capture failed quality gate evidence',
+      userStories: [],
+      dependencies: [],
+    }, null, 2));
+    fs.writeFileSync(path.join(repoDir, 'fail.js'), [
+      "console.log('x'.repeat(5000));",
+      "console.error(\"src/service.ts(12,5): error TS2353: Object literal may only specify known properties, and 'sourceType' does not exist in type 'SpeakingPersonaWhereInput'.\");",
+      'process.exit(2);',
+      '',
+    ].join('\n'));
+    fs.writeFileSync(path.join(repoDir, 'package.json'), JSON.stringify({
+      name: 'fixture',
+      version: '1.0.0',
+      scripts: {
+        typecheck: 'node fail.js',
+      },
+    }, null, 2));
+    fs.writeFileSync(path.join(repoDir, 'feature.txt'), 'base\n');
+    git(['add', '.'], repoDir);
+    git(['commit', '-m', 'feat: initial'], repoDir);
+
+    const worktreePath = path.join(repoDir, '.ralph-worktrees', 'task-failed-evidence');
+    fs.mkdirSync(path.dirname(worktreePath), { recursive: true });
+    git(['worktree', 'add', '-b', 'ralph/task-failed-evidence', worktreePath, 'main'], repoDir);
+
+    fs.appendFileSync(path.join(worktreePath, 'feature.txt'), 'change\n');
+
+    const task = {
+      id: 'task-failed-evidence',
+      prdPath,
+      status: 'ready_to_finalize',
+      startTime: Date.now(),
+      completedUS: [],
+      worktree: worktreePath,
+      logPath: path.join(repoDir, '.ralph', 'tasks', 'task-failed-evidence', 'agent.log'),
+      agent: 'codex',
+      repoPath: repoDir,
+      loopCount: 0,
+      consecutiveNoProgress: 0,
+      consecutiveErrors: 0,
+      lastProgressTime: Date.now(),
+      lastFilesChanged: 1,
+    };
+
+    assert.throws(
+      () => finalizeTaskOutput(task),
+      (error) => {
+        assert.equal(error instanceof QualityGateFailure, true);
+        assert.equal(error.details.gate, 'typecheck');
+        assert.equal(error.details.exitCode, 2);
+        assert.equal(typeof error.details.durationMs, 'number');
+        assert.equal(error.details.stdoutSummary.truncated, true);
+        assert.ok(error.details.stdoutSummary.excerpt.length <= 2000);
+        assert.equal(error.details.diagnosticCount, 1);
+        assert.deepEqual(error.details.failedSymbols, ['sourceType']);
+
+        const evidence = error.validationEvidence;
+        assert.equal(evidence.summary.failed, 1);
+        const failedRun = evidence.runs.find((run) => run.status === 'failed');
+        assert.ok(failedRun);
+        assert.equal(failedRun.command, 'npm run typecheck');
+        assert.equal(path.resolve(failedRun.cwd), fs.realpathSync.native(worktreePath));
+        assert.equal(failedRun.exitCode, 2);
+        assert.equal(failedRun.classification, 'generated_type_drift');
+        assert.equal(failedRun.stdoutSummary.truncated, true);
+        assert.ok(failedRun.stdoutSummary.excerpt.length <= 2000);
+        assert.equal(failedRun.diagnosticCount, 1);
+        return true;
+      },
+    );
   } finally {
     fs.rmSync(repoDir, { recursive: true, force: true });
   }
@@ -1114,6 +1274,7 @@ test('finalizeTaskOutput repairs missing workspace install symlinks before Prism
     fs.writeFileSync(path.join(repoDir, 'package.json'), JSON.stringify({
       name: 'workspace-fixture',
       private: true,
+      packageManager: 'pnpm@9.0.0',
       workspaces: ['packages/*'],
       scripts: {
         typecheck: `node -e "require('fs').accessSync('packages/db/generated-client.txt'); require('fs').writeFileSync('typecheck.txt','ok')"`,
@@ -1126,6 +1287,7 @@ test('finalizeTaskOutput repairs missing workspace install symlinks before Prism
     fs.mkdirSync(path.join(repoDir, 'docs'), { recursive: true });
     fs.writeFileSync(path.join(repoDir, 'packages', 'db', 'package.json'), JSON.stringify({
       name: '@repo/db',
+      packageManager: 'pnpm@9.0.0',
       scripts: {
         'db:generate:safe': 'node prisma/generate-safe.mjs',
       },
@@ -1378,6 +1540,7 @@ test('finalizeTaskOutput scopes quality gates using pnpm-workspace.yaml patterns
     fs.writeFileSync(path.join(repoDir, 'package.json'), JSON.stringify({
       name: 'workspace-fixture',
       private: true,
+      packageManager: 'pnpm@9.0.0',
       scripts: {
         test: `node -e "process.exit(9)"`,
       },
@@ -1388,12 +1551,14 @@ test('finalizeTaskOutput scopes quality gates using pnpm-workspace.yaml patterns
     fs.mkdirSync(path.join(repoDir, 'packages', 'unchanged'), { recursive: true });
     fs.writeFileSync(path.join(repoDir, 'packages', 'changed', 'package.json'), JSON.stringify({
       name: 'changed',
+      packageManager: 'pnpm@9.0.0',
       scripts: {
         test: `node -e "require('fs').writeFileSync('changed-test.txt','ok')"`,
       },
     }, null, 2));
     fs.writeFileSync(path.join(repoDir, 'packages', 'unchanged', 'package.json'), JSON.stringify({
       name: 'unchanged',
+      packageManager: 'pnpm@9.0.0',
       scripts: {
         test: `node -e "process.exit(8)"`,
       },

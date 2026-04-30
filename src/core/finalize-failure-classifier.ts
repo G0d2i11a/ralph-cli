@@ -2,7 +2,11 @@ import {
   FinalizeFailureClass,
   FinalizeFailureDiagnostic,
   FinalizerFailureDetails,
+  TaskValidationEvidenceManifest,
+  ValidationOutputSummary,
 } from '../types/task';
+
+const OUTPUT_SUMMARY_EXCERPT_LIMIT = 2000;
 
 export interface QualityGateFailureInput {
   requestedScript: string;
@@ -14,17 +18,22 @@ export interface QualityGateFailureInput {
   stdout?: string;
   stderr?: string;
   exitCode?: number | null;
+  durationMs?: number;
+  startedAt?: number;
+  completedAt?: number;
   timedOut?: boolean;
   startFailed?: boolean;
 }
 
 export class QualityGateFailure extends Error {
   readonly details: FinalizerFailureDetails;
+  readonly validationEvidence?: TaskValidationEvidenceManifest;
 
-  constructor(details: FinalizerFailureDetails) {
+  constructor(details: FinalizerFailureDetails, validationEvidence?: TaskValidationEvidenceManifest) {
     super(details.rawMessage);
     this.name = 'QualityGateFailure';
     this.details = details;
+    this.validationEvidence = validationEvidence;
   }
 }
 
@@ -65,8 +74,13 @@ export function classifyQualityGateFailure(input: QualityGateFailureInput): Fina
     cwd: input.cwd,
     command: input.command,
     exitCode: typeof input.exitCode === 'number' ? input.exitCode : undefined,
+    durationMs: input.durationMs,
+    startedAt: input.startedAt,
+    completedAt: input.completedAt,
     timedOut: input.timedOut || undefined,
     startFailed: input.startFailed || undefined,
+    stdoutSummary: summarizeValidationOutput(input.stdout),
+    stderrSummary: summarizeValidationOutput(input.stderr),
     diagnosticCount: diagnostics.length > 0 ? diagnostics.length : undefined,
     diagnosticSignature,
     failedFiles: failedFiles.length > 0 ? failedFiles : undefined,
@@ -74,6 +88,25 @@ export function classifyQualityGateFailure(input: QualityGateFailureInput): Fina
     failedSymbols: failedSymbols.length > 0 ? failedSymbols : undefined,
     diagnostics: diagnostics.length > 0 ? diagnostics : undefined,
     rawMessage: input.rawMessage,
+  };
+}
+
+export function summarizeValidationOutput(output: string | undefined): ValidationOutputSummary {
+  const content = output ?? '';
+  const byteLength = Buffer.byteLength(content, 'utf-8');
+  const lineCount = content.length === 0 ? 0 : content.split(/\r?\n/).length;
+  const trimmed = content.trim();
+  const excerptSource = trimmed || content;
+  const truncated = excerptSource.length > OUTPUT_SUMMARY_EXCERPT_LIMIT;
+  const excerpt = truncated
+    ? excerptSource.slice(excerptSource.length - OUTPUT_SUMMARY_EXCERPT_LIMIT)
+    : excerptSource;
+
+  return {
+    byteLength,
+    lineCount,
+    truncated,
+    excerpt: excerpt || undefined,
   };
 }
 

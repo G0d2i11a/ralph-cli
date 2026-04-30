@@ -6,7 +6,7 @@ import { appendTaskEvent } from './events';
 import { FinalizeResult, finalizeTaskOutput } from './finalizer';
 import { isQualityGateFailure } from './finalize-failure-classifier';
 import { assertRalphHomeIsolation } from './home-isolation';
-import { resolveTaskIntegrationStatus } from './task-delivery';
+import { buildValidationEvidenceSummary, resolveTaskIntegrationStatus } from './task-delivery';
 import {
   resolveIntegrationPolicy,
   resolveMergeTargetBranch,
@@ -517,6 +517,7 @@ function buildCompletedConflictRepairReset(task: Task, repairStoryId: string): {
       storyId: repairStoryId,
       reason: repairMessage,
       createdAt: updatedAt,
+      validationEvidenceSummary: buildValidationEvidenceSummary(task),
     }),
   };
 }
@@ -1289,6 +1290,7 @@ if (prdGlobAutoIngestEnabled) {
           storyId: repairStoryId,
           reason: repairMessage,
           createdAt: now,
+          validationEvidenceSummary: buildValidationEvidenceSummary(task),
         }),
         mergeRepairAttempts: (task.mergeRepairAttempts ?? 0) + 1,
         mergeRepairRecoveryTotalRequeues: nextMergeRepairRequeues,
@@ -1576,6 +1578,7 @@ if (prdGlobAutoIngestEnabled) {
             storyId: repairStoryId ?? task.repairContext.storyId,
             reason: buildMergeRepairReason(task),
             createdAt: now,
+            validationEvidenceSummary: buildValidationEvidenceSummary(task),
           })
         : undefined;
       const resetState = repairStoryId
@@ -1951,6 +1954,7 @@ if (prdGlobAutoIngestEnabled) {
         mode: mergeConflict ? 'merge' : 'finalize',
         reason: repairMessage,
         createdAt: updatedAt,
+        validationEvidenceSummary: buildValidationEvidenceSummary(activeTask),
       });
       const completedUS = activeTask.completedUS.filter((storyId) => storyId !== repairStoryId);
       const storyProgress = (activeTask.storyProgress || []).map((story) => story.id === repairStoryId
@@ -2626,6 +2630,7 @@ if (prdGlobAutoIngestEnabled) {
             finalizerCommitMessage: finalizeResult.commitMessage,
             finalizerCommitSha: finalizeResult.commitSha,
             finalizerCommittedAt,
+            validationEvidence: finalizeResult.validationEvidence,
             mergeError: undefined,
             mergeConflictFiles: undefined,
             mergeConflictAt: undefined,
@@ -2659,6 +2664,7 @@ if (prdGlobAutoIngestEnabled) {
               committed: finalizeResult.committed,
               commitSha: finalizeResult.commitSha,
               commitMessage: finalizeResult.commitMessage,
+              validationEvidenceSummary: finalizeResult.validationEvidence?.summary,
             },
           });
 
@@ -2716,6 +2722,10 @@ if (prdGlobAutoIngestEnabled) {
           const finalizerAttempts = (latestTask?.finalizerAttempts ?? task.finalizerAttempts ?? 0) + 1;
           const failureUpdates = getTaskUpdatesFromError(error);
           const finalizerFailure = isQualityGateFailure(error) ? error.details : undefined;
+          const validationEvidence = isQualityGateFailure(error)
+            ? error.validationEvidence
+            : finalizeResult?.validationEvidence;
+          const validationEvidenceSummary = buildValidationEvidenceSummary({ validationEvidence });
           const failureMessage = error instanceof Error ? error.message : String(error);
           const observedAt = Date.now();
           const lastErrorKind = finalizerFailure
@@ -2747,6 +2757,7 @@ if (prdGlobAutoIngestEnabled) {
                 mode: failureUpdates.mergeConflictFiles?.length ? 'merge' : 'finalize',
                 reason: failureMessage,
                 createdAt: observedAt,
+                validationEvidenceSummary,
               })
             : undefined;
           await this.stateManager.updateTask(task.id, {
@@ -2763,6 +2774,7 @@ if (prdGlobAutoIngestEnabled) {
             finalizerAttempts,
             mergeError: failureMessage,
             finalizerFailure,
+            validationEvidence,
             repairContext,
             postFinalizeMergeProbeRequired: failureUpdates.postFinalizeMergeProbeRequired
               ?? latestTask?.postFinalizeMergeProbeRequired
@@ -2795,6 +2807,7 @@ if (prdGlobAutoIngestEnabled) {
               repairMode: repairContext?.mode,
               repairStoryId,
               diagnosticCount: finalizerFailure?.diagnosticCount,
+              validationEvidenceSummary: validationEvidence?.summary,
               conflictFiles: failureUpdates.mergeConflictFiles,
             },
           });

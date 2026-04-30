@@ -1,8 +1,47 @@
-import { Task, TaskIntegrationStatus, TaskTargetSyncStatus } from '../types/task';
+import {
+  Task,
+  TaskIntegrationStatus,
+  TaskTargetSyncStatus,
+  TaskValidationEvidenceSummary,
+} from '../types/task';
 import { evaluateAutoRecovery } from './auto-recovery-state';
 
 function toIsoTimestamp(value?: number): string | undefined {
   return value ? new Date(value).toISOString() : undefined;
+}
+
+export function buildValidationEvidenceSummary(
+  task: Partial<Pick<Task, 'validationEvidence' | 'repairContext'>>,
+): TaskValidationEvidenceSummary | undefined {
+  const evidence = task.validationEvidence;
+  if (!evidence) {
+    return task.repairContext?.validationEvidenceSummary;
+  }
+
+  return {
+    generatedAt: toIsoTimestamp(evidence.generatedAt),
+    configuredGates: [...evidence.configuredGates],
+    total: evidence.summary.total,
+    passed: evidence.summary.passed,
+    failed: evidence.summary.failed,
+    skipped: evidence.summary.skipped,
+    classifications: { ...evidence.summary.classifications },
+    gates: evidence.runs.map((run) => ({
+      phase: run.phase,
+      requestedGate: run.requestedGate,
+      gate: run.gate,
+      status: run.status,
+      classification: run.classification,
+      packageLabel: run.packageLabel,
+      command: run.command,
+      exitCode: run.exitCode,
+      durationMs: run.durationMs,
+      timedOut: run.timedOut === true ? true : undefined,
+      startFailed: run.startFailed === true ? true : undefined,
+      diagnosticCount: run.diagnosticCount,
+      reason: run.status === 'skipped' ? run.reason : undefined,
+    })),
+  };
 }
 
 type TaskIntegrationInput = Pick<Task, 'integrationStatus' | 'integratedAt'>

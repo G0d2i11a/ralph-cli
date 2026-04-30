@@ -48,6 +48,57 @@ test('buildStoryExecutionPayload rewrites anchored story into finalize repair pr
       ],
       rawMessage: 'Quality gate "typecheck" failed',
     },
+    validationEvidence: {
+      schemaVersion: 1,
+      source: 'finalizer',
+      taskId: 'repair-prompt-task',
+      generatedAt: 1_700_000_000_000,
+      configuredGates: ['typecheck', 'test', 'lint'],
+      summary: {
+        total: 3,
+        passed: 1,
+        failed: 1,
+        skipped: 1,
+        classifications: {
+          passed: 1,
+          quality_gate_timeout: 1,
+          skipped: 1,
+        },
+      },
+      runs: [
+        {
+          phase: 'quality_gate',
+          requestedGate: 'typecheck',
+          gate: 'typecheck',
+          status: 'passed',
+          classification: 'passed',
+          packageLabel: 'apps/api',
+          command: 'pnpm --filter api check-types',
+          exitCode: 0,
+          durationMs: 50,
+        },
+        {
+          phase: 'quality_gate',
+          requestedGate: 'test',
+          gate: 'test',
+          status: 'failed',
+          classification: 'quality_gate_timeout',
+          packageLabel: 'apps/api',
+          command: 'pnpm --filter api test',
+          durationMs: 10_000,
+          timedOut: true,
+        },
+        {
+          phase: 'quality_gate',
+          requestedGate: 'lint',
+          gate: 'lint',
+          status: 'skipped',
+          classification: 'skipped',
+          packageLabel: 'apps/api',
+          reason: 'script "lint" is not defined for apps/api',
+        },
+      ],
+    },
     observedPackageSurface: ['apps/api', 'packages/db'],
     observedWriteSurface: ['apps/api/src/service.ts', 'packages/db/prisma/schema.prisma'],
   }, story);
@@ -56,6 +107,10 @@ test('buildStoryExecutionPayload rewrites anchored story into finalize repair pr
   assert.match(result.description, /not a new feature pass/i);
   assert.match(result.description, /Failed gate: requested=typecheck, actual=typecheck, package=apps\/api/);
   assert.match(result.description, /Failed symbols: sourceType/);
+  assert.match(result.description, /Latest validation evidence: total=3; passed=1; failed=1; skipped=1/);
+  assert.match(result.description, /quality_gate typecheck->typecheck apps\/api: passed, exit=0, duration=50ms/);
+  assert.match(result.description, /quality_gate test->test apps\/api: failed, quality_gate_timeout, timed out, duration=10000ms/);
+  assert.match(result.description, /quality_gate lint->lint apps\/api: skipped, script "lint" is not defined for apps\/api/);
   assert.match(result.description, /Observed package surface: apps\/api, packages\/db/);
   assert.match(result.acceptanceCriteria[0], /Repair the failed finalizer quality gate/);
   assert.match(result.acceptanceCriteria[result.acceptanceCriteria.length - 1], /Preserve original requirement/);

@@ -70,6 +70,88 @@ export interface FinalizeFailureDiagnostic {
   message: string;
 }
 
+export type ValidationEvidenceStatus = 'passed' | 'failed' | 'skipped';
+export type ValidationEvidencePhase = 'quality_gate' | 'quality_gate_preparation';
+export type ValidationEvidenceClassification = FinalizeFailureClass | 'passed' | 'skipped' | 'legacy_debt';
+
+export interface ValidationOutputSummary {
+  byteLength: number;
+  lineCount: number;
+  truncated: boolean;
+  excerpt?: string;
+}
+
+export interface ValidationEvidenceRun {
+  phase: ValidationEvidencePhase;
+  requestedGate: string;
+  gate: string;
+  status: ValidationEvidenceStatus;
+  classification: ValidationEvidenceClassification;
+  packageLabel?: string;
+  cwd?: string;
+  command?: string;
+  exitCode?: number;
+  durationMs?: number;
+  startedAt?: number;
+  completedAt?: number;
+  timedOut?: boolean;
+  startFailed?: boolean;
+  reason?: string;
+  stdoutSummary?: ValidationOutputSummary;
+  stderrSummary?: ValidationOutputSummary;
+  diagnosticCount?: number;
+  diagnosticSignature?: string;
+  failedFiles?: string[];
+  failedCodes?: string[];
+  failedSymbols?: string[];
+  diagnostics?: FinalizeFailureDiagnostic[];
+}
+
+export interface ValidationEvidenceSummary {
+  total: number;
+  passed: number;
+  failed: number;
+  skipped: number;
+  classifications: Record<string, number>;
+}
+
+export interface TaskValidationEvidenceManifest {
+  schemaVersion: 1;
+  source: 'finalizer';
+  taskId: string;
+  generatedAt: number;
+  configuredGates: string[];
+  summary: ValidationEvidenceSummary;
+  runs: ValidationEvidenceRun[];
+}
+
+export interface TaskValidationEvidenceGateSummary {
+  phase: ValidationEvidencePhase;
+  requestedGate: string;
+  gate: string;
+  status: ValidationEvidenceStatus;
+  classification: ValidationEvidenceClassification;
+  packageLabel?: string;
+  command?: string;
+  exitCode?: number;
+  durationMs?: number;
+  timedOut?: boolean;
+  startFailed?: boolean;
+  diagnosticCount?: number;
+  reason?: string;
+}
+
+export interface TaskValidationEvidenceSummary {
+  generatedAt?: string;
+  configuredGates: string[];
+  total: number;
+  passed: number;
+  failed: number;
+  skipped: number;
+  classifications: Record<string, number>;
+  gates: TaskValidationEvidenceGateSummary[];
+}
+
 export interface FinalizerFailureDetails {
   failureKind: FinalizeRepairFailureKind;
   class: FinalizeFailureClass;
@@ -79,8 +161,13 @@ export interface FinalizerFailureDetails {
   cwd: string;
   command: string;
   exitCode?: number;
+  durationMs?: number;
+  startedAt?: number;
+  completedAt?: number;
   timedOut?: boolean;
   startFailed?: boolean;
+  stdoutSummary?: ValidationOutputSummary;
+  stderrSummary?: ValidationOutputSummary;
   diagnosticCount?: number;
   diagnosticSignature?: string;
   failedFiles?: string[];
@@ -95,6 +182,7 @@ export interface TaskRepairContext {
   storyId: string;
   createdAt: number;
   reason: string;
+  validationEvidenceSummary?: TaskValidationEvidenceSummary;
 }
 
 export interface TaskCoordinationConflict {
@@ -199,6 +287,7 @@ export interface Task {
   finalizerCommittedAt?: number;
   finalizerAttempts?: number;
   finalizerFailure?: FinalizerFailureDetails;
+  validationEvidence?: TaskValidationEvidenceManifest;
   repairContext?: TaskRepairContext;
   finalizeRepairStartedAt?: number;
   finalizeRepairDeadlineAt?: number;
