@@ -3,9 +3,25 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
+const { createHash } = require('node:crypto');
 const { execFileSync } = require('node:child_process');
 
 const { enqueueTaskFromPrd } = require('../dist/core/task-intake.js');
+
+let previousRalphHome;
+
+test.beforeEach(() => {
+  previousRalphHome = process.env.RALPH_HOME;
+  delete process.env.RALPH_HOME;
+});
+
+test.afterEach(() => {
+  if (previousRalphHome === undefined) {
+    delete process.env.RALPH_HOME;
+  } else {
+    process.env.RALPH_HOME = previousRalphHome;
+  }
+});
 
 class FakeStateManager {
   constructor(tasks = []) {
@@ -70,9 +86,14 @@ function createPrdFile(dir, id, dependencies = [], overrides = {}) {
   return prdPath;
 }
 
-function createMarkdownPrdFile(dir, fileName, id, extraFrontmatter = '') {
+function createMarkdownPrdFile(dir, fileNameOrId, idOrFrontmatter = '', extraFrontmatter = '') {
+  const usesExplicitFileName = arguments.length >= 4 || String(fileNameOrId).endsWith('.md');
+  const fileName = usesExplicitFileName ? fileNameOrId : `${fileNameOrId}.md`;
+  const id = usesExplicitFileName ? idOrFrontmatter : fileNameOrId;
+  const frontmatter = usesExplicitFileName ? extraFrontmatter : idOrFrontmatter;
+  const extra = frontmatter.trim() ? `${frontmatter.trim()}
+` : '';
   const prdPath = path.join(dir, fileName);
-  const extra = extraFrontmatter.trim() ? `${extraFrontmatter.trim()}\n` : '';
 
   fs.writeFileSync(prdPath, `---
 id: ${id}
@@ -86,13 +107,12 @@ ${extra}userStories:
       - done
 ---
 
-## Additional Context
+## Context
 
-Body only.
+Markdown PRD body.
 `);
   return prdPath;
 }
-
 test('enqueueTaskFromPrd stores immutable PRD metadata and source hash at intake', async () => {
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-intake-metadata-'));
   const previousHome = process.env.HOME;
@@ -151,6 +171,80 @@ test('enqueueTaskFromPrd stores declared coordination metadata from PRD', async 
     assert.deepEqual(task.declaredWriteSurface, ['packages/contracts', 'scripts/wiki/sync.ts']);
     assert.deepEqual(task.declaredConflictDomains, ['contracts-index']);
     assert.equal(task.integrationLane, 'contracts');
+  } finally {
+    process.env.HOME = previousHome;
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('enqueueTaskFromPrd enqueues markdown PRDs with valid frontmatter metadata', async () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-intake-markdown-'));
+  const previousHome = process.env.HOME;
+
+  try {
+    process.env.HOME = tempDir;
+    const prdPath = createMarkdownPrdFile(tempDir, 'markdown-prd', `status: ready
+priority: P1
+dependencies:
+  - upstream-prd
+declaredWriteSurface:
+  - src/core/task-intake.ts
+declaredConflictDomains:
+  - prd-ingestion
+integrationLane: intake
+`);
+    const stateManager = new FakeStateManager();
+    const scheduler = new NoopScheduler();
+
+    const result = await enqueueTaskFromPrd(prdPath, {
+      repoPath: tempDir,
+      stateManager,
+      scheduler,
+      configManager: { get: () => undefined },
+      now: () => 2_500,
+    });
+
+    const task = await stateManager.loadTask(result.taskId);
+    assert.equal(task.prdId, 'markdown-prd');
+    assert.equal(task.prdTitle, 'markdown-prd title');
+    assert.deepEqual(task.prdDependencies, ['upstream-prd']);
+    assert.deepEqual(task.declaredWriteSurface, ['src/core/task-intake.ts']);
+    assert.deepEqual(task.declaredConflictDomains, ['prd-ingestion']);
+    assert.equal(task.integrationLane, 'intake');
+    assert.equal(task.storyProgress.length, 1);
+  } finally {
+    process.env.HOME = previousHome;
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('enqueueTaskFromPrd records an immutable source hash for markdown PRDs', async () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-intake-markdown-hash-'));
+  const previousHome = process.env.HOME;
+
+  try {
+    process.env.HOME = tempDir;
+    const prdPath = createMarkdownPrdFile(tempDir, 'markdown-hash-prd', `dependencies:
+  - upstream-prd
+`);
+    const expectedHash = createHash('sha256').update(fs.readFileSync(prdPath)).digest('hex');
+    const stateManager = new FakeStateManager();
+    const scheduler = new NoopScheduler();
+
+    const result = await enqueueTaskFromPrd(prdPath, {
+      repoPath: tempDir,
+      stateManager,
+      scheduler,
+      configManager: { get: () => undefined },
+      now: () => 2_750,
+    });
+
+    fs.appendFileSync(prdPath, '\n## Later edit\n\nThis source changed after intake.\n');
+
+    const task = await stateManager.loadTask(result.taskId);
+    assert.equal(task.prdSourceHash, expectedHash);
+    assert.notEqual(task.prdSourceHash, createHash('sha256').update(fs.readFileSync(prdPath)).digest('hex'));
+    assert.deepEqual(task.prdDependencies, ['upstream-prd']);
   } finally {
     process.env.HOME = previousHome;
     fs.rmSync(tempDir, { recursive: true, force: true });
@@ -391,6 +485,42 @@ test('enqueueTaskFromPrd rejects PRDs without an explicit title', async () => {
   }
 });
 
+test('enqueueTaskFromPrd rejects markdown PRDs without an explicit title', async () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-intake-markdown-title-'));
+  const previousHome = process.env.HOME;
+
+  try {
+    process.env.HOME = tempDir;
+    const prdPath = path.join(tempDir, 'untitled.md');
+    fs.writeFileSync(prdPath, `---
+id: untitled-markdown
+dependencies: []
+userStories:
+  - id: US-001
+    title: First story
+    acceptanceCriteria:
+      - Done
+---
+`);
+
+    const stateManager = new FakeStateManager();
+    const scheduler = new NoopScheduler();
+
+    await assert.rejects(
+      enqueueTaskFromPrd(prdPath, {
+        repoPath: tempDir,
+        stateManager,
+        scheduler,
+        configManager: { get: () => undefined },
+      }),
+      /must define a non-empty top-level title/i,
+    );
+  } finally {
+    process.env.HOME = previousHome;
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+});
+
 test('enqueueTaskFromPrd rejects completed or archived PRDs with delta guidance', async () => {
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-intake-completed-'));
   const previousHome = process.env.HOME;
@@ -507,6 +637,42 @@ test('enqueueTaskFromPrd reconciles ez4ielts markdown task index status without 
   }
 });
 
+test('enqueueTaskFromPrd rejects prose-only markdown PRDs by default', async () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-intake-prose-only-'));
+  const previousHome = process.env.HOME;
+
+  try {
+    process.env.HOME = tempDir;
+    const prdPath = path.join(tempDir, 'strategy.md');
+    fs.writeFileSync(prdPath, `---
+id: strategy-doc
+title: Strategy Document
+dependencies: []
+---
+
+## Strategy
+
+This is a broad plan without implementation acceptance criteria.
+`);
+
+    const stateManager = new FakeStateManager();
+    const scheduler = new NoopScheduler();
+
+    await assert.rejects(
+      enqueueTaskFromPrd(prdPath, {
+        repoPath: tempDir,
+        stateManager,
+        scheduler,
+        configManager: { get: () => undefined },
+      }),
+      /prose-only strategy documents are not executable by default/i,
+    );
+  } finally {
+    process.env.HOME = previousHome;
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+});
+
 test('enqueueTaskFromPrd requires allow flag or executable metadata for umbrella PRDs', async () => {
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-intake-umbrella-'));
   const previousHome = process.env.HOME;
@@ -535,6 +701,31 @@ test('enqueueTaskFromPrd requires allow flag or executable metadata for umbrella
 
     assert.equal(result.alreadyExists, false);
     assert.equal((await stateManager.listTasks()).length, 1);
+  } finally {
+    process.env.HOME = previousHome;
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('enqueueTaskFromPrd rejects invalid dependency metadata clearly', async () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-intake-dependencies-'));
+  const previousHome = process.env.HOME;
+
+  try {
+    process.env.HOME = tempDir;
+    const prdPath = createMarkdownPrdFile(tempDir, 'invalid-dependencies', 'dependencies: upstream-prd\n');
+    const stateManager = new FakeStateManager();
+    const scheduler = new NoopScheduler();
+
+    await assert.rejects(
+      enqueueTaskFromPrd(prdPath, {
+        repoPath: tempDir,
+        stateManager,
+        scheduler,
+        configManager: { get: () => undefined },
+      }),
+      /field "dependencies" must be an array of non-empty strings/i,
+    );
   } finally {
     process.env.HOME = previousHome;
     fs.rmSync(tempDir, { recursive: true, force: true });

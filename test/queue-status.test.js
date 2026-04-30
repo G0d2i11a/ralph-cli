@@ -6,6 +6,7 @@ const {
   deriveAttention,
   findFreshFinalizerLease,
   resolveNextAction,
+  summarizeTask,
 } = require('../dist/commands/queue.js');
 
 function createTask(overrides = {}) {
@@ -65,6 +66,52 @@ test('queue attention labels integration sync conflicts distinctly', () => {
   assert.equal(attention.needed, true);
   assert.equal(attention.reason, 'integration_sync_conflict');
   assert.match(resolveNextAction(task), /integration branch sync conflict/);
+});
+
+test('queue attention labels active merge-repair quarantine distinctly', () => {
+  const task = createTask({
+    status: 'failed',
+    repairContext: {
+      mode: 'merge',
+      storyId: 'US-003',
+      createdAt: 123,
+      reason: 'Merge repair required by Ralph.',
+    },
+    lastError: 'merge repair did not converge',
+    mergeConflictFiles: ['apps/api/src/service.ts'],
+  });
+
+  const attention = deriveAttention(task);
+
+  assert.equal(attention.needed, true);
+  assert.equal(attention.reason, 'merge_repair_quarantine');
+  assert.match(resolveNextAction(task), /merge-repair quarantine/);
+});
+
+test('queue attention records explicit quarantine release reason', () => {
+  const task = createTask({
+    status: 'failed',
+    repairContext: {
+      mode: 'merge',
+      storyId: 'US-003',
+      createdAt: 123,
+      reason: 'Merge repair required by Ralph.',
+    },
+    lastError: 'merge repair did not converge',
+    mergeConflictFiles: ['apps/api/src/service.ts'],
+    quarantineExitKind: 'demote',
+    quarantineReleasedAt: 456,
+    quarantineReleaseReason: 'superseded by smaller fix',
+    quarantineTransferredTo: 'task-next',
+  });
+
+  const attention = deriveAttention(task);
+
+  assert.equal(attention.needed, true);
+  assert.equal(attention.reason, 'merge_repair_quarantine_released');
+  assert.match(resolveNextAction(task), /released by demotion/);
+  assert.match(resolveNextAction(task), /task-next/);
+  assert.match(resolveNextAction(task), /superseded by smaller fix/);
 });
 
 test('queue attention labels nonretryable story incomplete distinctly', () => {
@@ -157,4 +204,77 @@ test('queue keeps stale manager heartbeat when finalizer lease is expired', () =
   assert.equal(lease, undefined);
   assert.equal(adjusted.heartbeatStale, true);
   assert.equal(adjusted.heartbeatStaleSuppressed, undefined);
+});
+
+test('queue summary explains coordination owner and overlapping conflict surface', () => {
+  const coordinationConflicts = [{
+    taskId: 'observed-owner',
+    overlapKinds: ['write_surface'],
+    overlappingDomains: [],
+    overlappingPaths: ['packages/contracts/src/index.ts'],
+  }];
+  const pendingState = {
+    reason: 'coordination',
+    dependencies: [],
+    blockers: ['observed-owner'],
+    coordinationReason: 'Earlier overlapping task(s) must integrate first: observed-owner (paths: packages/contracts/src/index.ts)',
+    coordinationConflicts,
+    integrationLane: 'main',
+    maxConcurrent: 3,
+    running: 1,
+  };
+  const summary = summarizeTask(createTask({
+    id: 'blocked-task',
+    status: 'pending',
+  }), pendingState, false, true);
+
+  assert.equal(summary.reason, 'coordination');
+  assert.equal(summary.coordination.owner, 'observed-owner');
+  assert.equal(summary.coordination.phase, 'start');
+  assert.equal(summary.coordination.lane, 'main');
+  assert.equal(summary.coordination.reason, pendingState.coordinationReason);
+  assert.deepEqual(summary.coordination.conflicts, coordinationConflicts);
+  assert.deepEqual(summary.coordinationConflicts, coordinationConflicts);
+  assert.match(summary.nextAction, /observed-owner/);
+  assert.match(summary.nextAction, /packages\/contracts\/src\/index\.ts/);
+});
+
+test('queue coordination next action stays bounded for human output', () => {
+  const coordinationConflicts = [
+    {
+      taskId: 'owner-a',
+      overlapKinds: ['write_surface'],
+      overlappingDomains: [],
+      overlappingPaths: ['packages/contracts/src/index.ts'],
+    },
+    {
+      taskId: 'owner-b',
+      overlapKinds: ['write_surface'],
+      overlappingDomains: [],
+      overlappingPaths: ['apps/web/src/view.ts'],
+    },
+    {
+      taskId: 'owner-c',
+      overlapKinds: ['write_surface'],
+      overlappingDomains: [],
+      overlappingPaths: ['docs/guide.md'],
+    },
+  ];
+  const nextAction = resolveNextAction(createTask({
+    id: 'blocked-task',
+    status: 'pending',
+  }), {
+    reason: 'coordination',
+    dependencies: [],
+    blockers: coordinationConflicts.map((conflict) => conflict.taskId),
+    coordinationConflicts,
+    integrationLane: 'main',
+    maxConcurrent: 3,
+    running: 1,
+  });
+
+  assert.match(nextAction, /owner-a/);
+  assert.match(nextAction, /owner-b/);
+  assert.match(nextAction, /\+1 more/);
+  assert.doesNotMatch(nextAction, /owner-c/);
 });

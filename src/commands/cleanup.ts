@@ -13,6 +13,7 @@ const TERMINAL_STATUSES = new Set([
   'failed',
   'failed_finalize',
   'stagnant',
+  'stopped',
 ]);
 
 function isCleanupCandidate(task: Task, cutoffTime: number): boolean {

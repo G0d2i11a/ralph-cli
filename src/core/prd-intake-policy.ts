@@ -449,15 +449,15 @@ function evaluateUmbrellaMetadata(
   prd: PRD,
   allowUmbrellaPrd?: boolean,
 ): PrdIntakeIssue | undefined {
-  if (allowUmbrellaPrd || hasExecutableFrontmatter(metadata)) {
-    return undefined;
-  }
-
   if (hasNonExecutableFrontmatter(metadata)) {
     return {
       kind: 'umbrella',
       reason: 'frontmatter marks it as non-executable',
     };
+  }
+
+  if (allowUmbrellaPrd || hasExecutableFrontmatter(metadata)) {
+    return undefined;
   }
 
   const umbrellaToken = classificationTokens(metadata).find((token) => UMBRELLA_TYPES.has(token));

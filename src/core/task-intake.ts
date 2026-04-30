@@ -9,7 +9,7 @@ import { extractDeclaredCoordination } from './task-coordination';
 import { assertPrdCanBeEnqueued } from './prd-intake-policy';
 import { TaskScheduler, PendingTaskState } from './scheduler';
 import { StateManager } from './state';
-import { assertPrdHasExplicitTitle, generateTaskId, parsePRD, saveTaskPRD } from '../utils/helpers';
+import { assertPrdHasExplicitTitle, assertPrdIsExecutable, generateTaskId, parsePRD, saveTaskPRD } from '../utils/helpers';
 import { Task, TaskStatus } from '../types/task';
 import { appendTaskEvent } from './events';
 import { getRalphPaths, RalphHomeOptions } from './paths';
@@ -140,6 +140,19 @@ export async function enqueueTaskFromPrd(
   const prd = parsePRD(resolvedPrdPath);
   const declaredCoordination = extractDeclaredCoordination(prd);
   const sourceHash = hashFile(resolvedPrdPath);
+
+  if (prd.executable === false) {
+    await assertPrdCanBeEnqueued({
+      prdPath: resolvedPrdPath,
+      prd,
+      repoPath,
+      sourceHash,
+      stateManager,
+      allowUmbrellaPrd: options.allowUmbrellaPrd,
+    });
+  }
+
+  assertPrdIsExecutable(prd, resolvedPrdPath);
   const base = resolveBaseRef(repoPath);
   const enqueuedAt = now();
 

@@ -6,6 +6,7 @@ const os = require('node:os');
 const path = require('node:path');
 
 const { DependencyWatcher } = require('../dist/core/dependency-watcher.js');
+const { buildMergeRepairObservationSignature } = require('../dist/core/merge-task-updates.js');
 
 class FakeStateManager {
   constructor(tasks = []) {
@@ -81,6 +82,34 @@ function queuedPendingState() {
     blockers: [],
     maxConcurrent: 3,
     running: 0,
+  };
+}
+
+function createUnresolvedMergeProbe({
+  conflictFiles = ['docs/TODO.md'],
+  message = `Merge conflicts detected: ${conflictFiles.join(', ')}`,
+  statusSignature = 'same-state',
+  headSha = 'abc123',
+} = {}) {
+  return {
+    mergeable: false,
+    alreadyIntegrated: false,
+    message,
+    conflictFiles,
+    integrationBranch: 'ralph/integration/main',
+    integrationWorktree: '/tmp/integration',
+    sourceKind: 'worktree_snapshot',
+    worktreeMergeState: {
+      kind: 'unresolved',
+      usesGitLocal: true,
+      gitDir: '/repo/.ralph-worktrees/task/.git-local',
+      headSha,
+      mergeParents: ['def456'],
+      unmergedFiles: conflictFiles,
+      changedFiles: conflictFiles,
+      statusPorcelain: conflictFiles.map((file) => `UU ${file}`).join('\n'),
+      statusSignature,
+    },
   };
 }
 
@@ -1724,6 +1753,10 @@ test('dependency watcher refreshes merge-repair recovery state after stagnant au
 });
 
 test('dependency watcher stops failed merge repair when the unresolved worktree observation repeats', async () => {
+  const repeatedProbe = createUnresolvedMergeProbe({
+    conflictFiles: ['docs/TODO.md'],
+    statusSignature: 'same-state',
+  });
   const stateManager = new FakeStateManager([
     {
       id: 'failed-worker-merge-stop-same-state',
@@ -1758,6 +1791,7 @@ test('dependency watcher stops failed merge repair when the unresolved worktree 
       mergeRepairRecoveryStartedAt: Date.now() - 5_000,
       mergeRepairRecoveryDeadlineAt: Date.now() + 60_000,
       mergeRepairRecoveryConsecutiveNoProgress: 1,
+      mergeRepairRecoveryLastObservationSignature: buildMergeRepairObservationSignature(repeatedProbe),
       mergeRepairRecoveryLastConflictSignature: 'docs/TODO.md',
     },
   ]);
@@ -1882,6 +1916,164 @@ test('dependency watcher stops task repair immediately on integration sync confl
   assert.equal(task.mergeConflictPhase, 'integration_sync');
   assert.equal(task.mergeRepairRecoveryTotalRequeues, undefined);
   assert.equal(task.mergeRepairDisplayStatus, 'stopped');
+});
+
+test('dependency watcher refreshes merge repair recovery when conflicts shrink', async () => {
+  const staleStartedAt = Date.now() - (3 * 60 * 60 * 1000);
+  const staleDeadlineAt = Date.now() - 60_000;
+  const currentProbe = createUnresolvedMergeProbe({
+    conflictFiles: ['docs/A.md'],
+    statusSignature: 'shrunk-conflicts',
+  });
+  const stateManager = new FakeStateManager([
+    {
+      id: 'failed-worker-merge-shrinking-conflicts',
+      prdPath: '/tmp/prd.json',
+      status: 'failed',
+      startTime: 100,
+      completedUS: ['US-001'],
+      storyProgress: [
+        { id: 'US-001', status: 'passed', attempts: 1, updatedAt: 1 },
+        { id: 'US-002', status: 'failed', attempts: 2, lastError: 'merge failed', updatedAt: 1 },
+      ],
+      worktree: '/repo/.ralph-worktrees/failed-worker-merge-shrinking-conflicts',
+      logPath: '/tmp/failed-worker-merge-shrinking-conflicts.log',
+      agent: 'codex',
+      repoPath: '/repo',
+      loopCount: 4,
+      consecutiveNoProgress: 1,
+      consecutiveErrors: 1,
+      lastProgressTime: 100,
+      lastFilesChanged: 0,
+      lastError: 'Exact mergeability probe still fails against ralph/integration/main',
+      lastErrorObservedAt: Date.now() - 1000,
+      repairContext: {
+        mode: 'merge',
+        storyId: 'US-002',
+        createdAt: staleStartedAt,
+        reason: 'Merge repair required by Ralph.',
+      },
+      mergeError: 'Merge conflicts detected: docs/A.md, docs/B.md',
+      mergeConflictFiles: ['docs/A.md', 'docs/B.md'],
+      postFinalizeMergeProbeRequired: true,
+      mergeRepairRecoveryStartedAt: staleStartedAt,
+      mergeRepairRecoveryDeadlineAt: staleDeadlineAt,
+      mergeRepairRecoveryTotalRequeues: 8,
+      mergeRepairRecoveryConsecutiveNoProgress: 1,
+      mergeRepairRecoveryLastConflictSignature: 'docs/A.md\ndocs/B.md',
+      mergeRepairRecoveryLastProbeMessage: 'Merge conflicts detected: docs/A.md, docs/B.md',
+      mergeRepairRecoveryLastProgressReason: 'older progress',
+    },
+  ]);
+
+  const watcher = new DependencyWatcher(
+    {},
+    {
+      stateManager,
+      configManager: createConfigManager(),
+      scheduler: {
+        schedulePendingTasks: async () => [],
+      },
+      sleep: async () => undefined,
+      logger: { log() {}, error() {} },
+      probeWorktreeMergeability: async () => currentProbe,
+    },
+  );
+
+  const beforeRecovery = Date.now();
+  await watcher.recoverFailedWorkerMergeRepairTasks();
+  const task = stateManager.tasks.get('failed-worker-merge-shrinking-conflicts');
+  assert.equal(task.status, 'pending');
+  assert.equal(task.mergeRepairRecoveryStopReason, undefined);
+  assert.ok(task.mergeRepairRecoveryStartedAt >= beforeRecovery);
+  assert.ok(task.mergeRepairRecoveryDeadlineAt > beforeRecovery);
+  assert.equal(task.mergeRepairRecoveryTotalRequeues, 1);
+  assert.equal(task.mergeRepairRecoveryConsecutiveNoProgress, 0);
+  assert.equal(task.mergeRepairRecoveryLastConflictSignature, 'docs/A.md');
+  assert.match(task.mergeRepairRecoveryLastProgressReason, /conflict file set shrank/i);
+});
+
+test('dependency watcher refreshes merge repair recovery when proof signature changes', async () => {
+  const staleStartedAt = Date.now() - (3 * 60 * 60 * 1000);
+  const staleDeadlineAt = Date.now() - 60_000;
+  const previousProbe = createUnresolvedMergeProbe({
+    conflictFiles: ['docs/TODO.md'],
+    statusSignature: 'old-proof',
+  });
+  const currentProbe = createUnresolvedMergeProbe({
+    conflictFiles: ['docs/TODO.md'],
+    statusSignature: 'new-proof',
+  });
+  const stateManager = new FakeStateManager([
+    {
+      id: 'failed-worker-merge-proof-changed',
+      prdPath: '/tmp/prd.json',
+      status: 'failed',
+      startTime: 100,
+      completedUS: ['US-001'],
+      storyProgress: [
+        { id: 'US-001', status: 'passed', attempts: 1, updatedAt: 1 },
+        { id: 'US-002', status: 'failed', attempts: 2, lastError: 'merge failed', updatedAt: 1 },
+      ],
+      worktree: '/repo/.ralph-worktrees/failed-worker-merge-proof-changed',
+      logPath: '/tmp/failed-worker-merge-proof-changed.log',
+      agent: 'codex',
+      repoPath: '/repo',
+      loopCount: 4,
+      consecutiveNoProgress: 1,
+      consecutiveErrors: 1,
+      lastProgressTime: 100,
+      lastFilesChanged: 0,
+      lastError: 'Exact mergeability probe still fails against ralph/integration/main',
+      lastErrorObservedAt: Date.now() - 1000,
+      repairContext: {
+        mode: 'merge',
+        storyId: 'US-002',
+        createdAt: staleStartedAt,
+        reason: 'Merge repair required by Ralph.',
+      },
+      mergeError: 'Merge conflicts detected: docs/TODO.md',
+      mergeConflictFiles: ['docs/TODO.md'],
+      postFinalizeMergeProbeRequired: true,
+      mergeRepairRecoveryStartedAt: staleStartedAt,
+      mergeRepairRecoveryDeadlineAt: staleDeadlineAt,
+      mergeRepairRecoveryTotalRequeues: 8,
+      mergeRepairRecoveryConsecutiveNoProgress: 1,
+      mergeRepairRecoveryLastObservationSignature: buildMergeRepairObservationSignature(previousProbe),
+      mergeRepairRecoveryLastConflictSignature: 'docs/TODO.md',
+      mergeRepairRecoveryLastProbeMessage: previousProbe.message,
+      mergeRepairRecoveryLastProgressReason: 'older progress',
+    },
+  ]);
+
+  const watcher = new DependencyWatcher(
+    {},
+    {
+      stateManager,
+      configManager: createConfigManager(),
+      scheduler: {
+        schedulePendingTasks: async () => [],
+      },
+      sleep: async () => undefined,
+      logger: { log() {}, error() {} },
+      probeWorktreeMergeability: async () => currentProbe,
+    },
+  );
+
+  const beforeRecovery = Date.now();
+  await watcher.recoverFailedWorkerMergeRepairTasks();
+  const task = stateManager.tasks.get('failed-worker-merge-proof-changed');
+  assert.equal(task.status, 'pending');
+  assert.equal(task.mergeRepairRecoveryStopReason, undefined);
+  assert.ok(task.mergeRepairRecoveryStartedAt >= beforeRecovery);
+  assert.ok(task.mergeRepairRecoveryDeadlineAt > beforeRecovery);
+  assert.equal(task.mergeRepairRecoveryTotalRequeues, 1);
+  assert.equal(task.mergeRepairRecoveryConsecutiveNoProgress, 0);
+  assert.equal(
+    task.mergeRepairRecoveryLastObservationSignature,
+    buildMergeRepairObservationSignature(currentProbe),
+  );
+  assert.match(task.mergeRepairRecoveryLastProgressReason, /proof signature changed/i);
 });
 
 test('dependency watcher refuses worker merge repair recovery when another story is incomplete', async () => {
@@ -2026,6 +2218,66 @@ test('dependency watcher ignores stale merge repair residue for ordinary failed 
   assert.equal(task.status, 'failed');
   assert.deepEqual(task.completedUS, ['US-002', 'US-003']);
   assert.equal(task.storyProgress.find((story) => story.id === 'US-001').status, 'failed');
+  assert.equal(probeCalls, 0);
+});
+
+test('dependency watcher leaves explicitly demoted merge-repair quarantine owners alone', async () => {
+  const stateManager = new FakeStateManager([
+    {
+      id: 'demoted-merge-owner',
+      prdPath: '/tmp/prd.json',
+      status: 'failed',
+      startTime: 100,
+      completedUS: ['US-001'],
+      storyProgress: [
+        { id: 'US-001', status: 'passed', attempts: 1, updatedAt: 1 },
+        { id: 'US-002', status: 'needs_repair', attempts: 2, lastError: 'merge conflict', updatedAt: 1 },
+      ],
+      worktree: '/repo/.ralph-worktrees/demoted-merge-owner',
+      logPath: '/tmp/demoted-merge-owner.log',
+      agent: 'codex',
+      repoPath: '/repo',
+      loopCount: 4,
+      consecutiveNoProgress: 1,
+      consecutiveErrors: 1,
+      lastProgressTime: 100,
+      lastFilesChanged: 0,
+      repairContext: {
+        mode: 'merge',
+        storyId: 'US-002',
+        createdAt: 123,
+        reason: 'Merge repair required by Ralph.',
+      },
+      mergeConflictFiles: ['docs/TODO.md'],
+      quarantineExitKind: 'demote',
+      quarantineReleasedAt: 456,
+      quarantineReleaseReason: 'superseded by later task',
+    },
+  ]);
+  let probeCalls = 0;
+
+  const watcher = new DependencyWatcher(
+    {},
+    {
+      stateManager,
+      configManager: createConfigManager(),
+      scheduler: {
+        schedulePendingTasks: async () => [],
+      },
+      sleep: async () => undefined,
+      logger: { log() {}, error() {} },
+      probeWorktreeMergeability: async () => {
+        probeCalls += 1;
+        throw new Error('probe should not run');
+      },
+    },
+  );
+
+  await watcher.recoverFailedWorkerMergeRepairTasks();
+  const task = stateManager.tasks.get('demoted-merge-owner');
+  assert.equal(task.status, 'failed');
+  assert.equal(task.quarantineExitKind, 'demote');
+  assert.equal(task.storyProgress.find((story) => story.id === 'US-002').status, 'needs_repair');
   assert.equal(probeCalls, 0);
 });
 
