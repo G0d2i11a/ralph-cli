@@ -57,6 +57,36 @@ function createConfigManager(overrides = {}) {
   };
 }
 
+function buildValidationEvidence(taskId) {
+  return {
+    schemaVersion: 1,
+    source: 'finalizer',
+    taskId,
+    generatedAt: 1_700_000_000_000,
+    configuredGates: ['test'],
+    summary: {
+      total: 1,
+      passed: 0,
+      failed: 1,
+      skipped: 0,
+      classifications: { quality_gate_timeout: 1 },
+    },
+    runs: [
+      {
+        phase: 'quality_gate',
+        requestedGate: 'test',
+        gate: 'test',
+        status: 'failed',
+        classification: 'quality_gate_timeout',
+        packageLabel: 'app',
+        command: 'npm test',
+        durationMs: 10_000,
+        timedOut: true,
+      },
+    ],
+  };
+}
+
 test('dependency watcher finalizes ready_to_finalize tasks before scheduling pending work', async () => {
   const stateManager = new FakeStateManager([
     {
@@ -100,6 +130,36 @@ test('dependency watcher finalizes ready_to_finalize tasks before scheduling pen
         committed: true,
         message: 'Committed task changes successfully',
         commitMessage: 'feat: finalize test',
+        validationEvidence: {
+          schemaVersion: 1,
+          source: 'finalizer',
+          taskId: 'finalize-me',
+          generatedAt: 123,
+          configuredGates: ['typecheck'],
+          summary: {
+            total: 1,
+            passed: 1,
+            failed: 0,
+            skipped: 0,
+            classifications: { passed: 1 },
+          },
+          runs: [
+            {
+              phase: 'quality_gate',
+              requestedGate: 'typecheck',
+              gate: 'typecheck',
+              status: 'passed',
+              classification: 'passed',
+              packageLabel: 'repo',
+              cwd: '/repo',
+              command: 'npm run typecheck',
+              exitCode: 0,
+              durationMs: 12,
+              stdoutSummary: { byteLength: 0, lineCount: 0, truncated: false },
+              stderrSummary: { byteLength: 0, lineCount: 0, truncated: false },
+            },
+          ],
+        },
       }),
     }
   );
@@ -116,6 +176,8 @@ test('dependency watcher finalizes ready_to_finalize tasks before scheduling pen
   const finalizedTask = stateManager.tasks.get('finalize-me');
   assert.equal(finalizedTask.status, 'completed');
   assert.equal(finalizedTask.finalizerCommitMessage, 'feat: finalize test');
+  assert.equal(finalizedTask.validationEvidence.summary.passed, 1);
+  assert.equal(finalizedTask.validationEvidence.runs[0].command, 'npm run typecheck');
   assert.equal(finalizedTask.mergedAt, undefined);
   assert.equal(started.length, 1);
 });
@@ -522,7 +584,7 @@ test('dependency watcher stores structured finalizer failure details for quality
       sleep: async () => undefined,
       logger: { log() {}, error() {} },
       finalizer: () => {
-        throw new QualityGateFailure(classifyQualityGateFailure({
+        const details = classifyQualityGateFailure({
           requestedScript: 'typecheck',
           actualScript: 'typecheck',
           cwd: '/repo/apps/api',
@@ -531,7 +593,43 @@ test('dependency watcher stores structured finalizer failure details for quality
           rawMessage: 'Quality gate "typecheck" failed: src/service.ts(12,5): error TS2353: Object literal may only specify known properties, and \'sourceType\' does not exist in type \'SpeakingPersonaWhereInput\'.',
           stderr: 'src/service.ts(12,5): error TS2353: Object literal may only specify known properties, and \'sourceType\' does not exist in type \'SpeakingPersonaWhereInput\'.',
           exitCode: 2,
-        }));
+          durationMs: 25,
+          startedAt: 10,
+          completedAt: 35,
+        });
+        throw new QualityGateFailure(details, {
+          schemaVersion: 1,
+          source: 'finalizer',
+          taskId: 'quality-gate-failure-task',
+          generatedAt: 35,
+          configuredGates: ['typecheck'],
+          summary: {
+            total: 1,
+            passed: 0,
+            failed: 1,
+            skipped: 0,
+            classifications: { generated_type_drift: 1 },
+          },
+          runs: [
+            {
+              phase: 'quality_gate',
+              requestedGate: details.requestedGate,
+              gate: details.gate,
+              status: 'failed',
+              classification: details.class,
+              packageLabel: details.packageLabel,
+              cwd: details.cwd,
+              command: details.command,
+              exitCode: details.exitCode,
+              durationMs: details.durationMs,
+              startedAt: details.startedAt,
+              completedAt: details.completedAt,
+              stderrSummary: details.stderrSummary,
+              diagnosticCount: details.diagnosticCount,
+              failedSymbols: details.failedSymbols,
+            },
+          ],
+        });
       },
     }
   );
@@ -547,6 +645,9 @@ test('dependency watcher stores structured finalizer failure details for quality
   assert.equal(task.finalizerFailure.packageLabel, 'apps/api');
   assert.equal(task.finalizerFailure.diagnosticCount, 1);
   assert.deepEqual(task.finalizerFailure.failedSymbols, ['sourceType']);
+  assert.equal(task.validationEvidence.summary.failed, 1);
+  assert.equal(task.validationEvidence.runs[0].durationMs, 25);
+  assert.equal(task.validationEvidence.runs[0].classification, 'generated_type_drift');
 });
 
 test('dependency watcher routes failed_finalize tasks back to pending repair once', async () => {
@@ -576,6 +677,7 @@ test('dependency watcher routes failed_finalize tasks back to pending repair onc
       lastFilesChanged: 1,
       finalizerAttempts: 1,
       lastError: 'Quality gate "test" failed',
+      validationEvidence: buildValidationEvidence('repair-finalize-task'),
     },
   ]);
 
@@ -606,7 +708,10 @@ test('dependency watcher routes failed_finalize tasks back to pending repair onc
     storyId: 'US-001',
     createdAt: task.repairContext.createdAt,
     reason: 'Quality gate "test" failed',
+    validationEvidenceSummary: task.repairContext.validationEvidenceSummary,
   });
+  assert.equal(task.repairContext.validationEvidenceSummary.failed, 1);
+  assert.equal(task.repairContext.validationEvidenceSummary.gates[0].timedOut, true);
   assert.equal(typeof task.finalizeRepairStartedAt, 'number');
   assert.equal(typeof task.finalizeRepairDeadlineAt, 'number');
   assert.equal(typeof task.finalizeRepairLastFailureSnapshot?.capturedAt, 'number');

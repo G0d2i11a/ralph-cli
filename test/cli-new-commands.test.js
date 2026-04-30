@@ -445,6 +445,25 @@ test('queue command compact mode trims heavy task payload fields', () => {
         storyId: 'US-001',
         createdAt: Date.now(),
         reason: 'very long reason that should be stripped from compact mode',
+        validationEvidenceSummary: {
+          generatedAt: new Date(1_700_000_000_000).toISOString(),
+          configuredGates: ['test'],
+          total: 1,
+          passed: 0,
+          failed: 1,
+          skipped: 0,
+          classifications: { quality_gate_timeout: 1 },
+          gates: [
+            {
+              phase: 'quality_gate',
+              requestedGate: 'test',
+              gate: 'test',
+              status: 'failed',
+              classification: 'quality_gate_timeout',
+              timedOut: true,
+            },
+          ],
+        },
       },
       worktree: '/tmp/worktree',
       logPath: path.join(taskDir, 'agent.log'),
@@ -487,6 +506,8 @@ test('queue command compact mode trims heavy task payload fields', () => {
       createdAt: task.repairContext.createdAt,
     });
     assert.equal(task.integrationStatus, 'not_started');
+    assert.equal(task.validationEvidenceSummary.failed, 1);
+    assert.equal(task.validationEvidenceSummary.gates[0].timedOut, true);
     assert.equal(task.coordination.status, 'blocked_observed_overlap');
     assert.equal(task.coordination.reason, 'shared writes');
     assert.deepEqual(task.coordination.blockers, ['task-a']);
@@ -494,6 +515,94 @@ test('queue command compact mode trims heavy task payload fields', () => {
     assert.equal(task.coordination.declaredConflictDomains, undefined);
     assert.equal(task.storyProgress[0].history, undefined);
     assert.equal(task.repairContext.reason, undefined);
+    assert.equal(task.repairContext.validationEvidenceSummary, undefined);
+  } finally {
+    fs.rmSync(homeDir, { recursive: true, force: true });
+  }
+});
+
+test('queue compact marks terminal tasks with validation evidence presence', () => {
+  const homeDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-queue-evidence-home-'));
+
+  try {
+    const completedTaskDir = path.join(homeDir, '.ralph', 'tasks', 'completed-with-evidence');
+    const failedTaskDir = path.join(homeDir, '.ralph', 'tasks', 'failed-without-evidence');
+    fs.mkdirSync(completedTaskDir, { recursive: true });
+    fs.mkdirSync(failedTaskDir, { recursive: true });
+
+    fs.writeFileSync(path.join(completedTaskDir, 'state.json'), JSON.stringify({
+      id: 'completed-with-evidence',
+      prdPath: '/tmp/completed.json',
+      prdId: 'completed-prd',
+      status: 'completed',
+      startTime: Date.now() - 1000,
+      updatedAt: Date.now(),
+      completedUS: ['US-001'],
+      worktree: '/tmp/completed-worktree',
+      logPath: path.join(completedTaskDir, 'agent.log'),
+      agent: 'codex',
+      repoPath: '/tmp/repo',
+      integrationStatus: 'integrated',
+      integratedAt: Date.now(),
+      loopCount: 0,
+      consecutiveNoProgress: 0,
+      consecutiveErrors: 0,
+      lastProgressTime: Date.now(),
+      lastFilesChanged: 1,
+      validationEvidence: {
+        schemaVersion: 1,
+        source: 'finalizer',
+        taskId: 'completed-with-evidence',
+        generatedAt: Date.now(),
+        configuredGates: ['typecheck'],
+        summary: {
+          total: 1,
+          passed: 1,
+          failed: 0,
+          skipped: 0,
+          classifications: { passed: 1 },
+        },
+        runs: [
+          {
+            phase: 'quality_gate',
+            requestedGate: 'typecheck',
+            gate: 'typecheck',
+            status: 'passed',
+            classification: 'passed',
+          },
+        ],
+      },
+    }, null, 2));
+
+    fs.writeFileSync(path.join(failedTaskDir, 'state.json'), JSON.stringify({
+      id: 'failed-without-evidence',
+      prdPath: '/tmp/failed.json',
+      prdId: 'failed-prd',
+      status: 'failed',
+      startTime: Date.now() - 1000,
+      updatedAt: Date.now(),
+      completedUS: [],
+      worktree: '/tmp/failed-worktree',
+      logPath: path.join(failedTaskDir, 'agent.log'),
+      agent: 'codex',
+      repoPath: '/tmp/repo',
+      lastError: 'task failed before finalizer evidence',
+      loopCount: 0,
+      consecutiveNoProgress: 0,
+      consecutiveErrors: 0,
+      lastProgressTime: Date.now(),
+      lastFilesChanged: 0,
+    }, null, 2));
+
+    const result = runCli(['queue', '--compact'], { HOME: homeDir });
+    const output = JSON.parse(result.stdout);
+    const failedTask = output.tasks.find((task) => task.id === 'failed-without-evidence');
+    const completedTask = output.recentCompleted.find((task) => task.id === 'completed-with-evidence');
+
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(failedTask.hasValidationEvidence, false);
+    assert.equal(completedTask.hasValidationEvidence, true);
+    assert.equal(completedTask.validationEvidenceSummary.passed, 1);
   } finally {
     fs.rmSync(homeDir, { recursive: true, force: true });
   }

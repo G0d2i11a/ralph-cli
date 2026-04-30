@@ -3,6 +3,7 @@ import { TaskScheduler } from '../core/scheduler';
 import { StoryProgress, Task } from '../types/task';
 import { buildMergeRepairReason, buildTaskRepairContext } from '../core/repair-context';
 import { buildFinalizeRetryReset } from '../core/task-reset';
+import { buildValidationEvidenceSummary } from '../core/task-delivery';
 import {
   evaluateTaskStoryCompletion,
   formatStoryCompletionInvariantMessage,
@@ -58,6 +59,7 @@ function resetFailedFinalizeMergeRepair(task: Task): {
   }
 
   const repairMessage = buildMergeRepairReason(task);
+  const validationEvidenceSummary = buildValidationEvidenceSummary(task);
   const storyProgress = (task.storyProgress || []).map((story) => {
     if (story.id !== repairStoryId) {
       return story;
@@ -90,6 +92,7 @@ function resetFailedFinalizeMergeRepair(task: Task): {
       storyId: repairStoryId,
       reason: repairMessage,
       createdAt: updatedAt,
+      validationEvidenceSummary,
     }),
   };
 }
@@ -148,6 +151,7 @@ export async function retryCommand(taskId: string, options: RetryCommandOptions 
     }
 
     const previousStatus = task.status;
+    const validationEvidenceSummary = buildValidationEvidenceSummary(task);
 
     // Only retry terminal failure states. ready_to_finalize/finalizing are handled by manager/finalizer.
     const retryableCompletedConflict = isCompletedBlockedConflictTask(task);
@@ -223,6 +227,7 @@ export async function retryCommand(taskId: string, options: RetryCommandOptions 
         logPath: latestTask.logPath,
         sessionId: latestTask.sessionId,
         threadId: latestTask.threadId,
+        validationEvidenceSummary,
       }));
       return;
     }
@@ -300,7 +305,8 @@ export async function retryCommand(taskId: string, options: RetryCommandOptions 
       worktree: latestTask.worktree,
       logPath: latestTask.logPath,
       sessionId: latestTask.sessionId,
-      threadId: latestTask.threadId
+      threadId: latestTask.threadId,
+      validationEvidenceSummary,
     }));
   } catch (error) {
     console.error(JSON.stringify({

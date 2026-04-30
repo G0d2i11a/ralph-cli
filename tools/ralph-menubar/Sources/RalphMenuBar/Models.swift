@@ -33,7 +33,7 @@ struct RalphMenuBarConfig: Codable {
     var projects = [
       RalphMenuBarProject(name: "atta", ralphHome: primaryHome)
     ]
-    let ez4ieltsHome = "~/Project/ez4ielts/.ralph-cli-home"
+    let ez4ieltsHome = "/Users/shawn/Project/ez4ielts/.ralph-cli-home"
     if FileManager.default.fileExists(atPath: ez4ieltsHome) {
       projects.append(RalphMenuBarProject(name: "ez4ielts", ralphHome: ez4ieltsHome))
     }

@@ -16,6 +16,50 @@ function runCli(args, env = {}) {
   });
 }
 
+function buildValidationEvidence(taskId) {
+  return {
+    schemaVersion: 1,
+    source: 'finalizer',
+    taskId,
+    generatedAt: 1_700_000_000_000,
+    configuredGates: ['typecheck', 'test'],
+    summary: {
+      total: 2,
+      passed: 1,
+      failed: 1,
+      skipped: 0,
+      classifications: {
+        passed: 1,
+        quality_gate_timeout: 1,
+      },
+    },
+    runs: [
+      {
+        phase: 'quality_gate',
+        requestedGate: 'typecheck',
+        gate: 'typecheck',
+        status: 'passed',
+        classification: 'passed',
+        packageLabel: 'app',
+        command: 'npm run typecheck',
+        exitCode: 0,
+        durationMs: 20,
+      },
+      {
+        phase: 'quality_gate',
+        requestedGate: 'test',
+        gate: 'test',
+        status: 'failed',
+        classification: 'quality_gate_timeout',
+        packageLabel: 'app',
+        command: 'npm test',
+        durationMs: 10_000,
+        timedOut: true,
+      },
+    ],
+  };
+}
+
 test('retry resets failed_finalize tasks and exhausted story attempts', () => {
   const homeDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-retry-home-'));
   const repoDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-retry-repo-'));
@@ -374,6 +418,7 @@ test('retry preserves anchored merge repair for failed merge-conflict tasks', ()
       mergeConflictAt: 61,
       mergeRepairAttempts: 4,
       postFinalizeMergeProbeRequired: true,
+      validationEvidence: buildValidationEvidence(taskId),
       repairContext: {
         mode: 'merge',
         storyId: 'US-002',
@@ -399,7 +444,10 @@ test('retry preserves anchored merge repair for failed merge-conflict tasks', ()
     assert.equal(output.previousStatus, 'failed');
     assert.equal(output.currentStatus, 'pending');
     assert.deepEqual(output.resetStoryIds, ['US-002']);
+    assert.equal(output.validationEvidenceSummary.total, 2);
+    assert.equal(output.validationEvidenceSummary.gates[1].timedOut, true);
     assert.deepEqual(state.completedUS, ['US-001']);
+    assert.equal(state.validationEvidence, undefined);
     assert.equal(state.storyProgress[1].status, 'pending');
     assert.equal(state.storyProgress[1].attempts, 0);
     assert.match(state.storyProgress[1].lastError, /Merge repair required by Ralph/);
@@ -408,8 +456,11 @@ test('retry preserves anchored merge repair for failed merge-conflict tasks', ()
       storyId: 'US-002',
       createdAt: state.repairContext.createdAt,
       reason: state.repairContext.reason,
+      validationEvidenceSummary: state.repairContext.validationEvidenceSummary,
     });
     assert.match(state.repairContext.reason, /src\/one\.ts, src\/two\.ts/);
+    assert.equal(state.repairContext.validationEvidenceSummary.failed, 1);
+    assert.equal(state.repairContext.validationEvidenceSummary.gates[1].timedOut, true);
     assert.equal(state.integrationStatus, 'not_started');
     assert.equal(state.postFinalizeMergeProbeRequired, true);
     assert.equal(state.mergeError, undefined);

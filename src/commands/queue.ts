@@ -3,7 +3,13 @@ import { resolveAutoIntegrate } from '../core/integration-policy';
 import { getManagerStatus } from '../core/manager-state';
 import { buildCoordinationState } from '../core/task-coordination';
 import { summarizeActiveRepoPaths } from '../core/task-home-summary';
-import { buildAutoRecoveryState, buildDeliveryState, buildTransientRetryState, resolveTaskIntegrationStatus } from '../core/task-delivery';
+import {
+  buildAutoRecoveryState,
+  buildDeliveryState,
+  buildTransientRetryState,
+  buildValidationEvidenceSummary,
+  resolveTaskIntegrationStatus,
+} from '../core/task-delivery';
 import { evaluateAutoRecovery } from '../core/auto-recovery-state';
 import { StateManager } from '../core/state';
 import { TaskScheduler } from '../core/scheduler';
@@ -62,6 +68,17 @@ function hasStoppedRecoveryState(task: Task): boolean {
     || task.finalizeRepairStoppedAt
     || task.mergeRepairDisplayStatus === 'stopped'
   );
+}
+
+const TERMINAL_TASK_STATUSES = new Set<string>([
+  'completed',
+  'failed',
+  'failed_finalize',
+  'stagnant',
+]);
+
+function isTerminalTaskStatus(status: unknown): boolean {
+  return typeof status === 'string' && TERMINAL_TASK_STATUSES.has(status);
 }
 
 function stoppedFailedReason(task: Task): string {
@@ -194,6 +211,8 @@ function compactCoordinationState(coordination: ReturnType<typeof buildCoordinat
 }
 
 function compactTaskSummary(taskSummary: Record<string, any>) {
+  const terminalTask = isTerminalTaskStatus(taskSummary.status);
+
   return {
     id: taskSummary.id,
     status: taskSummary.status,
@@ -208,6 +227,8 @@ function compactTaskSummary(taskSummary: Record<string, any>) {
     completedUS: taskSummary.completedUS,
     storyProgress: toCompactStoryProgress(taskSummary.storyProgress),
     repairContext: toCompactRepairContext(taskSummary.repairContext),
+    hasValidationEvidence: terminalTask ? taskSummary.hasValidationEvidence : undefined,
+    validationEvidenceSummary: taskSummary.validationEvidenceSummary,
     errorMessage: taskSummary.errorMessage,
     mergeError: taskSummary.mergeError,
     reason: taskSummary.reason,
@@ -312,6 +333,8 @@ function summarizeTask(
     autoRecovery,
     delivery,
     coordination,
+    validationEvidenceSummary: buildValidationEvidenceSummary(task),
+    hasValidationEvidence: Boolean(task.validationEvidence || task.repairContext?.validationEvidenceSummary),
     attention,
     attentionReason: attention.reason,
     nextAction: resolveNextAction(task, pendingState, autoIntegrateEnabled),

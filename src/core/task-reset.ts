@@ -9,6 +9,7 @@ export function buildFinalizeRetryReset(): Partial<Task> {
     finalizerCommittedAt: undefined,
     finalizerAttempts: 0,
     finalizerFailure: undefined,
+    validationEvidence: undefined,
     repairContext: undefined,
     mergedAt: undefined,
     integratedAt: undefined,
