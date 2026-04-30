@@ -73,6 +73,7 @@ export interface WatchCommandOptions {
   allowMixedHome?: boolean;
   autoIngestEz4ielts?: boolean;
   ez4ieltsDir?: string;
+  allowUmbrellaPrds?: boolean;
 }
 
 interface DependencyWatcherDeps {
@@ -624,7 +625,7 @@ export class DependencyWatcher {
       const agent = resolveAgentType(options.agent || DEFAULT_AGENT);
       const autoIngestors: AutoIngestor[] = [];
 
-      if (prdGlobAutoIngestEnabled) {
+if (prdGlobAutoIngestEnabled) {
         if (prdGlobs.length === 0) {
           throw new Error('PRD auto-ingest requires at least one configured glob in `ingestion.prds.globs`.');
         }
@@ -637,6 +638,7 @@ export class DependencyWatcher {
             backend,
             glob: entry.glob,
             settleMs,
+            allowUmbrellaPrd: options.allowUmbrellaPrds,
             logger: (message) => this.logger.log(message),
           }, {
             stateManager,
@@ -664,6 +666,7 @@ export class DependencyWatcher {
           watchDir,
           pattern: typeof configuredPattern === 'string' ? configuredPattern : DEFAULT_EZ4IELTS_PATTERN,
           settleMs: resolveSettleMs(settleMs),
+          allowUmbrellaPrd: options.allowUmbrellaPrds,
           logger: (message) => this.logger.log(message),
         }, {
           stateManager,

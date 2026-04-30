@@ -108,6 +108,7 @@ Options:
   --agent <name>       Agent to use: claude or codex (default: codex)
   --backend <name>     Backend to use: cli or agent-runners (default: cli)
   --allow-duplicate    Queue another active copy of the same PRD for this repo
+  --allow-umbrella-prd Allow a broad umbrella or strategy PRD without executable frontmatter
 ```
 
 **Examples:**
@@ -161,6 +162,7 @@ For non-ez4ielts projects, set `ingestion.prds.enabled=true` and configure `inge
 - Generic PRD glob entries resolve relative globs from their configured `repo` / `repoPath`, or from `--repo` when no repo is set on the entry.
 - Legacy ez4ielts auto-ingest requires an explicit watch directory via `--ez4ielts-dir`, `RALPH_EZ4IELTS_WATCH_DIR`, or `ingestion.ez4ielts.watchDir` in `RALPH_HOME/config.json`.
 - New files still respect dependency checks and the configured concurrency limit.
+- PRDs marked `status: completed`, `status: archived`, or `archived: true` are skipped. Broad umbrella or strategy PRDs must use `executable: true` or an explicit `--allow-umbrella-prds` watcher/manager flag.
 
 You can also enable the same mode through `RALPH_HOME/config.json` (default: `~/.ralph/config.json`) and then run plain `ralph watch`.
 
@@ -382,6 +384,12 @@ Optional coordination fields:
 - `writeSurface`: predicted files, directories, or package roots this task is expected to touch
 - `conflictDomains`: coarse overlap tags when file lists would be too narrow or unstable
 - `integrationLane`: serialization lane for finalize/merge; defaults to the merge target branch when omitted
+
+Optional intake safety fields:
+
+- `status`: `completed` or `archived` PRDs are refused or skipped instead of being queued again
+- `archived`: `true` also marks the PRD as non-ingestable
+- `executable`: `true` allows an otherwise broad umbrella or strategy PRD to be queued intentionally
 
 Ralph uses declared coordination metadata at intake and queue start, then captures observed diff/package surface again before finalize or merge.
 

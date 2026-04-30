@@ -2,7 +2,7 @@ import { enqueueTaskFromPrd } from '../core/task-intake';
 
 export async function startCommand(
   prdPath: string,
-  options: { repo?: string; agent?: string; backend?: string; allowDuplicate?: boolean }
+  options: { repo?: string; agent?: string; backend?: string; allowDuplicate?: boolean; allowUmbrellaPrd?: boolean }
 ): Promise<void> {
   try {
     const { taskId, latestTask, pendingState, alreadyExists } = await enqueueTaskFromPrd(prdPath, {
@@ -10,6 +10,7 @@ export async function startCommand(
       agent: options.agent,
       backend: options.backend,
       allowDuplicate: options.allowDuplicate,
+      allowUmbrellaPrd: options.allowUmbrellaPrd,
     });
 
     if (alreadyExists) {

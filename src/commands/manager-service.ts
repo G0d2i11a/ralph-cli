@@ -116,6 +116,10 @@ function buildManagerArgs(options: ManagerInstallOptions): string[] {
     args.push('--ez4ielts-dir', path.resolve(options.ez4ieltsDir));
   }
 
+  if (options.allowUmbrellaPrds) {
+    args.push('--allow-umbrella-prds');
+  }
+
   return args;
 }
 

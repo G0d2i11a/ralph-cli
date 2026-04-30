@@ -16,14 +16,69 @@ function runCli(args, env = {}) {
   });
 }
 
-function writeMarkdownPrd(filePath, id) {
+function writeRiskPrdFile(dir, id, overrides = {}) {
+  const prdPath = path.join(dir, `${id}.json`);
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(prdPath, JSON.stringify({
+    id,
+    title: `${id} title`,
+    description: '',
+    dependencies: [],
+    userStories: [
+      {
+        id: 'US-001',
+        title: 'First story',
+        description: '',
+        acceptanceCriteria: [],
+      },
+    ],
+    ...overrides,
+  }, null, 2));
+  return prdPath;
+}
+
+function writeRiskTaskState(homeDir, taskId, overrides = {}) {
+  const taskDir = path.join(homeDir, '.ralph', 'tasks', taskId);
+  fs.mkdirSync(taskDir, { recursive: true });
+  fs.writeFileSync(path.join(taskDir, 'state.json'), JSON.stringify({
+    id: taskId,
+    prdPath: overrides.prdPath || `/tmp/${taskId}.json`,
+    prdId: overrides.prdId || taskId,
+    status: overrides.status || 'pending',
+    startTime: overrides.startTime || 100,
+    enqueuedAt: overrides.enqueuedAt || overrides.startTime || 100,
+    completedUS: [],
+    worktree: overrides.worktree || '',
+    logPath: path.join(taskDir, 'agent.log'),
+    agent: 'codex',
+    repoPath: overrides.repoPath || '/tmp/repo',
+    loopCount: 0,
+    consecutiveNoProgress: 0,
+    consecutiveErrors: 0,
+    lastProgressTime: overrides.startTime || 100,
+    lastFilesChanged: 0,
+    ...overrides,
+  }, null, 2));
+}
+
+function writeMarkdownPrd(
+  filePath,
+  id,
+  dependencies = ['missing-upstream-prd'],
+  writeSurface = ['src/utils/helpers.ts']
+) {
+  const dependencyFrontmatter = dependencies.length > 0
+    ? `dependencies:\n${dependencies.map((dependency) => `  - ${dependency}`).join('\n')}`
+    : 'dependencies: []';
+  const writeSurfaceFrontmatter = writeSurface.length > 0
+    ? `writeSurface:\n${writeSurface.map((entry) => `  - ${entry}`).join('\n')}`
+    : 'writeSurface: []';
+
   fs.writeFileSync(filePath, `---
 id: ${id}
 title: ${id} title
-dependencies:
-  - missing-upstream-prd
-writeSurface:
-  - src/utils/helpers.ts
+${dependencyFrontmatter}
+${writeSurfaceFrontmatter}
 userStories:
   - id: US-001
     title: Implement ${id}
@@ -49,8 +104,26 @@ test('start and batch-start enqueue markdown PRDs with valid frontmatter', () =>
   };
 
   try {
+    fs.mkdirSync(path.join(homeDir, '.ralph'), { recursive: true });
+    fs.writeFileSync(path.join(homeDir, '.ralph', 'config.json'), JSON.stringify({
+      runner: {
+        maxConcurrent: 1,
+      },
+    }, null, 2));
+    writeRiskTaskState(homeDir, 'running-slot', {
+      status: 'running',
+      pid: process.pid,
+      prdPath: path.join(repoDir, 'running-slot.json'),
+      prdId: 'running-slot-prd',
+      repoPath: repoDir,
+      declaredWriteSurface: ['src/occupied-slot.ts'],
+      startTime: 50,
+      enqueuedAt: 50,
+      lastProgressTime: Date.now(),
+    });
+
     writeMarkdownPrd(startPrd, 'cli-start-prd');
-    writeMarkdownPrd(batchPrd, 'cli-batch-prd');
+    writeMarkdownPrd(batchPrd, 'cli-batch-prd', [], ['src/commands/start.ts']);
 
     const startResult = runCli(['start', startPrd, '--repo', repoDir], env);
     assert.equal(startResult.status, 0, startResult.stderr);
@@ -818,6 +891,98 @@ test('queue command includes recent integrated tasks within the configured windo
   }
 });
 
+test('batch-start separates skipped blocked and enqueued PRDs during preflight', () => {
+  const homeDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-batch-risk-home-'));
+  const repoDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-batch-risk-repo-'));
+  const prdDir = path.join(repoDir, 'prds');
+
+  try {
+    execFileSync('git', ['init', '-b', 'main'], { cwd: repoDir, stdio: 'ignore' });
+    fs.mkdirSync(path.join(homeDir, '.ralph'), { recursive: true });
+    fs.writeFileSync(path.join(homeDir, '.ralph', 'config.json'), JSON.stringify({
+      runner: {
+        maxConcurrent: 1,
+      },
+    }, null, 2));
+
+    const readyPrd = writeRiskPrdFile(prdDir, 'ready-prd');
+    const missingDependencyPrd = writeRiskPrdFile(prdDir, 'missing-dependency-prd', {
+      dependencies: ['not-enqueued'],
+    });
+    const activeDuplicatePrd = writeRiskPrdFile(prdDir, 'active-duplicate-prd');
+    const completedDuplicatePrd = writeRiskPrdFile(prdDir, 'completed-duplicate-prd');
+    const overlapPrd = writeRiskPrdFile(prdDir, 'overlap-prd', {
+      writeSurface: ['src/auth/routes.ts'],
+    });
+
+    writeRiskTaskState(homeDir, 'active-duplicate-task', {
+      prdPath: activeDuplicatePrd,
+      prdId: 'active-duplicate-prd',
+      status: 'running',
+      pid: process.pid,
+      repoPath: repoDir,
+      worktree: path.join(repoDir, '.ralph-worktrees', 'active-duplicate-task'),
+      startTime: 100,
+      enqueuedAt: 100,
+      lastProgressTime: Date.now(),
+    });
+    writeRiskTaskState(homeDir, 'completed-duplicate-task', {
+      prdPath: completedDuplicatePrd,
+      prdId: 'completed-duplicate-prd',
+      status: 'completed',
+      repoPath: repoDir,
+      completedUS: ['US-001'],
+      startTime: 50,
+      enqueuedAt: 50,
+    });
+    writeRiskTaskState(homeDir, 'surface-owner-task', {
+      prdPath: path.join(prdDir, 'surface-owner.json'),
+      prdId: 'surface-owner-prd',
+      status: 'running',
+      pid: process.pid,
+      repoPath: repoDir,
+      worktree: path.join(repoDir, '.ralph-worktrees', 'surface-owner-task'),
+      declaredWriteSurface: ['src/auth'],
+      startTime: 10,
+      enqueuedAt: 10,
+      lastProgressTime: Date.now(),
+    });
+
+    const result = runCli([
+      'batch-start',
+      readyPrd,
+      missingDependencyPrd,
+      activeDuplicatePrd,
+      completedDuplicatePrd,
+      overlapPrd,
+      '--repo',
+      repoDir,
+    ], { HOME: homeDir });
+    const output = JSON.parse(result.stdout);
+
+    assert.equal(result.status, 1, result.stderr);
+    assert.equal(output.enqueued.length, 1);
+    assert.equal(output.enqueued[0].prdId, 'ready-prd');
+    assert.equal(output.blocked.length, 2);
+    assert.equal(output.skipped.length, 2);
+
+    const blockedById = new Map(output.blocked.map((entry) => [entry.prdId, entry]));
+    const skippedById = new Map(output.skipped.map((entry) => [entry.prdId, entry]));
+    assert.deepEqual(blockedById.get('missing-dependency-prd').missingDependencies, ['not-enqueued']);
+    assert.ok(blockedById.get('overlap-prd').writeSurfaceOverlaps.length > 0);
+    assert.deepEqual(skippedById.get('active-duplicate-prd').activeDuplicates, ['active-duplicate-task']);
+    assert.deepEqual(skippedById.get('completed-duplicate-prd').completedDuplicates, ['completed-duplicate-task']);
+
+    const taskIds = fs.readdirSync(path.join(homeDir, '.ralph', 'tasks')).sort();
+    assert.equal(taskIds.length, 4);
+    assert.ok(taskIds.includes(output.enqueued[0].taskId));
+    assert.equal(fs.existsSync(path.join(homeDir, '.ralph', 'tasks', output.enqueued[0].taskId, 'state.json')), true);
+  } finally {
+    fs.rmSync(homeDir, { recursive: true, force: true });
+    fs.rmSync(repoDir, { recursive: true, force: true });
+  }
+});
+
 test('doctor warns when overlap backlog exists but unattended integration is disabled', () => {
   const homeDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-doctor-liveness-home-'));
   const repoDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-doctor-liveness-repo-'));
@@ -880,6 +1045,62 @@ test('doctor command returns preflight JSON', () => {
     assert.ok(Array.isArray(output.checks));
     assert.ok(output.checks.some((check) => check.name === 'repo'));
     assert.ok(output.checks.some((check) => check.name === 'manager'));
+  } finally {
+    fs.rmSync(homeDir, { recursive: true, force: true });
+    fs.rmSync(repoDir, { recursive: true, force: true });
+  }
+});
+
+test('doctor command scans a PRD folder for stale status and active duplicates', () => {
+  const homeDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-doctor-prd-folder-home-'));
+  const repoDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-doctor-prd-folder-repo-'));
+  const prdDir = path.join(repoDir, 'prds');
+
+  try {
+    execFileSync('git', ['init', '-b', 'main'], { cwd: repoDir, stdio: 'ignore' });
+    const activePrd = writeRiskPrdFile(prdDir, 'folder-active-prd');
+    const completedStatusPrd = writeRiskPrdFile(prdDir, 'folder-completed-status-prd', {
+      status: 'completed',
+    });
+    const completedDuplicatePrd = writeRiskPrdFile(prdDir, 'folder-completed-duplicate-prd');
+    writeRiskPrdFile(prdDir, 'folder-ready-prd');
+
+    writeRiskTaskState(homeDir, 'folder-active-task', {
+      prdPath: activePrd,
+      prdId: 'folder-active-prd',
+      status: 'running',
+      pid: process.pid,
+      repoPath: repoDir,
+      worktree: path.join(repoDir, '.ralph-worktrees', 'folder-active-task'),
+      lastProgressTime: Date.now(),
+    });
+    writeRiskTaskState(homeDir, 'folder-completed-task', {
+      prdPath: completedDuplicatePrd,
+      prdId: 'folder-completed-duplicate-prd',
+      status: 'completed',
+      repoPath: repoDir,
+      completedUS: ['US-001'],
+    });
+
+    const result = runCli([
+      'doctor',
+      '--repo',
+      repoDir,
+      '--prd-dir',
+      prdDir,
+    ], { HOME: homeDir });
+    const output = JSON.parse(result.stdout);
+    const prdFolderCheck = output.checks.find((check) => check.name === 'prd.folder');
+
+    assert.equal(result.status, 1, result.stderr);
+    assert.equal(prdFolderCheck.ok, false);
+    assert.equal(output.prdFolder.total, 4);
+    assert.equal(output.prdFolder.ready.length, 1);
+    assert.equal(output.prdFolder.activeDuplicates.length, 1);
+    assert.equal(output.prdFolder.completedDuplicates.length, 1);
+    assert.ok(output.prdFolder.stale.some((entry) => entry.prdId === 'folder-completed-status-prd'));
+    assert.ok(output.prdFolder.stale.some((entry) => entry.prdId === 'folder-completed-duplicate-prd'));
+    assert.deepEqual(output.prdFolder.activeDuplicates[0].activeDuplicates, ['folder-active-task']);
   } finally {
     fs.rmSync(homeDir, { recursive: true, force: true });
     fs.rmSync(repoDir, { recursive: true, force: true });
