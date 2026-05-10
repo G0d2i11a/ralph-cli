@@ -3,62 +3,96 @@ const assert = require('node:assert/strict');
 
 const {
   classifyQualityGateFailure,
-  QualityGateFailure,
-  isQualityGateFailure,
+  parseTurboNestedFailures,
 } = require('../dist/core/finalize-failure-classifier.js');
+const {
+  buildFailureObservationFromTask,
+} = require('../dist/core/failure-observation.js');
 
-test('classifyQualityGateFailure detects generated type drift from TypeScript diagnostics', () => {
+test('quality gate classifier normalizes root turbo api#test failure to apps/api', () => {
+  const taskId = 'task-1777894813877-e6j0sr75q';
+  const repoPath = '/repo/ez4ielts';
+  const taskWorktree = `${repoPath}/.ralph-worktrees/${taskId}`;
+  const output = [
+    'api:test: ERROR: command finished with error: command (/repo/ez4ielts/.ralph-worktrees/task-1777894813877-e6j0sr75q/apps/api) /opt/homebrew/bin/pnpm run test exited (1)',
+    'api#test: command (/repo/ez4ielts/.ralph-worktrees/task-1777894813877-e6j0sr75q/apps/api) /opt/homebrew/bin/pnpm run test exited (1)',
+    "Nest can't resolve dependencies of the ContentExposureService (PrismaService, ?). Please make sure that the argument OpsAlertService at index [1] is available in the RootTestModule context.",
+  ].join('\n');
+
   const details = classifyQualityGateFailure({
-    requestedScript: 'typecheck',
-    actualScript: 'typecheck',
-    cwd: '/repo/apps/api',
-    packageLabel: 'apps/api',
-    command: 'pnpm run typecheck',
-    rawMessage: 'Quality gate "typecheck" failed: type errors detected',
-    stderr: [
-      "src/service.ts(12,5): error TS2353: Object literal may only specify known properties, and 'sourceType' does not exist in type 'SpeakingPersonaWhereInput'.",
-      "src/service.ts(18,5): error TS2339: Property 'sourceType' does not exist on type '{ id: string; }'.",
-    ].join('\n'),
-    exitCode: 2,
+    requestedScript: 'test',
+    actualScript: 'test',
+    cwd: taskWorktree,
+    packageLabel: taskId,
+    command: 'pnpm run test',
+    rawMessage: `Quality gate "test" failed: ${output}`,
+    stdout: output,
+    exitCode: 1,
+    taskId,
+    taskWorktree,
+    repoPath,
   });
 
-  assert.equal(details.class, 'generated_type_drift');
-  assert.equal(details.diagnosticCount, 2);
-  assert.deepEqual(details.failedCodes, ['TS2339', 'TS2353']);
-  assert.deepEqual(details.failedSymbols, ['sourceType']);
-  assert.match(details.diagnosticSignature, /TS2353/);
+  assert.equal(details.packageLabel, 'apps/api');
+  assert.equal(details.gate, 'test');
+  assert.equal(details.cwd, `${taskWorktree}/apps/api`);
+  assert.equal(details.parentCommand, 'pnpm run test');
+  assert.equal(details.parentCwd, taskWorktree);
+  assert.equal(details.class, 'test_module_provider_drift');
+  assert.equal(details.nestedFailures.length, 1);
+  assert.equal(details.nestedFailures[0].packageLabel, 'apps/api');
 });
 
-test('classifyQualityGateFailure detects enum drift from TypeScript diagnostics', () => {
-  const details = classifyQualityGateFailure({
-    requestedScript: 'typecheck',
-    actualScript: 'typecheck',
-    cwd: '/repo/apps/api',
-    packageLabel: 'apps/api',
-    command: 'pnpm run typecheck',
-    rawMessage: 'Quality gate "typecheck" failed: enum mismatch',
-    stderr: 'src/service.ts(24,9): error TS2322: Type \'"REVIEWING_QUESTIONS"\' is not assignable to type \'PersonaStatus | undefined\'.',
-    exitCode: 2,
+test('turbo nested parser deduplicates api:test and api#test lines', () => {
+  const taskWorktree = '/repo/.ralph-worktrees/task-a';
+  const output = [
+    'api:test: ERROR: command finished with error: command (/repo/.ralph-worktrees/task-a/apps/api) /opt/homebrew/bin/pnpm run test exited (1)',
+    'api#test: command (/repo/.ralph-worktrees/task-a/apps/api) /opt/homebrew/bin/pnpm run test exited (1)',
+  ].join('\n');
+
+  const failures = parseTurboNestedFailures({
+    output,
+    taskWorktree,
+    repoPath: '/repo',
+    parentCommand: 'pnpm run test',
   });
 
-  assert.equal(details.class, 'enum_drift');
-  assert.equal(details.failedSymbols?.includes('REVIEWING_QUESTIONS'), true);
+  assert.equal(failures.length, 1);
+  assert.equal(failures[0].packageLabel, 'apps/api');
+  assert.equal(failures[0].gate, 'test');
 });
 
-test('QualityGateFailure preserves structured details on the thrown error', () => {
-  const details = classifyQualityGateFailure({
-    requestedScript: 'typecheck',
-    actualScript: 'typecheck',
-    cwd: '/repo/apps/api',
-    packageLabel: 'apps/api',
-    command: 'pnpm run typecheck',
-    rawMessage: 'Quality gate "typecheck" timed out after 30s',
-    timedOut: true,
+test('failure observation normalizes legacy persisted root turbo failure', () => {
+  const taskId = 'task-1777894813877-e6j0sr75q';
+  const repoPath = '/repo/ez4ielts';
+  const taskWorktree = `${repoPath}/.ralph-worktrees/${taskId}`;
+  const rawMessage = [
+    'Quality gate "test" failed: • turbo 2.7.1',
+    `api:test: ERROR: command finished with error: command (${taskWorktree}/apps/api) /opt/homebrew/bin/pnpm run test exited (1)`,
+    `api#test: command (${taskWorktree}/apps/api) /opt/homebrew/bin/pnpm run test exited (1)`,
+  ].join('\n');
+
+  const observation = buildFailureObservationFromTask({
+    id: taskId,
+    repoPath,
+    worktree: taskWorktree,
+    lastErrorObservedAt: 1778001323674,
+    finalizerFailure: {
+      failureKind: 'quality_gate',
+      class: 'quality_gate_failure',
+      gate: 'test',
+      requestedGate: 'test',
+      packageLabel: taskId,
+      cwd: taskWorktree,
+      command: 'pnpm run test',
+      exitCode: 1,
+      rawMessage,
+    },
   });
 
-  const error = new QualityGateFailure(details);
-
-  assert.equal(isQualityGateFailure(error), true);
-  assert.equal(error.message, 'Quality gate "typecheck" timed out after 30s');
-  assert.equal(error.details.class, 'quality_gate_timeout');
+  assert.equal(observation.packageLabel, 'apps/api');
+  assert.equal(observation.cwd, `${taskWorktree}/apps/api`);
+  assert.equal(observation.command, '/opt/homebrew/bin/pnpm run test');
+  assert.equal(observation.parentCommand, 'pnpm run test');
+  assert.ok(observation.signature.includes('test|apps/api'));
 });

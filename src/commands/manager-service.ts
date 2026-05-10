@@ -4,10 +4,12 @@ import * as os from 'os';
 import * as path from 'path';
 import { WatchCommandOptions } from '../core/dependency-watcher';
 import { getRalphPaths, hashRalphHome, isDefaultRalphHome, resolveRalphHome } from '../core/paths';
+import { assertNoDuplicateRepoManagers, listRepoManagerClaims } from '../core/repo-manager-registry';
 
 interface ManagerInstallOptions extends WatchCommandOptions {
   label?: string;
   plist?: string;
+  profile?: string;
   dryRun?: boolean;
   load?: boolean;
   disableAutoIngestEz4ielts?: boolean;
@@ -16,6 +18,7 @@ interface ManagerInstallOptions extends WatchCommandOptions {
 interface ManagerUninstallOptions {
   label?: string;
   plist?: string;
+  repo?: string;
   dryRun?: boolean;
 }
 
@@ -89,6 +92,7 @@ function envEntries(): string {
 
 function buildManagerArgs(options: ManagerInstallOptions): string[] {
   const args = ['manager'];
+  const ez4ieltsAutonomous = options.profile === 'ez4ielts-autonomous';
 
   if (options.interval !== undefined) {
     args.push('--interval', String(options.interval));
@@ -106,10 +110,14 @@ function buildManagerArgs(options: ManagerInstallOptions): string[] {
     args.push('--backend', options.backend);
   }
 
-  if (options.disableAutoIngestEz4ielts) {
+  if (options.disableAutoIngestEz4ielts && !ez4ieltsAutonomous) {
     args.push('--disable-auto-ingest-ez4ielts');
-  } else if (options.autoIngestEz4ielts) {
+  } else if (options.autoIngestEz4ielts || ez4ieltsAutonomous) {
     args.push('--auto-ingest-ez4ielts');
+  }
+
+  if (options.ingestExistingEz4ielts) {
+    args.push('--ingest-existing-ez4ielts');
   }
 
   if (options.ez4ieltsDir) {
@@ -123,6 +131,7 @@ function createLaunchdPlist(options: {
   label: string;
   cliPath: string;
   managerArgs: string[];
+  workingDirectory: string;
   stdoutPath: string;
   stderrPath: string;
 }): string {
@@ -147,7 +156,7 @@ ${programArguments.map(stringEntry).join('\n')}
   <key>KeepAlive</key>
   <true/>
   <key>WorkingDirectory</key>
-  <string>${escapeXml(process.cwd())}</string>
+  <string>${escapeXml(options.workingDirectory)}</string>
 ${envEntries()}  <key>StandardOutPath</key>
   <string>${escapeXml(options.stdoutPath)}</string>
   <key>StandardErrorPath</key>
@@ -171,6 +180,38 @@ function launchdDomain(): string {
   return `gui/${uid}`;
 }
 
+function sleepSync(ms: number): void {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+function tryLaunchctl(args: string[]): boolean {
+  try {
+    execFileSync('launchctl', args, {
+      stdio: 'ignore',
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function isLaunchdServiceLoaded(label: string): boolean {
+  return tryLaunchctl(['print', launchdTarget(label)]);
+}
+
+function waitForLaunchdServiceState(label: string, loaded: boolean, timeoutMs = 3000): boolean {
+  const deadline = Date.now() + timeoutMs;
+
+  do {
+    if (isLaunchdServiceLoaded(label) === loaded) {
+      return true;
+    }
+    sleepSync(100);
+  } while (Date.now() < deadline);
+
+  return isLaunchdServiceLoaded(label) === loaded;
+}
+
 function ensureParentDir(filePath: string): void {
   const parentDir = path.dirname(filePath);
   if (!fs.existsSync(parentDir)) {
@@ -178,8 +219,66 @@ function ensureParentDir(filePath: string): void {
   }
 }
 
+function reloadLaunchdService(label: string, plistPath: string): { bootedOut: boolean; bootstrapped: boolean; kickstarted: boolean } {
+  const bootedOut = [
+    ['bootout', launchdTarget(label)],
+    ['bootout', launchdDomain(), plistPath],
+    ['remove', label],
+  ].some((args) => tryLaunchctl(args));
+
+  if (bootedOut) {
+    waitForLaunchdServiceState(label, false);
+  }
+
+  let bootstrapped = tryLaunchctl(['bootstrap', launchdDomain(), plistPath]);
+  if (!bootstrapped) {
+    sleepSync(300);
+    bootstrapped = tryLaunchctl(['bootstrap', launchdDomain(), plistPath]);
+  }
+  if (!bootstrapped) {
+    const fallbackBootedOut = tryLaunchctl(['bootout', launchdDomain(), plistPath]);
+    if (fallbackBootedOut) {
+      waitForLaunchdServiceState(label, false);
+    }
+    bootstrapped = tryLaunchctl(['bootstrap', launchdDomain(), plistPath]);
+  }
+  if (!bootstrapped && !isLaunchdServiceLoaded(label)) {
+    execFileSync('launchctl', ['bootstrap', launchdDomain(), plistPath], {
+      stdio: 'ignore',
+    });
+    bootstrapped = true;
+  }
+  if (!bootstrapped && isLaunchdServiceLoaded(label)) {
+    // A previous service definition is still loaded; keep it alive but report
+    // that this install did not apply the rewritten plist.
+    throw new Error(`launchd service ${label} is still loaded and could not be reloaded from ${plistPath}`);
+  }
+
+  const kickstarted = tryLaunchctl(['kickstart', '-k', launchdTarget(label)]);
+
+  return {
+    bootedOut,
+    bootstrapped,
+    kickstarted,
+  };
+}
+
 export async function managerInstallCommand(options: ManagerInstallOptions = {}): Promise<void> {
   const ralphHome = resolveRalphHome();
+  const profile = typeof options.profile === 'string' && options.profile.trim()
+    ? options.profile.trim()
+    : undefined;
+  if (profile && profile !== 'ez4ielts-autonomous') {
+    throw new Error(`Unknown manager profile: ${profile}`);
+  }
+  if (profile === 'ez4ielts-autonomous' && !options.ez4ieltsDir) {
+    throw new Error('manager-install --profile ez4ielts-autonomous requires --ez4ielts-dir');
+  }
+  assertNoDuplicateRepoManagers({
+    repoPath: options.repo,
+    currentRalphHome: ralphHome,
+    operation: 'install the Ralph manager service',
+  });
   const label = resolveManagerLabel(options.label);
   const plistPath = resolvePlistPath(label, options.plist);
   const logDir = getRalphPaths({ ralphHome }).logsDir;
@@ -187,13 +286,16 @@ export async function managerInstallCommand(options: ManagerInstallOptions = {})
   const stderrPath = path.join(logDir, 'manager.err.log');
   const cliPath = resolveCliPath();
   const managerArgs = buildManagerArgs(options);
+  const workingDirectory = options.repo ? path.resolve(options.repo) : process.cwd();
   const plist = createLaunchdPlist({
     label,
     cliPath,
     managerArgs,
+    workingDirectory,
     stdoutPath,
     stderrPath,
   });
+  let loadResult: ReturnType<typeof reloadLaunchdService> | undefined;
 
   if (!options.dryRun) {
     ensureParentDir(plistPath);
@@ -201,12 +303,7 @@ export async function managerInstallCommand(options: ManagerInstallOptions = {})
     fs.writeFileSync(plistPath, plist);
 
     if (options.load) {
-      execFileSync('launchctl', ['bootstrap', launchdDomain(), plistPath], {
-        stdio: 'ignore',
-      });
-      execFileSync('launchctl', ['kickstart', '-k', launchdTarget(label)], {
-        stdio: 'ignore',
-      });
+      loadResult = reloadLaunchdService(label, plistPath);
     }
   }
 
@@ -215,17 +312,67 @@ export async function managerInstallCommand(options: ManagerInstallOptions = {})
     dryRun: Boolean(options.dryRun),
     loaded: Boolean(options.load && !options.dryRun),
     ralphHome,
+    profile,
     label,
     plistPath,
     cliPath,
     managerArgs,
+    workingDirectory,
     stdoutPath,
     stderrPath,
+    loadResult,
   }));
 }
 
 export async function managerUninstallCommand(options: ManagerUninstallOptions = {}): Promise<void> {
   const ralphHome = resolveRalphHome();
+  if (options.repo) {
+    const targets = listRepoManagerClaims({
+      repoPath: path.resolve(options.repo),
+      currentRalphHome: ralphHome,
+    }).filter((claim) => claim.plistPath && claim.label);
+    const results = targets.map((claim) => {
+      let unloaded = false;
+      let removed = false;
+
+      if (!options.dryRun) {
+        try {
+          execFileSync('launchctl', ['bootout', launchdTarget(claim.label as string)], {
+            stdio: 'ignore',
+          });
+          unloaded = true;
+        } catch {
+          unloaded = false;
+        }
+
+        if (claim.plistPath && fs.existsSync(claim.plistPath)) {
+          fs.rmSync(claim.plistPath, { force: true });
+          removed = true;
+        }
+      }
+
+      return {
+        label: claim.label,
+        plistPath: claim.plistPath,
+        ralphHome: claim.ralphHome,
+        pid: claim.pid,
+        active: claim.active,
+        unloaded,
+        removed,
+      };
+    });
+
+    console.log(JSON.stringify({
+      ok: true,
+      dryRun: Boolean(options.dryRun),
+      repoPath: path.resolve(options.repo),
+      ralphHome,
+      targetCount: results.length,
+      targets: results,
+    }));
+    return;
+  }
+
   const label = resolveManagerLabel(options.label);
   const plistPath = resolvePlistPath(label, options.plist);
   let unloaded = false;

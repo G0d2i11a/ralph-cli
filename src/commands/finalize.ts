@@ -25,6 +25,10 @@ import {
   evaluateFinalizeRepairFailure,
   resolveFinalizeRepairConfig,
 } from '../core/finalize-repair-policy';
+import {
+  appendFailureObservation,
+  buildFailureObservationFromTask,
+} from '../core/failure-observation';
 import { buildTaskRepairContext } from '../core/repair-context';
 import {
   createCoordinationBlockedError,
@@ -418,6 +422,7 @@ export async function finalizeCommand(taskId: string): Promise<void> {
       : undefined;
     const mergeConflict = hasMergeConflictFiles(failureUpdates)
       || hasMergeConflictFiles(latestTask ?? undefined);
+    const autoRecoveryKind = mergeConflict ? 'merge_repair' : 'finalize_repair';
     const repairStoryId = latestTask
       ? selectRepairStoryId(latestTask, mergeConflict)
       : undefined;
@@ -428,6 +433,15 @@ export async function finalizeCommand(taskId: string): Promise<void> {
           reason: failureMessage,
           createdAt: observedAt,
         })
+      : undefined;
+    const latestFailure = finalizerFailure
+      && latestTask
+      ? buildFailureObservationFromTask({
+          ...latestTask,
+          finalizerFailure,
+          lastError: failureMessage,
+          lastErrorObservedAt: observedAt,
+        }, observedAt)
       : undefined;
     await stateManager.updateTask(taskId, {
       status: 'failed_finalize',
@@ -448,6 +462,8 @@ export async function finalizeCommand(taskId: string): Promise<void> {
       mergeError: failureMessage,
       finalizerAttempts,
       finalizerFailure,
+      latestFailure,
+      failureHistory: appendFailureObservation(latestTask?.failureHistory, latestFailure),
       repairContext,
       postFinalizeMergeProbeRequired: failureUpdates.postFinalizeMergeProbeRequired
         ?? latestTask?.postFinalizeMergeProbeRequired,
@@ -456,6 +472,16 @@ export async function finalizeCommand(taskId: string): Promise<void> {
       leaseOwner: undefined,
       leaseHeartbeatAt: undefined,
       leaseExpiresAt: undefined,
+      autoRecoveryKind,
+      autoRecoveryHardCap: mergeConflict
+        ? Math.max(repairConfig.maxRepairAttempts, 1)
+        : repairConfig.repairHardCap,
+      autoRecoveryNextEligibleAt: undefined,
+      autoRecoveryStoppedAt: undefined,
+      autoRecoveryStopReason: undefined,
+      autoRecoveryLastReason: mergeConflict
+        ? 'Finalizer failed with merge conflict; waiting for merge repair'
+        : 'Finalizer failed; waiting for finalize repair',
       ...(repairFailureState
         ? {
             finalizeRepairStartedAt: repairFailureState.startedAt,

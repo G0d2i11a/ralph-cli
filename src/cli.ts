@@ -20,10 +20,15 @@ import { managerInstallCommand, managerUninstallCommand } from './commands/manag
 import { managerStatusCommand } from './commands/manager-status';
 import { doctorCommand } from './commands/doctor';
 import { queueCommand } from './commands/queue';
+import { watchdogCommand, watchdogInstallCommand, watchdogUninstallCommand } from './commands/watchdog';
 import { cleanupCommand } from './commands/cleanup';
 import { DEFAULT_AGENT, DEFAULT_BACKEND } from './core/agent';
 
 const program = new Command();
+
+function collectRepeatedOption(value: string, previous: string[] = []): string[] {
+  return [...previous, value];
+}
 
 program
   .name('ralph')
@@ -177,6 +182,7 @@ program
   .option('--backend <name>', `Backend to use for auto-ingested tasks (cli|agent-runners, default: ${DEFAULT_BACKEND})`)
   .option('--auto-ingest-ez4ielts', 'Auto-enqueue new ez4ielts-*.json files discovered by the watcher')
   .option('--disable-auto-ingest-ez4ielts', 'Disable configured ez4ielts auto-ingestion for this watcher run')
+  .option('--ingest-existing-ez4ielts', 'Queue existing matching PRD files on startup instead of only watching new files')
   .option('--ez4ielts-dir <path>', 'Directory to scan for ez4ielts-*.json files')
   .addHelpText('after', `
 Examples:
@@ -191,9 +197,9 @@ Description:
   When a task's dependencies are satisfied and a concurrency slot is available,
   it automatically starts the task.
 
-  With --auto-ingest-ez4ielts enabled, Ralph also watches for brand new
-  ez4ielts-*.json PRDs, skips the existing backlog on startup, and queues each
-  new PRD only once.
+  With --auto-ingest-ez4ielts enabled, Ralph watches for ez4ielts-*.json PRDs.
+  By default it skips the existing backlog on startup and queues new PRDs only
+  once. Add --ingest-existing-ez4ielts to explicitly queue the current backlog.
   
   Ralph now auto-starts queued tasks when running tasks finish, fail, stop,
   or transition into ready_to_finalize and complete via the restricted finalizer.
@@ -206,6 +212,7 @@ Description:
     agent: options.agent,
     backend: options.backend,
     autoIngestEz4ielts: options.disableAutoIngestEz4ielts ? false : options.autoIngestEz4ielts,
+    ingestExistingEz4ielts: options.ingestExistingEz4ielts,
     ez4ieltsDir: options.ez4ieltsDir,
   }));
 
@@ -218,6 +225,7 @@ program
   .option('--backend <name>', `Backend to use for auto-ingested tasks (cli|agent-runners, default: ${DEFAULT_BACKEND})`)
   .option('--auto-ingest-ez4ielts', 'Auto-enqueue new ez4ielts-*.json files discovered by the manager')
   .option('--disable-auto-ingest-ez4ielts', 'Disable configured ez4ielts auto-ingestion for this manager run')
+  .option('--ingest-existing-ez4ielts', 'Queue existing matching PRD files on startup instead of only watching new files')
   .option('--ez4ielts-dir <path>', 'Directory to scan for ez4ielts-*.json files')
   .addHelpText('after', `
 Examples:
@@ -234,6 +242,7 @@ Description:
     agent: options.agent,
     backend: options.backend,
     autoIngestEz4ielts: options.disableAutoIngestEz4ielts ? false : options.autoIngestEz4ielts,
+    ingestExistingEz4ielts: options.ingestExistingEz4ielts,
     ez4ieltsDir: options.ez4ieltsDir,
   }));
 
@@ -241,10 +250,12 @@ program
   .command('manager-status')
   .description('Show Ralph manager heartbeat, PID, loop timing, and stale status')
   .option('--stale-after-ms <ms>', 'Heartbeat age threshold used to mark the manager stale')
+  .option('--all', 'Include Ralph launchd manager claims from ~/Library/LaunchAgents')
   .addHelpText('after', `
 Examples:
   $ ralph manager-status
-  $ ralph manager-status --stale-after-ms 300000`)
+  $ ralph manager-status --stale-after-ms 300000
+  $ ralph manager-status --all`)
   .action(managerStatusCommand);
 
 program
@@ -252,12 +263,14 @@ program
   .description('Install a macOS launchd service that keeps the Ralph manager running')
   .option('--label <label>', 'launchd label')
   .option('--plist <path>', 'Path to write the launchd plist')
+  .option('--profile <name>', 'Manager install profile (ez4ielts-autonomous)')
   .option('--interval <ms>', 'Polling interval in milliseconds')
   .option('--repo <path>', 'Repository path for auto-ingested tasks')
   .option('--agent <name>', 'Agent to use (claude|codex)', DEFAULT_AGENT)
   .option('--backend <name>', `Backend to use (cli|agent-runners, default: ${DEFAULT_BACKEND})`)
   .option('--auto-ingest-ez4ielts', 'Auto-enqueue new ez4ielts-*.json files discovered by the manager')
   .option('--disable-auto-ingest-ez4ielts', 'Disable configured ez4ielts auto-ingestion for this launchd manager')
+  .option('--ingest-existing-ez4ielts', 'Queue existing matching PRD files on startup instead of only watching new files')
   .option('--ez4ielts-dir <path>', 'Directory to scan for ez4ielts-*.json files')
   .option('--load', 'Load and kickstart the launchd service after writing the plist')
   .option('--dry-run', 'Print the resolved launchd config without writing or loading it')
@@ -273,11 +286,13 @@ program
   .description('Unload and remove the macOS launchd service for the Ralph manager')
   .option('--label <label>', 'launchd label')
   .option('--plist <path>', 'Path to the launchd plist')
+  .option('--repo <path>', 'Unload/remove Ralph launchd services that claim this repository')
   .option('--dry-run', 'Print what would be removed without unloading or deleting')
   .addHelpText('after', `
 Examples:
   $ ralph manager-uninstall
-  $ ralph manager-uninstall --dry-run`)
+  $ ralph manager-uninstall --dry-run
+  $ ralph manager-uninstall --repo ~/Project/ez4ielts --dry-run`)
   .action(managerUninstallCommand);
 
 program
@@ -315,14 +330,81 @@ Examples:
   }));
 
 program
+  .command('watchdog')
+  .description('Continuously monitor Ralph managers and auto-restart stale or code-drifted launchd services')
+  .option('--interval <ms>', 'Polling interval in milliseconds', '30000')
+  .option('--stale-after-ms <ms>', 'Override the manager heartbeat stale threshold used in queue snapshots')
+  .option('--recent-completed-window-seconds <seconds>', 'Recent integrated task window for queue snapshots', '7200')
+  .option('--recent-completed-limit <count>', 'Maximum recent integrated tasks to include in queue snapshots', '5')
+  .option('--home-path <path>', 'Ralph home to monitor (repeatable); defaults to discovered launchd managers', collectRepeatedOption, [])
+  .option('--homes <paths>', 'Comma-separated Ralph homes to monitor')
+  .option('--log <path>', 'JSONL watchdog event log path')
+  .option('--once', 'Run one watchdog check and exit')
+  .option('--dry-run', 'Report restart actions without running launchctl')
+  .option('--no-restart-code-drift', 'Do not auto-restart managers whose loaded code is older than disk')
+  .option('--no-restart-stale', 'Do not auto-restart stale, down, or missing-state managers')
+  .addHelpText('after', `
+Examples:
+  $ ralph watchdog --once
+  $ ralph watchdog --home-path ~/.ralph --home-path ~/.ralph-ez4ielts
+  $ ralph watchdog --interval 30000
+
+Description:
+  The watchdog monitors every launchd Ralph manager it can discover.
+  It automatically kickstarts manager services when queue snapshots report
+  code drift ("older than current code"), stale heartbeats, down managers, or
+  missing manager state. Concrete queue actions such as blocked, awaiting
+  approval, policy-blocked, or diagnostics states are recorded to the JSONL
+  event log for higher-level repair workflows; the watchdog does not kill
+  active finalizers or blindly retry semantic task failures.`)
+  .action((options) => watchdogCommand(options));
+
+program
+  .command('watchdog-install')
+  .description('Install a macOS launchd service that keeps the Ralph watchdog running')
+  .option('--label <label>', 'launchd label')
+  .option('--plist <path>', 'Path to write the launchd plist')
+  .option('--interval <ms>', 'Polling interval in milliseconds', '30000')
+  .option('--stale-after-ms <ms>', 'Override the manager heartbeat stale threshold used in queue snapshots')
+  .option('--home-path <path>', 'Ralph home to monitor (repeatable); defaults to discovered launchd managers', collectRepeatedOption, [])
+  .option('--homes <paths>', 'Comma-separated Ralph homes to monitor')
+  .option('--log <path>', 'JSONL watchdog event log path')
+  .option('--load', 'Load and kickstart the launchd watchdog after writing the plist')
+  .option('--dry-run', 'Print the resolved launchd config without writing or loading it')
+  .option('--no-restart-code-drift', 'Do not auto-restart managers whose loaded code is older than disk')
+  .option('--no-restart-stale', 'Do not auto-restart stale, down, or missing-state managers')
+  .addHelpText('after', `
+Examples:
+  $ ralph watchdog-install --load
+  $ ralph watchdog-install --home-path ~/.ralph --home-path ~/.ralph-ez4ielts --load
+  $ ralph watchdog-install --dry-run`)
+  .action(watchdogInstallCommand);
+
+program
+  .command('watchdog-uninstall')
+  .description('Unload and remove the macOS launchd service for the Ralph watchdog')
+  .option('--label <label>', 'launchd label')
+  .option('--plist <path>', 'Path to the launchd plist')
+  .option('--dry-run', 'Print what would be removed without unloading or deleting')
+  .addHelpText('after', `
+Examples:
+  $ ralph watchdog-uninstall
+  $ ralph watchdog-uninstall --dry-run`)
+  .action(watchdogUninstallCommand);
+
+program
   .command('cleanup')
   .description('Remove old terminal task worktrees according to a retention window')
   .option('--older-than-hours <hours>', 'Only clean terminal tasks older than this many hours', '24')
+  .option('--include-orphans', 'Also reclaim unreferenced clean Ralph worktrees')
+  .option('--repo <path>', 'Repository path to scan for orphan worktrees')
+  .option('--max-removals <count>', 'Maximum number of worktrees to remove in this run')
   .option('--dry-run', 'Show cleanup candidates without removing worktrees')
   .addHelpText('after', `
 Examples:
   $ ralph cleanup --dry-run
-  $ ralph cleanup --older-than-hours 168`)
+  $ ralph cleanup --older-than-hours 168
+  $ ralph cleanup --include-orphans --repo ~/Project/myproject --dry-run`)
   .action(cleanupCommand);
 
 program

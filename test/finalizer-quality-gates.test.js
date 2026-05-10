@@ -1091,6 +1091,80 @@ test('finalizeTaskOutput refreshes Prisma client before root typecheck when sche
   }
 });
 
+test('finalizeTaskOutput refreshes Prisma client before root typecheck in clean worktrees', { concurrency: false }, () => {
+  const repoDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-finalizer-prisma-clean-prep-'));
+  const prdPath = path.join(repoDir, 'prd.json');
+
+  try {
+    git(['init'], repoDir);
+    git(['checkout', '-b', 'main'], repoDir);
+    git(['config', 'user.name', 'Ralph Test'], repoDir);
+    git(['config', 'user.email', 'ralph@example.com'], repoDir);
+
+    fs.writeFileSync(prdPath, JSON.stringify({
+      id: 'prd-prisma-clean-prep',
+      title: 'Prisma Clean Preparation Task',
+      description: 'Refresh generated Prisma artifacts before typecheck even when schema did not change',
+      userStories: [],
+      dependencies: [],
+    }, null, 2));
+
+    fs.writeFileSync(path.join(repoDir, 'package.json'), JSON.stringify({
+      name: 'workspace-fixture',
+      private: true,
+      workspaces: ['packages/*'],
+      scripts: {
+        typecheck: `node -e "const fs=require('fs'); if (!fs.existsSync('packages/db/generated-client.txt')) { throw new Error('missing generated client'); } fs.writeFileSync('typecheck.txt','ok')"`,
+      },
+    }, null, 2));
+    fs.mkdirSync(path.join(repoDir, 'packages', 'db', 'prisma'), { recursive: true });
+    fs.mkdirSync(path.join(repoDir, 'docs'), { recursive: true });
+    fs.writeFileSync(path.join(repoDir, 'packages', 'db', 'package.json'), JSON.stringify({
+      name: '@repo/db',
+      scripts: {
+        'db:generate:safe': `node -e "require('fs').writeFileSync('generated-client.txt','ok')"`,
+      },
+    }, null, 2));
+    fs.writeFileSync(path.join(repoDir, 'packages', 'db', 'prisma', 'schema.prisma'), 'model Example { id String @id }\n');
+    fs.writeFileSync(path.join(repoDir, 'docs', 'TODO.md'), 'base\n');
+    git(['add', '.'], repoDir);
+    git(['commit', '-m', 'feat: initial'], repoDir);
+
+    const worktreePath = path.join(repoDir, '.ralph-worktrees', 'task-prisma-clean-prep');
+    fs.mkdirSync(path.dirname(worktreePath), { recursive: true });
+    git(['worktree', 'add', '-b', 'ralph/task-prisma-clean-prep', worktreePath, 'main'], repoDir);
+
+    fs.appendFileSync(path.join(worktreePath, 'docs', 'TODO.md'), 'change\n');
+
+    const task = {
+      id: 'task-prisma-clean-prep',
+      prdPath,
+      status: 'ready_to_finalize',
+      startTime: Date.now(),
+      completedUS: [],
+      worktree: worktreePath,
+      logPath: path.join(repoDir, '.ralph', 'tasks', 'task-prisma-clean-prep', 'agent.log'),
+      agent: 'codex',
+      repoPath: repoDir,
+      loopCount: 0,
+      consecutiveNoProgress: 0,
+      consecutiveErrors: 0,
+      lastProgressTime: Date.now(),
+      lastFilesChanged: 1,
+    };
+
+    const result = finalizeTaskOutput(task);
+
+    assert.equal(result.success, true);
+    assert.equal(result.committed, true);
+    assert.equal(fs.existsSync(path.join(worktreePath, 'packages', 'db', 'generated-client.txt')), true);
+    assert.equal(fs.existsSync(path.join(worktreePath, 'typecheck.txt')), true);
+    assert.match(result.message, /typecheck/);
+  } finally {
+    fs.rmSync(repoDir, { recursive: true, force: true });
+  }
+});
+
 test('finalizeTaskOutput repairs missing workspace install symlinks before Prisma preparation', { concurrency: false }, () => {
   const repoDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-finalizer-prisma-bootstrap-'));
   const prdPath = path.join(repoDir, 'prd.json');

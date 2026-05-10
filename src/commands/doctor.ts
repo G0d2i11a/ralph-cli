@@ -7,6 +7,7 @@ import { evaluateRalphHomeIsolation } from '../core/home-isolation';
 import { resolveAutoIntegrate } from '../core/integration-policy';
 import { getManagerStatus } from '../core/manager-state';
 import { resolveRalphHome } from '../core/paths';
+import { detectDuplicateRepoManagers } from '../core/repo-manager-registry';
 import { StateManager } from '../core/state';
 import { resolveTaskIntegrationStatus } from '../core/task-delivery';
 import { summarizeActiveRepoPaths } from '../core/task-home-summary';
@@ -96,6 +97,7 @@ export async function doctorCommand(options: { repo?: string } = {}): Promise<vo
   const usesIntegrationWorktree = configManager.get('merge.useIntegrationWorktree') !== false;
   const autoIntegrate = resolveAutoIntegrate(configManager);
   const managerStatus = getManagerStatus({ ralphHome });
+  const duplicateManagers = detectDuplicateRepoManagers({ repoPath, currentRalphHome: ralphHome });
   const stateManager = new StateManager({ ralphHome });
   const tasks = await stateManager.listTasks();
   const repoSummary = summarizeActiveRepoPaths(tasks);
@@ -180,6 +182,15 @@ export async function doctorCommand(options: { repo?: string } = {}): Promise<vo
       message: managerStatus.message,
     },
     {
+      name: 'repo.manager.ownership',
+      ok: !duplicateManagers.duplicateRepoManagers,
+      message: duplicateManagers.duplicateRepoManagers
+        ? `repo is managed by multiple active Ralph homes: ${duplicateManagers.activeClaims.map((claim) => `${claim.ralphHome}${claim.pid ? ` pid=${claim.pid}` : ''}`).join(', ')}`
+        : duplicateManagers.activeClaims.length > 0
+          ? `repo manager ownership is singular: ${duplicateManagers.activeClaims[0].ralphHome}`
+          : 'no active Ralph manager claim found for this repo',
+    },
+    {
       name: 'ralph.home.repos',
       ok: homeIsolation.compatible,
       message: homeIsolation.reason === 'mixed_repos'
@@ -202,6 +213,7 @@ export async function doctorCommand(options: { repo?: string } = {}): Promise<vo
     backend,
     ...repoSummary,
     manager: managerStatus,
+    repoManagerOwnership: duplicateManagers,
     checks,
   }));
 

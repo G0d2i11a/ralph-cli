@@ -15,7 +15,7 @@ _ralph_completion() {
   local cur prev commands
   cur="\${COMP_WORDS[COMP_CWORD]}"
   prev="\${COMP_WORDS[COMP_CWORD-1]}"
-  commands="start batch-start status list stop merge finalize update retry reset-stagnation watch stats completion"
+  commands="start batch-start status list stop merge finalize update retry reset-stagnation watch watchdog watchdog-install watchdog-uninstall stats completion"
 
   case "\${prev}" in
     ralph)
@@ -59,7 +59,7 @@ _ralph_completion() {
 
   case "\${cur}" in
     -*)
-      local opts="--repo --agent --backend --status --auto --strategy --target --format --all --interval --auto-ingest-ez4ielts --ez4ielts-dir --story-id --passes --notes --detailed --help"
+      local opts="--repo --agent --backend --status --auto --strategy --target --format --all --interval --profile --auto-ingest-ez4ielts --ingest-existing-ez4ielts --ez4ielts-dir --story-id --passes --notes --detailed --home-path --homes --log --once --dry-run --load --no-restart-code-drift --no-restart-stale --help"
       COMPREPLY=( $(compgen -W "\${opts}" -- \${cur}) )
       return 0
       ;;
@@ -88,6 +88,9 @@ _ralph() {
     'retry:Retry a failed or stopped task'
     'reset-stagnation:Reset stagnation counters for a task'
     'watch:Poll the queue and optionally auto-ingest new PRDs'
+    'watchdog:Monitor Ralph managers and restart stale or code-drifted services'
+    'watchdog-install:Install the launchd watchdog service'
+    'watchdog-uninstall:Unload and remove the launchd watchdog service'
     'stats:Show performance statistics for a task'
     'completion:Generate shell completion script'
   )
@@ -151,7 +154,40 @@ _ralph() {
             '--agent[Agent to use for auto-ingested tasks]:agent:(claude codex)' \\
             '--backend[Backend to use for auto-ingested tasks]:backend:(cli agent-runners)' \\
             '--auto-ingest-ez4ielts[Auto-enqueue new ez4ielts PRDs]' \\
+            '--ingest-existing-ez4ielts[Queue existing matching PRD files on startup]' \\
             '--ez4ielts-dir[Directory to scan for ez4ielts PRDs]:directory:_directories'
+          ;;
+        watchdog)
+          _arguments \\
+            '--interval[Polling interval in milliseconds]:interval:' \\
+            '--stale-after-ms[Manager stale threshold]:milliseconds:' \\
+            '--home-path[Ralph home to monitor]:directory:_directories' \\
+            '--homes[Comma-separated Ralph homes]:paths:' \\
+            '--log[JSONL event log path]:file:_files' \\
+            '--once[Run one check and exit]' \\
+            '--dry-run[Report restart actions without launchctl]' \\
+            '--no-restart-code-drift[Disable code-drift restarts]' \\
+            '--no-restart-stale[Disable stale manager restarts]'
+          ;;
+        watchdog-install)
+          _arguments \\
+            '--label[launchd label]:label:' \\
+            '--plist[Path to write launchd plist]:file:_files' \\
+            '--interval[Polling interval in milliseconds]:interval:' \\
+            '--stale-after-ms[Manager stale threshold]:milliseconds:' \\
+            '--home-path[Ralph home to monitor]:directory:_directories' \\
+            '--homes[Comma-separated Ralph homes]:paths:' \\
+            '--log[JSONL event log path]:file:_files' \\
+            '--load[Load and kickstart after writing]' \\
+            '--dry-run[Print config without writing]' \\
+            '--no-restart-code-drift[Disable code-drift restarts]' \\
+            '--no-restart-stale[Disable stale manager restarts]'
+          ;;
+        watchdog-uninstall)
+          _arguments \\
+            '--label[launchd label]:label:' \\
+            '--plist[Path to launchd plist]:file:_files' \\
+            '--dry-run[Print removal plan only]'
           ;;
         completion)
           _arguments \\

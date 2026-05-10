@@ -3,6 +3,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
+const { createHash } = require('node:crypto');
 
 const { DEFAULT_AGENT, DEFAULT_BACKEND, resolveAgentType, resolveAgentBackend } = require('../dist/core/agent.js');
 const { PrdAutoIngestor } = require('../dist/core/prd-auto-ingest.js');
@@ -78,6 +79,10 @@ function createPrdFile(dir, name, overrides = {}) {
   return filePath;
 }
 
+function hashFile(filePath) {
+  return createHash('sha256').update(fs.readFileSync(filePath)).digest('hex');
+}
+
 test('default agent and backend resolve to codex/cli', () => {
   assert.equal(DEFAULT_AGENT, 'codex');
   assert.equal(DEFAULT_BACKEND, 'cli');
@@ -139,6 +144,101 @@ test('PrdAutoIngestor skips backlog, ingests new files once, and ignores later m
     assert.equal(secondResults.length, 0);
     assert.equal(tasksAfterModification.length, 1);
     assert.equal(scheduler.scheduleCalls, 1);
+  } finally {
+    process.env.HOME = previousHome;
+    fs.rmSync(watchDir, { recursive: true, force: true });
+  }
+});
+
+test('PrdAutoIngestor queues existing backlog only when explicitly enabled', async () => {
+  const watchDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-auto-ingest-existing-'));
+  const existingPrd = createPrdFile(watchDir, 'ez4ielts-existing.json', { id: 'existing-prd' });
+  const signatures = new Map([[existingPrd, 'existing-v1']]);
+  const stateManager = new FakeStateManager();
+  const scheduler = new FakeScheduler(stateManager);
+  const previousHome = process.env.HOME;
+  let now = 0;
+
+  try {
+    process.env.HOME = watchDir;
+
+    const ingestor = new PrdAutoIngestor({
+      watchDir,
+      repoPath: '/repo',
+      agent: 'codex',
+      settleMs: 1000,
+      ingestExistingOnStartup: true,
+    }, {
+      stateManager,
+      scheduler,
+      now: () => now,
+      statSignature: (filePath) => signatures.get(filePath) || 'missing',
+    });
+
+    await ingestor.initialize();
+    const results = await ingestor.scan();
+    const tasks = await stateManager.listTasks();
+
+    assert.equal(results.length, 1);
+    assert.equal(results[0].action, 'ingested');
+    assert.equal(path.basename(tasks[0].prdPath), 'ez4ielts-existing.json');
+    assert.equal(scheduler.scheduleCalls, 1);
+  } finally {
+    process.env.HOME = previousHome;
+    fs.rmSync(watchDir, { recursive: true, force: true });
+  }
+});
+
+test('PrdAutoIngestor treats existing completed PRDs with matching source hash as already tracked', async () => {
+  const watchDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-auto-ingest-existing-dedupe-'));
+  const existingPrd = createPrdFile(watchDir, 'ez4ielts-existing.json', { id: 'existing-prd' });
+  const signatures = new Map([[existingPrd, 'existing-v1']]);
+  const stateManager = new FakeStateManager([{
+    id: 'completed-task',
+    prdPath: path.join(watchDir, 'archived-copy.json'),
+    prdId: 'archived-copy',
+    prdSourceHash: hashFile(existingPrd),
+    status: 'completed',
+    startTime: 1,
+    completedUS: ['US-001'],
+    worktree: '/tmp/worktree',
+    logPath: '/tmp/task.log',
+    agent: 'codex',
+    repoPath: '/repo',
+    loopCount: 0,
+    consecutiveNoProgress: 0,
+    consecutiveErrors: 0,
+    lastProgressTime: 1,
+    lastFilesChanged: 0,
+  }]);
+  const scheduler = new FakeScheduler(stateManager);
+  const previousHome = process.env.HOME;
+
+  try {
+    process.env.HOME = watchDir;
+
+    const ingestor = new PrdAutoIngestor({
+      watchDir,
+      repoPath: '/repo',
+      agent: 'codex',
+      settleMs: 1000,
+      ingestExistingOnStartup: true,
+    }, {
+      stateManager,
+      scheduler,
+      now: () => 0,
+      statSignature: (filePath) => signatures.get(filePath) || 'missing',
+    });
+
+    await ingestor.initialize();
+    const results = await ingestor.scan();
+    const tasks = await stateManager.listTasks();
+
+    assert.equal(results.length, 1);
+    assert.equal(results[0].action, 'already-tracked');
+    assert.equal(results[0].taskId, 'completed-task');
+    assert.equal(tasks.length, 1);
+    assert.equal(scheduler.scheduleCalls, 0);
   } finally {
     process.env.HOME = previousHome;
     fs.rmSync(watchDir, { recursive: true, force: true });

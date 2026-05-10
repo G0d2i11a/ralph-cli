@@ -11,6 +11,7 @@ import {
   TaskCoordinationStatus,
 } from '../types/task';
 import { resolveTaskIntegrationStatus } from './task-delivery';
+import { resolveTaskRecoveryKind } from './auto-recovery-state';
 
 export interface TaskCoordinationState {
   status: TaskCoordinationStatus;
@@ -136,6 +137,27 @@ function compareTaskOrder(left: Pick<Task, 'id' | 'enqueuedAt' | 'startTime'>, r
 }
 
 function taskBlocksCoordination(task: Task): boolean {
+  if (
+    resolveTaskIntegrationStatus(task) === 'integrated'
+    && !hasHotConflictReservation(task)
+  ) {
+    return false;
+  }
+
+  if (
+    (
+      task.baselineRepair?.repairTaskId === task.id
+      || task.prdId?.startsWith('baseline-quality-gate:')
+      || task.prdPath?.split(path.sep).includes('baseline-repairs')
+    )
+    && (
+      task.baselineRepair?.status === 'superseded'
+      || Boolean(task.baselineRepair?.supersededByRepairTaskId)
+    )
+  ) {
+    return false;
+  }
+
   if (!BLOCKING_COORDINATION_STATUSES.has(task.status)) {
     return (task.status === 'failed' || task.status === 'stagnant')
       ? hasHotConflictReservation(task)
@@ -147,6 +169,150 @@ function taskBlocksCoordination(task: Task): boolean {
   }
 
   return true;
+}
+
+function isBaselineRepairTask(task: Task): boolean {
+  return Boolean(
+    task.baselineRepair?.repairTaskId === task.id
+    || task.prdId?.startsWith('baseline-quality-gate:')
+    || task.prdPath?.split(path.sep).includes('baseline-repairs')
+  );
+}
+
+function isSupersededBaselineRepairTask(task: Task): boolean {
+  return isBaselineRepairTask(task)
+    && (
+      task.baselineRepair?.status === 'superseded'
+      || Boolean(task.baselineRepair?.supersededByRepairTaskId)
+    );
+}
+
+function isGeneratedFollowupTask(task: Task): boolean {
+  return Boolean(
+    task.prdId?.startsWith('followup:')
+    || task.prdPath?.split(path.sep).includes('generated-prds')
+  );
+}
+
+function shouldBypassCandidateForGeneratedFollowup(task: Task, candidate: Task): boolean {
+  if (candidate.status === 'running' || candidate.status === 'finalizing') {
+    return false;
+  }
+
+  if (candidate.followupTaskIds?.includes(task.id)) {
+    return true;
+  }
+
+  return Boolean(
+    isGeneratedFollowupTask(task)
+    && candidate.followupTaskIds?.length
+    && !hasHotConflictReservation(candidate)
+  );
+}
+
+function shouldBypassCandidateForBaselineRepair(
+  task: Task,
+  candidate: Task,
+  phase: TaskCoordinationPhase,
+  candidates: Task[] = [],
+): boolean {
+  if (!isBaselineRepairTask(task)) {
+    return false;
+  }
+
+  if (isSupersededBaselineRepairTask(candidate)) {
+    return true;
+  }
+
+  const baselineRepair = task.baselineRepair;
+  if (!baselineRepair) {
+    return false;
+  }
+
+  if (candidate.status === 'running' || candidate.status === 'finalizing') {
+    return false;
+  }
+
+  if (baselineRepair.demandTaskIds?.includes(candidate.id)) {
+    return true;
+  }
+
+  const demandTaskIds = new Set(baselineRepair.demandTaskIds || []);
+  if (
+    candidate.status === 'failed_finalize'
+    && isBaselineRepairTask(candidate)
+    && baselineRepairWaitChainReachesDemand(candidate, demandTaskIds, candidates)
+  ) {
+    return true;
+  }
+
+  if (isBaselineRepairTask(candidate)) {
+    return false;
+  }
+
+  if (
+    (
+      resolveTaskRecoveryKind(candidate) === 'baseline_repair'
+      || resolveTaskRecoveryKind(candidate) === 'baseline_exhaustion'
+      || resolveTaskRecoveryKind(candidate) === 'baseline_supersession_migration'
+    )
+    && candidate.baselineQualityGate?.repairTaskId === task.id
+  ) {
+    return true;
+  }
+
+  if (
+    baselineRepair.repairKey
+    && candidate.baselineQualityGate?.repairKey === baselineRepair.repairKey
+  ) {
+    return true;
+  }
+
+  // Baseline repair is a barrier task. Non-running ordinary overlap in the same
+  // cohort must wait for the shared baseline repair, not block it.
+  return phase === 'start' || phase === 'finalize';
+}
+
+function baselineRepairWaitChainReachesDemand(
+  candidate: Task,
+  demandTaskIds: Set<string>,
+  candidates: Task[],
+): boolean {
+  if (demandTaskIds.size === 0) {
+    return false;
+  }
+
+  const byId = new Map(candidates.map((task) => [task.id, task]));
+  const visited = new Set<string>();
+  const pending = [candidate.id];
+
+  while (pending.length > 0) {
+    const taskId = pending.shift();
+    if (!taskId || visited.has(taskId)) {
+      continue;
+    }
+    visited.add(taskId);
+
+    if (demandTaskIds.has(taskId)) {
+      return true;
+    }
+
+    const current = byId.get(taskId);
+    if (!current || !isBaselineRepairTask(current)) {
+      continue;
+    }
+
+    for (const nextTaskId of [
+      current.baselineQualityGate?.repairTaskId,
+      current.baselineRepair?.repairTaskId,
+    ]) {
+      if (nextTaskId && nextTaskId !== current.id && !visited.has(nextTaskId)) {
+        pending.push(nextTaskId);
+      }
+    }
+  }
+
+  return false;
 }
 
 function isPrefixPath(prefix: string, candidate: string): boolean {
@@ -421,6 +587,14 @@ export function findCoordinationBlockers(
     }
 
     if (!taskBlocksCoordination(candidate)) {
+      continue;
+    }
+
+    if (shouldBypassCandidateForBaselineRepair(task, candidate, phase, candidates)) {
+      continue;
+    }
+
+    if (shouldBypassCandidateForGeneratedFollowup(task, candidate)) {
       continue;
     }
 

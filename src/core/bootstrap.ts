@@ -2,6 +2,7 @@ import { execFileSync, spawnSync } from 'child_process';
 import * as fs from 'fs';
 import * as path from 'path';
 import { resolveWorkspacePackageDirs } from './workspaces';
+import { buildRalphToolchainEnv } from './toolchain-env';
 
 export type PackageManager = 'pnpm' | 'yarn' | 'bun' | 'npm';
 
@@ -9,11 +10,14 @@ export interface BootstrapResult {
   bootstrapped: boolean;
   packageManager: PackageManager | null;
   installRoot: string | null;
+  needsInstall: boolean;
+  installReason?: BootstrapInstallReason;
   message: string;
 }
 
 export interface BootstrapOptions {
   repoPath?: string;
+  ralphHome?: string;
   logPath?: string;
   commandRunner?: CommandRunner;
   logger?: BootstrapLogger;
@@ -34,8 +38,13 @@ interface BootstrapInspection {
   installRoot: string | null;
   packageManager: PackageManager | null;
   needsInstall: boolean;
+  installReason?: BootstrapInstallReason;
   reason: string;
 }
+
+export type BootstrapInstallReason =
+  | 'missing_artifacts'
+  | 'next_turbopack_requires_local_install';
 
 export interface CommandResult {
   status: number | null;
@@ -228,6 +237,226 @@ function hasDependencyEntries(manifest: PackageManifest | null): boolean {
   return Array.isArray(bundled) && bundled.length > 0;
 }
 
+function hasDependency(manifest: PackageManifest | null, packageName: string): boolean {
+  return Boolean(
+    manifest?.dependencies?.[packageName]
+    || manifest?.devDependencies?.[packageName]
+    || manifest?.optionalDependencies?.[packageName]
+  );
+}
+
+function isInsidePath(parent: string, candidate: string): boolean {
+  const relative = path.relative(path.resolve(parent), path.resolve(candidate));
+  return relative === '' || (!relative.startsWith('..') && !path.isAbsolute(relative));
+}
+
+function shouldSkipWorkspaceNodeModulesReuse(workspaceDir: string): string | null {
+  const manifest = readManifest(workspaceDir);
+  if (hasDependency(manifest, 'next')) {
+    return 'Next/Turbopack rejects workspace node_modules symlinks that point outside the project root';
+  }
+
+  return null;
+}
+
+function hasNextDependencyInWorkspaceTree(installRoot: string, manifest: PackageManifest | null): boolean {
+  if (hasDependency(manifest, 'next')) {
+    return true;
+  }
+
+  return resolveWorkspacePackageDirs(installRoot, manifest).some((workspaceDir) =>
+    hasDependency(readManifest(workspaceDir), 'next')
+  );
+}
+
+function resolveSymlinkTarget(targetPath: string): string | null {
+  try {
+    return fs.realpathSync.native(targetPath);
+  } catch {
+    try {
+      return path.resolve(path.dirname(targetPath), fs.readlinkSync(targetPath));
+    } catch {
+      return null;
+    }
+  }
+}
+
+function isSymlinkToOutside(targetPath: string, rootPath: string): boolean {
+  if (!fs.existsSync(targetPath)) {
+    return false;
+  }
+
+  let stats: fs.Stats;
+  try {
+    stats = fs.lstatSync(targetPath);
+  } catch {
+    return false;
+  }
+
+  if (!stats.isSymbolicLink()) {
+    return false;
+  }
+
+  const resolvedTarget = resolveSymlinkTarget(targetPath);
+  return !resolvedTarget || !isInsidePath(rootPath, resolvedTarget);
+}
+
+function hasExternalSymlinkEntry(nodeModulesPath: string, rootPath: string): boolean {
+  if (!fs.existsSync(nodeModulesPath)) {
+    return false;
+  }
+
+  let stats: fs.Stats;
+  try {
+    stats = fs.lstatSync(nodeModulesPath);
+  } catch {
+    return false;
+  }
+
+  if (stats.isSymbolicLink()) {
+    return isSymlinkToOutside(nodeModulesPath, rootPath);
+  }
+
+  if (!stats.isDirectory()) {
+    return false;
+  }
+
+  let entries: fs.Dirent[];
+  try {
+    entries = fs.readdirSync(nodeModulesPath, { withFileTypes: true });
+  } catch {
+    return false;
+  }
+
+  const directDependencyPaths: string[] = [];
+  for (const entry of entries) {
+    if (entry.name === '.bin' || entry.name === '.cache' || entry.name === '.pnpm') {
+      continue;
+    }
+
+    const entryPath = path.join(nodeModulesPath, entry.name);
+    if (entry.name.startsWith('@') && entry.isDirectory()) {
+      try {
+        for (const scopedEntry of fs.readdirSync(entryPath, { withFileTypes: true })) {
+          directDependencyPaths.push(path.join(entryPath, scopedEntry.name));
+        }
+      } catch {
+        // Ignore malformed scoped directories; a local install will recreate them if needed.
+      }
+      continue;
+    }
+
+    directDependencyPaths.push(entryPath);
+  }
+
+  return directDependencyPaths.some((entryPath) => isSymlinkToOutside(entryPath, rootPath));
+}
+
+function getNextWorkspaceDirs(installRoot: string, manifest: PackageManifest | null): string[] {
+  const dirs: string[] = [];
+
+  if (hasDependency(manifest, 'next')) {
+    dirs.push(installRoot);
+  }
+
+  for (const workspaceDir of resolveWorkspacePackageDirs(installRoot, manifest)) {
+    if (hasDependency(readManifest(workspaceDir), 'next')) {
+      dirs.push(workspaceDir);
+    }
+  }
+
+  return uniqueDirs(dirs);
+}
+
+function resolveNextTurbopackLocalInstallReason(
+  installRoot: string,
+  manifest: PackageManifest | null,
+): string | null {
+  if (!hasNextDependencyInWorkspaceTree(installRoot, manifest)) {
+    return null;
+  }
+
+  const rootNodeModulesPath = path.join(installRoot, 'node_modules');
+  if (isSymlinkToOutside(rootNodeModulesPath, installRoot)) {
+    return 'Next/Turbopack requires worktree-local node_modules; root node_modules points outside the worktree';
+  }
+
+  for (const workspaceDir of getNextWorkspaceDirs(installRoot, manifest)) {
+    const relativeWorkspace = path.relative(installRoot, workspaceDir) || path.basename(installRoot);
+    const workspaceNodeModulesPath = path.join(workspaceDir, 'node_modules');
+    if (!fs.existsSync(workspaceNodeModulesPath)) {
+      return `Next/Turbopack requires local install artifacts for ${relativeWorkspace}`;
+    }
+
+    if (hasExternalSymlinkEntry(workspaceNodeModulesPath, installRoot)) {
+      return `Next/Turbopack requires worktree-local dependency symlinks for ${relativeWorkspace}`;
+    }
+  }
+
+  for (const workspaceDir of resolveWorkspacePackageDirs(installRoot, manifest)) {
+    const workspaceManifest = readManifest(workspaceDir);
+    const workspaceNodeModulesPath = path.join(workspaceDir, 'node_modules');
+    if (
+      !fs.existsSync(workspaceNodeModulesPath) &&
+      hasDependencyEntries(workspaceManifest)
+    ) {
+      const relativeWorkspace = path.relative(installRoot, workspaceDir) || path.basename(installRoot);
+      return `Next/Turbopack requires local install artifacts for ${relativeWorkspace}`;
+    }
+
+    if (
+      isSymlinkToOutside(workspaceNodeModulesPath, installRoot) ||
+      hasExternalSymlinkEntry(workspaceNodeModulesPath, installRoot)
+    ) {
+      const relativeWorkspace = path.relative(installRoot, workspaceDir) || path.basename(installRoot);
+      return `Next/Turbopack requires worktree-local dependency symlinks for ${relativeWorkspace}`;
+    }
+  }
+
+  return null;
+}
+
+function cleanupNextTurbopackInstallArtifacts(
+  installRoot: string,
+  manifest: PackageManifest | null,
+  logger: BootstrapLogger,
+): void {
+  if (!hasNextDependencyInWorkspaceTree(installRoot, manifest)) {
+    return;
+  }
+
+  const rootNodeModulesPath = path.join(installRoot, 'node_modules');
+  if (isSymlinkToOutside(rootNodeModulesPath, installRoot)) {
+    logger('Removed root node_modules symlink because Next/Turbopack requires worktree-local dependencies');
+    removePathIfExists(rootNodeModulesPath);
+  }
+
+  for (const workspaceDir of resolveWorkspacePackageDirs(installRoot, manifest)) {
+    const workspaceNodeModulesPath = path.join(workspaceDir, 'node_modules');
+    if (!fs.existsSync(workspaceNodeModulesPath)) {
+      continue;
+    }
+
+    const removedSymlink = removeSymlinkIfPresent(workspaceNodeModulesPath);
+    const hasUnsafeEntries = !removedSymlink && hasExternalSymlinkEntry(workspaceNodeModulesPath, installRoot);
+    if (removedSymlink || hasUnsafeEntries) {
+      logger(`Removed ${path.relative(installRoot, workspaceNodeModulesPath)} because Next/Turbopack dependency symlinks point outside the worktree`);
+      removePathIfExists(workspaceNodeModulesPath);
+    }
+  }
+}
+
+function shouldSkipRepoNodeModulesReuse(
+  worktreeInstallRoot: string,
+  manifest: PackageManifest | null,
+): string | null {
+  if (hasNextDependencyInWorkspaceTree(worktreeInstallRoot, manifest)) {
+    return 'Next/Turbopack requires worktree-local install artifacts and rejects repo-external pnpm symlinks';
+  }
+
+  return null;
+}
+
 function projectNeedsInstall(dir: string, manifest: PackageManifest | null): boolean {
   return hasDependencyEntries(manifest) || hasWorkspaceConfig(dir, manifest);
 }
@@ -293,6 +522,20 @@ function removePathIfExists(targetPath: string): void {
   fs.rmSync(targetPath, { recursive: true, force: true });
 }
 
+function removeSymlinkIfPresent(targetPath: string): boolean {
+  if (!fs.existsSync(targetPath)) {
+    return false;
+  }
+
+  const stats = fs.lstatSync(targetPath);
+  if (!stats.isSymbolicLink()) {
+    return false;
+  }
+
+  removePathIfExists(targetPath);
+  return true;
+}
+
 function createDirSymlink(targetPath: string, linkPath: string): void {
   const symlinkType: fs.symlink.Type = process.platform === 'win32' ? 'junction' : 'dir';
   fs.symlinkSync(targetPath, linkPath, symlinkType);
@@ -328,6 +571,15 @@ function maybeReuseWorkspaceInstallArtifacts(
     }
 
     const worktreeNodeModulesPath = path.join(worktreeWorkspaceDir, 'node_modules');
+    const skipReuseReason = shouldSkipWorkspaceNodeModulesReuse(worktreeWorkspaceDir);
+    if (skipReuseReason) {
+      logger(`Skipped workspace install artifact reuse for ${relativePath}: ${skipReuseReason}`);
+      if (removeSymlinkIfPresent(worktreeNodeModulesPath)) {
+        logger(`Removed existing workspace node_modules symlink for ${relativePath}: ${skipReuseReason}`);
+      }
+      continue;
+    }
+
     try {
       if (fs.existsSync(worktreeNodeModulesPath)) {
         const existingStats = fs.lstatSync(worktreeNodeModulesPath);
@@ -381,6 +633,21 @@ function maybeReuseRepoInstallArtifacts(
     return null;
   }
 
+  const worktreeManifest = readManifest(resolvedWorktreeInstallRoot);
+  const skipRepoReuseReason = shouldSkipRepoNodeModulesReuse(
+    resolvedWorktreeInstallRoot,
+    worktreeManifest,
+  );
+  if (skipRepoReuseReason) {
+    logger(`Skipped repo install artifact reuse for ${resolvedWorktreeInstallRoot}: ${skipRepoReuseReason}`);
+    cleanupNextTurbopackInstallArtifacts(
+      resolvedWorktreeInstallRoot,
+      worktreeManifest,
+      logger,
+    );
+    return null;
+  }
+
   const repoNodeModulesPath = path.join(resolvedRepoInstallRoot, 'node_modules');
   if (!fs.existsSync(repoNodeModulesPath)) {
     return null;
@@ -428,12 +695,18 @@ function maybeReuseRepoInstallArtifacts(
 function defaultCommandRunner(
   command: string,
   args: string[],
-  cwd: string
+  cwd: string,
+  ralphHome?: string,
 ): CommandResult {
+  const { env } = buildRalphToolchainEnv({
+    baseEnv: { ...process.env, CI: '1' },
+    installRoot: cwd,
+    ralphHome: ralphHome ?? process.env.RALPH_HOME,
+  });
   const result = spawnSync(command, args, {
     cwd,
     encoding: 'utf-8',
-    env: { ...process.env, CI: '1' },
+    env,
     stdio: ['ignore', 'pipe', 'pipe'],
     timeout: 5 * 60 * 1000,
   });
@@ -555,11 +828,26 @@ function inspectBootstrap(
     };
   }
 
+  const nextTurbopackLocalInstallReason = resolveNextTurbopackLocalInstallReason(
+    installRoot,
+    installManifest,
+  );
+  if (nextTurbopackLocalInstallReason) {
+    return {
+      installRoot,
+      packageManager,
+      needsInstall: true,
+      installReason: 'next_turbopack_requires_local_install',
+      reason: nextTurbopackLocalInstallReason,
+    };
+  }
+
   if (!hasInstallArtifacts(installRoot, packageManager)) {
     return {
       installRoot,
       packageManager,
       needsInstall: true,
+      installReason: 'missing_artifacts',
       reason: `Missing local install artifacts in ${installRoot}`,
     };
   }
@@ -701,6 +989,8 @@ export function bootstrapWorktreeDeps(
       bootstrapped: false,
       packageManager: inspection.packageManager,
       installRoot: inspection.installRoot,
+      needsInstall: false,
+      installReason: inspection.installReason,
       message: inspection.reason,
     };
   }
@@ -710,18 +1000,28 @@ export function bootstrapWorktreeDeps(
       bootstrapped: false,
       packageManager: inspection.packageManager,
       installRoot: inspection.installRoot,
+      needsInstall: true,
+      installReason: inspection.installReason,
       message: `Dependency install skipped: ${inspection.reason}`,
     };
   }
+
+  cleanupNextTurbopackInstallArtifacts(
+    inspection.installRoot,
+    readManifest(inspection.installRoot),
+    logger,
+  );
 
   logger(
     `Installing dependencies with ${inspection.packageManager} from ${inspection.installRoot}`,
   );
   try {
+    const commandRunner = options.commandRunner
+      ?? ((command, args, cwd) => defaultCommandRunner(command, args, cwd, options.ralphHome));
     runInstall(
       inspection.packageManager,
       inspection.installRoot,
-      options.commandRunner ?? defaultCommandRunner,
+      commandRunner,
       logger
     );
   } catch (error) {
@@ -739,6 +1039,8 @@ export function bootstrapWorktreeDeps(
     bootstrapped: true,
     packageManager: inspection.packageManager,
     installRoot: inspection.installRoot,
+    needsInstall: false,
+    installReason: inspection.installReason,
     message: `Dependencies installed with ${inspection.packageManager}`,
   };
 }

@@ -3,6 +3,7 @@ const RESERVED_GIT_INTERNAL_ROOTS = [
   '.git-local',
   '.git-local-admin',
   '.git-local-objects',
+  '.ralph-cache',
   '.ralph-integration-probe',
 ];
 

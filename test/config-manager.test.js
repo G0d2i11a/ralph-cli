@@ -56,6 +56,10 @@ test('ConfigManager ignores legacy notification config blocks', withTempHome(asy
 test('ConfigManager defaults agent.backend to cli', withTempHome(async () => {
   const { ConfigManager } = require('../dist/config/manager.js');
   const { resolveConfiguredBackend } = require('../dist/core/agent.js');
+  const {
+    resolveAutonomyRepairConfig,
+    resolveTransientRecoveryConfig,
+  } = require('../dist/core/auto-recovery-policy.js');
   const manager = new ConfigManager();
 
   assert.equal(manager.get('agent.backend'), 'cli');
@@ -81,11 +85,113 @@ test('ConfigManager defaults agent.backend to cli', withTempHome(async () => {
   assert.equal(manager.get('runner.transientRecoveryMaxDelaySeconds'), 900);
   assert.equal(manager.get('runner.transientRecoveryDeadlineSeconds'), 7200);
   assert.equal(manager.get('runner.maxTransientRecoverySameSignature'), 3);
+  assert.equal(manager.get('runner.transientRecoveryProgressAwareSameSignature'), true);
   assert.equal(manager.get('runner.autoRecoveryHardCap'), 20);
   assert.equal(manager.get('runner.autoRemediateFailedBlockers'), true);
   assert.equal(manager.get('runner.maxFailedBlockerStoryRequeues'), 1);
   assert.equal(manager.get('runner.failedBlockerRecoveryDeadlineSeconds'), 7200);
   assert.equal(manager.get('runner.failedBlockerRecoveryHardCap'), 2);
+  assert.equal(manager.get('runner.autoRemediateStoryFailures'), true);
+  assert.equal(manager.get('runner.maxStoryRepairRequeues'), 1);
+  assert.equal(manager.get('runner.storyRepairRecoveryDeadlineSeconds'), 7200);
+  assert.equal(manager.get('runner.storyRepairRecoveryHardCap'), 2);
+  assert.equal(manager.get('runner.autoRemediateAgentContextFailures'), true);
+  assert.equal(manager.get('runner.maxAgentContextRecoveryRequeues'), 1);
+  assert.equal(manager.get('runner.agentContextRecoveryDeadlineSeconds'), 7200);
+  assert.equal(manager.get('runner.agentContextRecoveryHardCap'), 2);
+  assert.equal(manager.get('runner.autoClassifyBaselineQualityGateFailures'), true);
+  assert.equal(manager.get('runner.autoRemediateBaselineQualityGateFailures'), true);
+  assert.equal(manager.get('runner.baselineQualityGateRepairHardCap'), 3);
+  assert.equal(manager.get('runner.baselineQualityGateEnvSelfHealEnabled'), true);
+  assert.equal(manager.get('runner.baselineQualityGateEnvSelfHealMaxAttempts'), 3);
+  assert.equal(manager.get('runner.baselineQualityGateProbeMaxAttempts'), 2);
+  assert.equal(manager.get('runner.baselineQualityGateRepairDeadlineSeconds'), 21600);
+  assert.equal(manager.get('runner.baselineQualityGateMaxSameSignatureNoProgress'), 2);
+  assert.equal(manager.get('runner.baselineQualityGateTreatProbeBufferOverflowAsProbeFailure'), true);
+  assert.equal(manager.get('runner.autoRecoverBlockedTasks'), true);
+  assert.equal(manager.get('runner.autonomyRepairDeadlineSeconds'), 86400);
+  assert.equal(manager.get('runner.autonomyRepairHardCap'), 10);
+  assert.equal(manager.get('runner.autonomyRepairCooldownBaseSeconds'), 60);
+  assert.equal(manager.get('runner.autonomyRepairCooldownMaxSeconds'), 1800);
+  assert.equal(manager.get('runner.deadlockAutoUnblockEnabled'), true);
+  assert.equal(manager.get('runner.deadlockAutoUnblockRequiresObservedDisjointSurface'), true);
+  assert.deepEqual(manager.get('runner.worktreeCleanupLockGlobs'), ['**/.next/lock', '**/.next.stale-build*/lock']);
+  assert.equal(manager.get('reclamation.enabled'), true);
+  assert.equal(manager.get('reclamation.intervalSeconds'), 900);
+  assert.equal(manager.get('reclamation.startupDelaySeconds'), 30);
+  assert.equal(manager.get('reclamation.maxRunSeconds'), 30);
+  assert.equal(manager.get('reclamation.worktrees.enabled'), true);
+  assert.equal(manager.get('reclamation.worktrees.completedRetentionHours'), 24);
+  assert.equal(manager.get('reclamation.worktrees.failedRetentionHours'), 168);
+  assert.equal(manager.get('reclamation.worktrees.cleanupOrphans'), true);
+  assert.equal(manager.get('reclamation.worktrees.keepNewestPerRepo'), 5);
+  assert.equal(manager.get('reclamation.worktrees.maxRemovalsPerRun'), 25);
+  assert.equal(manager.get('reclamation.worktrees.removeDirtyFailedWorktrees'), false);
+  assert.equal(manager.get('reclamation.worktrees.dirtyFailedRetentionHours'), 336);
+  assert.equal(manager.get('reclamation.worktrees.pruneGitWorktreeMetadata'), true);
+  assert.equal(manager.get('reclamation.tempDirs.enabled'), true);
+  assert.deepEqual(manager.get('reclamation.tempDirs.roots'), ['/private/tmp']);
+  assert.equal(manager.get('reclamation.reporting.logJsonl'), true);
+  assert.equal(manager.get('reclamation.reporting.writeLastRun'), true);
+  assert.equal(manager.get('ingestion.ez4ielts.enabled'), false);
+  assert.equal(manager.get('ingestion.ez4ielts.ingestExistingOnStartup'), false);
+  assert.equal(resolveTransientRecoveryConfig(manager).transientRecoveryProgressAwareSameSignature, true);
+  assert.deepEqual(resolveAutonomyRepairConfig(manager), {
+    autoRecoverBlockedTasks: true,
+    autonomyRepairDeadlineSeconds: 86400,
+    autonomyRepairHardCap: 10,
+    autonomyRepairCooldownBaseSeconds: 60,
+    autonomyRepairCooldownMaxSeconds: 1800,
+  });
+}));
+
+test('resolveAutonomyRepairConfig reads autonomy repair keys', withTempHome(async (homeDir) => {
+  const configDir = path.join(homeDir, '.ralph');
+  fs.mkdirSync(configDir, { recursive: true });
+  fs.writeFileSync(
+    path.join(configDir, 'config.json'),
+    JSON.stringify({
+      runner: {
+        autoRecoverBlockedTasks: true,
+        autonomyRepairDeadlineSeconds: 900,
+        autonomyRepairHardCap: 8,
+        autonomyRepairCooldownBaseSeconds: 30,
+        autonomyRepairCooldownMaxSeconds: 300,
+      },
+    }, null, 2),
+  );
+
+  const { ConfigManager } = require('../dist/config/manager.js');
+  const { resolveAutonomyRepairConfig } = require('../dist/core/auto-recovery-policy.js');
+  const manager = new ConfigManager();
+
+  assert.deepEqual(resolveAutonomyRepairConfig(manager), {
+    autoRecoverBlockedTasks: true,
+    autonomyRepairDeadlineSeconds: 900,
+    autonomyRepairHardCap: 8,
+    autonomyRepairCooldownBaseSeconds: 30,
+    autonomyRepairCooldownMaxSeconds: 300,
+  });
+}));
+
+test('ConfigManager can disable progress-aware transient same-signature recovery', withTempHome(async (homeDir) => {
+  const configDir = path.join(homeDir, '.ralph');
+  fs.mkdirSync(configDir, { recursive: true });
+  fs.writeFileSync(
+    path.join(configDir, 'config.json'),
+    JSON.stringify({
+      runner: {
+        transientRecoveryProgressAwareSameSignature: false,
+      },
+    }, null, 2),
+  );
+
+  const { ConfigManager } = require('../dist/config/manager.js');
+  const { resolveTransientRecoveryConfig } = require('../dist/core/auto-recovery-policy.js');
+  const manager = new ConfigManager();
+
+  assert.equal(manager.get('runner.transientRecoveryProgressAwareSameSignature'), false);
+  assert.equal(resolveTransientRecoveryConfig(manager).transientRecoveryProgressAwareSameSignature, false);
 }));
 
 test('ConfigManager uses RALPH_HOME without appending an extra .ralph segment', withTempHome(async (homeDir) => {

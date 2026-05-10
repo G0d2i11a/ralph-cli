@@ -4,6 +4,7 @@ import * as os from 'os';
 import * as path from 'path';
 import { ConfigManager } from '../config/manager';
 import { UserStory } from '../types/prd';
+import { listWorktreeProcessCandidatePids } from './worktree-process-cleanup';
 
 export type AgentType = 'claude' | 'codex';
 export type AgentBackend = 'cli' | 'agent-runners';
@@ -25,8 +26,33 @@ const AGENT_RUNNERS_ENV = 'RALPH_AGENT_RUNNERS_CLI';
 const LEGACY_SDK_RUNNER_ENV = 'RALPH_SDK_RUNNER_CLI';
 const OPENCLAW_HOME_ENV = 'OPENCLAW_HOME';
 const FORCE_KILL_GRACE_MS = 5000;
+const DEFAULT_LONG_RUNNING_COMMAND_PATTERNS = ['next build', 'pnpm run build', 'npm run build', 'yarn build', 'turbo build', 'tsc'];
 
 type AgentConfig = Pick<ConfigManager, 'get'> & Partial<Pick<ConfigManager, 'has'>>;
+
+function isIgnorableKillError(error: unknown): boolean {
+  const code = (error as NodeJS.ErrnoException).code;
+  return code === 'ESRCH' || code === 'EPERM' || code === 'EINVAL';
+}
+
+function signalChildProcessTree(child: ChildProcess | undefined, signal: NodeJS.Signals): void {
+  if (!child) {
+    return;
+  }
+
+  if (process.platform !== 'win32' && typeof child.pid === 'number') {
+    try {
+      process.kill(-child.pid, signal);
+      return;
+    } catch (error) {
+      if (!isIgnorableKillError(error)) {
+        throw error;
+      }
+    }
+  }
+
+  child.kill(signal);
+}
 
 export function isAgentType(value: string): value is AgentType {
   return value === 'claude' || value === 'codex';
@@ -156,6 +182,43 @@ function resolveAgentTimeoutMs(config: Pick<ConfigManager, 'get'>): number {
   return configuredTimeout * 1000;
 }
 
+function resolveLongRunningIdleExtensionEnabled(config: Pick<ConfigManager, 'get'>): boolean {
+  const rawValue = config.get('agent.extendIdleTimeoutForLongRunningCommands');
+
+  if (typeof rawValue === 'boolean') {
+    return rawValue;
+  }
+
+  if (typeof rawValue === 'string') {
+    const normalized = rawValue.trim().toLowerCase();
+    if (['false', '0', 'no', 'off'].includes(normalized)) {
+      return false;
+    }
+    if (['true', '1', 'yes', 'on'].includes(normalized)) {
+      return true;
+    }
+  }
+
+  return true;
+}
+
+function resolveLongRunningCommandPatterns(config: Pick<ConfigManager, 'get'>): string[] {
+  const rawValue = config.get('agent.longRunningCommandPatterns');
+  const values = Array.isArray(rawValue)
+    ? rawValue
+    : typeof rawValue === 'string'
+      ? rawValue.split(',')
+      : DEFAULT_LONG_RUNNING_COMMAND_PATTERNS;
+
+  const patterns = [...new Set(
+    values
+      .map((value) => typeof value === 'string' ? value.trim() : '')
+      .filter(Boolean)
+  )];
+
+  return patterns.length > 0 ? patterns : DEFAULT_LONG_RUNNING_COMMAND_PATTERNS;
+}
+
 function resolveWorktreeGitEnv(worktreePath: string): Partial<NodeJS.ProcessEnv> {
   const localGitDir = path.join(worktreePath, '.git-local');
 
@@ -167,6 +230,73 @@ function resolveWorktreeGitEnv(worktreePath: string): Partial<NodeJS.ProcessEnv>
     GIT_DIR: localGitDir,
     GIT_WORK_TREE: worktreePath,
   };
+}
+
+function resolveWorktreeToolEnv(worktreePath: string): Partial<NodeJS.ProcessEnv> {
+  const cacheHome = path.join(worktreePath, '.ralph-cache');
+  const prismaCache = path.join(cacheHome, 'prisma');
+  fs.mkdirSync(prismaCache, { recursive: true });
+
+  return {
+    XDG_CACHE_HOME: cacheHome,
+    PRISMA_ENGINES_CACHE_DIR: prismaCache,
+    PRISMA_HIDE_UPDATE_MESSAGE: 'true',
+  };
+}
+
+function isPathInside(childPath: string, parentPath: string): boolean {
+  const relative = path.relative(parentPath, childPath);
+  return relative === '' || (!relative.startsWith('..') && !path.isAbsolute(relative));
+}
+
+function parseGitdirFile(gitFilePath: string): string | null {
+  if (!fs.existsSync(gitFilePath) || !fs.statSync(gitFilePath).isFile()) {
+    return null;
+  }
+
+  const content = fs.readFileSync(gitFilePath, 'utf8').trim();
+  const match = content.match(/^gitdir:\s*(.+)$/i);
+
+  if (!match) {
+    return null;
+  }
+
+  const gitDir = match[1].trim();
+  return path.resolve(path.dirname(gitFilePath), gitDir);
+}
+
+function resolveCommonGitDir(gitDir: string): string {
+  const commonDirPath = path.join(gitDir, 'commondir');
+
+  if (!fs.existsSync(commonDirPath) || !fs.statSync(commonDirPath).isFile()) {
+    return gitDir;
+  }
+
+  const commonDir = fs.readFileSync(commonDirPath, 'utf8').trim();
+  return path.resolve(gitDir, commonDir);
+}
+
+export function resolveCodexWritableDirs(worktreePath: string): string[] {
+  const localGitDir = path.join(worktreePath, '.git-local');
+
+  if (fs.existsSync(localGitDir) && fs.statSync(localGitDir).isDirectory()) {
+    return [];
+  }
+
+  const worktreeGitPath = path.join(worktreePath, '.git');
+  const linkedGitDir = parseGitdirFile(worktreeGitPath);
+
+  if (!linkedGitDir) {
+    return [];
+  }
+
+  const commonGitDir = resolveCommonGitDir(linkedGitDir);
+
+  if (isPathInside(commonGitDir, worktreePath)) {
+    return [];
+  }
+
+  return [commonGitDir];
 }
 
 export function resolveCodexCliCommand(config: Pick<ConfigManager, 'get'>): string {
@@ -236,6 +366,18 @@ Do not commit your changes. Instead, leave the worktree ready for a separate fin
 `.trim();
   }
 
+  private addWorktreeGuard(prompt: string, worktreePath: string): string {
+    return `
+${prompt}
+
+## Ralph Worktree Boundary
+You are running inside this Ralph task worktree:
+${worktreePath}
+
+Treat this path as the only editable project checkout for the task. Do not edit the source repository checkout, other Ralph worktrees, or any sibling project directory. If another checkout appears to already contain a fix, reproduce the minimal relevant fix in this current worktree and validate it here. Ralph will only accept objective diff or commit evidence from this worktree.
+`.trim();
+  }
+
   private async execAgent(
     agent: AgentType,
     prompt: string,
@@ -247,6 +389,8 @@ Do not commit your changes. Instead, leave the worktree ready for a separate fin
     return new Promise((resolve, reject) => {
       let command: string;
       let args: string[];
+
+      const guardedPrompt = this.addWorktreeGuard(prompt, worktreePath);
 
       if (backend === 'agent-runners') {
         let agentRunnersCli: string;
@@ -261,7 +405,7 @@ Do not commit your changes. Instead, leave the worktree ready for a separate fin
         args = [
           agentRunnersCli,
           agent,
-          '--prompt', prompt,
+          '--prompt', guardedPrompt,
           '--cwd', worktreePath,
           '--log', logPath,
         ];
@@ -283,7 +427,7 @@ Do not commit your changes. Instead, leave the worktree ready for a separate fin
         command = 'claude';
         args = [
           '-p',
-          prompt,
+          guardedPrompt,
           '--model',
           model,
           '--dangerously-skip-permissions',
@@ -292,7 +436,17 @@ Do not commit your changes. Instead, leave the worktree ready for a separate fin
         ];
       } else {
         command = resolveCodexCliCommand(this.config);
-        args = ['exec', prompt, '--full-auto'];
+        const writableDirs = resolveCodexWritableDirs(worktreePath);
+        if (writableDirs.length > 0) {
+          // Linked worktree merges write objects/index state outside the worktree root.
+          // Keep the task sandbox bounded to the worktree plus explicit git metadata.
+          args = ['exec', guardedPrompt, '--sandbox', 'workspace-write', '--cd', worktreePath];
+        } else {
+          args = ['exec', guardedPrompt, '--full-auto', '--cd', worktreePath];
+        }
+        for (const writableDir of writableDirs) {
+          args.push('--add-dir', writableDir);
+        }
       }
 
       const logDir = path.dirname(logPath);
@@ -314,6 +468,7 @@ Do not commit your changes. Instead, leave the worktree ready for a separate fin
         ...process.env,
         CI: 'true',
         TERM: 'dumb',
+        ...resolveWorktreeToolEnv(worktreePath),
         ...resolveWorktreeGitEnv(worktreePath),
       };
 
@@ -321,7 +476,9 @@ Do not commit your changes. Instead, leave the worktree ready for a separate fin
         env.OPENAI_API_KEY = process.env.LITELLM_MASTER_KEY;
       }
 
-      const timeoutMs = resolveAgentTimeoutMs(this.config);
+      const idleTimeoutMs = resolveAgentTimeoutMs(this.config);
+      const extendIdleTimeoutForLongRunningCommands = resolveLongRunningIdleExtensionEnabled(this.config);
+      const longRunningCommandPatterns = resolveLongRunningCommandPatterns(this.config);
       let output = '';
       let capturedSessionId: string | undefined;
       let capturedThreadId: string | undefined;
@@ -341,10 +498,55 @@ Do not commit your changes. Instead, leave the worktree ready for a separate fin
         }
       };
 
+      const armIdleTimeout = () => {
+        if (idleTimeoutMs <= 0 || settled || timedOut) {
+          return;
+        }
+
+        if (timeoutHandle) {
+          clearTimeout(timeoutHandle);
+        }
+
+        timeoutHandle = setTimeout(() => {
+          const timeoutSeconds = idleTimeoutMs / 1000;
+          const formattedTimeout = Number.isInteger(timeoutSeconds)
+            ? String(timeoutSeconds)
+            : timeoutSeconds.toFixed(2).replace(/0+$/, '').replace(/\.$/, '');
+          const activeLongRunningPids = extendIdleTimeoutForLongRunningCommands
+            ? listWorktreeProcessCandidatePids(worktreePath, longRunningCommandPatterns)
+            : [];
+
+          if (activeLongRunningPids.length > 0) {
+            const extensionMessage = `[Agent] Idle timeout reached after ${formattedTimeout}s without output, but long-running command is active in the worktree (pids: ${activeLongRunningPids.join(', ')}); extending wait`;
+            output += `\n${extensionMessage}\n`;
+            console.error(extensionMessage);
+            this.logStream?.write(`\n${extensionMessage}\n`);
+            armIdleTimeout();
+            return;
+          }
+
+          timedOut = true;
+          const timeoutMessage = `[Agent] Timed out after ${formattedTimeout}s without output; sending SIGTERM`;
+          output += `\n${timeoutMessage}\n`;
+          console.error(timeoutMessage);
+          this.logStream?.write(`\n${timeoutMessage}\n`);
+          signalChildProcessTree(this.process, 'SIGTERM');
+
+          forceKillHandle = setTimeout(() => {
+            const killMessage = '[Agent] Process did not exit after SIGTERM; sending SIGKILL';
+            output += `\n${killMessage}\n`;
+            console.error(killMessage);
+            this.logStream?.write(`\n${killMessage}\n`);
+            signalChildProcessTree(this.process, 'SIGKILL');
+          }, FORCE_KILL_GRACE_MS);
+        }, idleTimeoutMs);
+      };
+
       this.process = spawn(command, args, {
         cwd: worktreePath,
         stdio: ['ignore', 'pipe', 'pipe'],
-        env
+        env,
+        detached: process.platform !== 'win32',
       });
 
       const finish = (result: AgentRunResult) => {
@@ -357,30 +559,10 @@ Do not commit your changes. Instead, leave the worktree ready for a separate fin
         resolve(result);
       };
 
-      if (timeoutMs > 0) {
-        timeoutHandle = setTimeout(() => {
-          timedOut = true;
-          const timeoutSeconds = timeoutMs / 1000;
-          const formattedTimeout = Number.isInteger(timeoutSeconds)
-            ? String(timeoutSeconds)
-            : timeoutSeconds.toFixed(2).replace(/0+$/, '').replace(/\.$/, '');
-          const timeoutMessage = `[Agent] Timed out after ${formattedTimeout}s; sending SIGTERM`;
-          output += `\n${timeoutMessage}\n`;
-          console.error(timeoutMessage);
-          this.logStream?.write(`\n${timeoutMessage}\n`);
-          this.process?.kill('SIGTERM');
-
-          forceKillHandle = setTimeout(() => {
-            const killMessage = '[Agent] Process did not exit after SIGTERM; sending SIGKILL';
-            output += `\n${killMessage}\n`;
-            console.error(killMessage);
-            this.logStream?.write(`\n${killMessage}\n`);
-            this.process?.kill('SIGKILL');
-          }, FORCE_KILL_GRACE_MS);
-        }, timeoutMs);
-      }
+      armIdleTimeout();
 
       this.process.stdout?.on('data', (data) => {
+        armIdleTimeout();
         const text = data.toString();
         output += text;
 
@@ -406,6 +588,7 @@ Do not commit your changes. Instead, leave the worktree ready for a separate fin
       });
 
       this.process.stderr?.on('data', (data) => {
+        armIdleTimeout();
         const text = data.toString();
         output += text;
         console.log(`[Agent] stderr: ${text}`);
@@ -461,7 +644,7 @@ Do not commit your changes. Instead, leave the worktree ready for a separate fin
 
   stop(): void {
     if (this.process) {
-      this.process.kill('SIGTERM');
+      signalChildProcessTree(this.process, 'SIGTERM');
     }
     if (this.logStream) {
       this.logStream.end();

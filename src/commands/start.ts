@@ -1,10 +1,15 @@
 import { enqueueTaskFromPrd } from '../core/task-intake';
+import { assertNoDuplicateRepoManagers } from '../core/repo-manager-registry';
 
 export async function startCommand(
   prdPath: string,
   options: { repo?: string; agent?: string; backend?: string; allowDuplicate?: boolean }
 ): Promise<void> {
   try {
+    assertNoDuplicateRepoManagers({
+      repoPath: options.repo || process.cwd(),
+      operation: 'start a Ralph task',
+    });
     const { taskId, latestTask, pendingState, alreadyExists } = await enqueueTaskFromPrd(prdPath, {
       repoPath: options.repo,
       agent: options.agent,

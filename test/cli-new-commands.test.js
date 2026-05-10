@@ -3,6 +3,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
+const { createHash } = require('node:crypto');
 const { spawnSync, execFileSync } = require('node:child_process');
 
 function runCli(args, env = {}) {
@@ -14,6 +15,10 @@ function runCli(args, env = {}) {
       ...env,
     },
   });
+}
+
+function hashFile(filePath) {
+  return createHash('sha256').update(fs.readFileSync(filePath)).digest('hex');
 }
 
 test('queue command reports active queue state', () => {
@@ -45,11 +50,61 @@ test('queue command reports active queue state', () => {
 
     assert.equal(result.status, 0, result.stderr);
     const output = JSON.parse(result.stdout);
+    assert.equal(output.schemaVersion, 2);
     assert.equal(output.tasks.length, 1);
     assert.equal(output.tasks[0].id, 'pending-task');
+    assert.equal(output.tasks[0].queueState.phase, 'queued');
+    assert.equal(output.tasks[0].queueState.detail, 'waiting_for_slot');
     assert.equal(output.tasks[0].nextAction, 'start when a concurrency slot is available');
     assert.equal(output.repoCount, 1);
     assert.equal(output.mixedRepos, false);
+  } finally {
+    fs.rmSync(homeDir, { recursive: true, force: true });
+  }
+});
+
+test('queue command does not count running tasks with stale recovery residue as active recovery', () => {
+  const homeDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-queue-running-recovery-residue-home-'));
+
+  try {
+    const taskDir = path.join(homeDir, '.ralph', 'tasks', 'running-task');
+    fs.mkdirSync(taskDir, { recursive: true });
+    fs.writeFileSync(path.join(taskDir, 'state.json'), JSON.stringify({
+      id: 'running-task',
+      prdPath: '/tmp/prd.json',
+      prdId: 'running-prd',
+      prdDependencies: [],
+      status: 'running',
+      startTime: Date.now(),
+      completedUS: [],
+      worktree: '/tmp/running-task',
+      logPath: path.join(taskDir, 'agent.log'),
+      agent: 'codex',
+      repoPath: '/tmp/repo',
+      autoRecoveryKind: 'stagnant',
+      autoRecoveryTotalRequeues: 14,
+      autoRecoveryLastReason: 'Automatically requeued after stagnation timeout',
+      loopCount: 0,
+      consecutiveNoProgress: 0,
+      consecutiveErrors: 0,
+      lastProgressTime: Date.now(),
+      lastFilesChanged: 0,
+    }, null, 2));
+
+    const result = runCli(['queue'], { HOME: homeDir });
+    const output = JSON.parse(result.stdout);
+    const task = output.tasks[0];
+
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(task.queueState.phase, 'running');
+    assert.equal(task.queueState.detail, 'worker_running');
+    assert.equal(task.autoRecovery.active, false);
+    assert.equal(task.autoRecovery.kind, 'stagnant');
+    assert.equal(task.autoRecovery.staleInvalidReason, 'task_running_not_waiting_for_recovery');
+    assert.equal(task.queueState.recovery.active, false);
+    assert.equal(output.summary.running, 1);
+    assert.equal(output.summary.autoRecoveryActive, 0);
+    assert.equal(output.summary.recoveryActive, 0);
   } finally {
     fs.rmSync(homeDir, { recursive: true, force: true });
   }
@@ -118,7 +173,7 @@ test('queue command reports coordination blockers for overlapping pending tasks'
   }
 });
 
-test('queue command marks pending tasks blocked by failed dependencies as attention', () => {
+test('queue command marks pending tasks blocked by failed dependencies as queue actions', () => {
   const homeDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-queue-failed-dep-home-'));
 
   try {
@@ -173,27 +228,31 @@ test('queue command marks pending tasks blocked by failed dependencies as attent
     const output = JSON.parse(result.stdout);
     const childTask = output.tasks.find((task) => task.id === 'blocked-child');
     const failedTask = output.tasks.find((task) => task.id === 'failed-dependency');
-    const childAttention = output.attention.find((task) => task.id === 'blocked-child');
+    const childAction = output.actions.find((task) => task.id === 'blocked-child');
 
     assert.equal(result.status, 0, result.stderr);
-    assert.equal(output.summary.totalAttention, 2);
+    assert.equal(output.schemaVersion, 2);
+    assert.equal(output.actions.length, 1);
+    assert.equal(output.summary.recovering, 1);
     assert.equal(output.summary.autoRecoveryActive, 0);
-    assert.equal(failedTask.attention.needed, true);
+    assert.equal(failedTask.queueState.phase, 'recovering');
+    assert.equal(failedTask.queueState.detail, 'auto_repairing_story');
     assert.equal(failedTask.autoRecovery.active, false);
     assert.equal(failedTask.autoRecovery.staleInvalidReason, 'semantic_story_incomplete_is_not_auto_recovering');
     assert.equal(childTask.reason, 'dependencies');
     assert.deepEqual(childTask.failedDependencies, ['dep-prd']);
     assert.deepEqual(childTask.recoveringDependencies, []);
-    assert.equal(childTask.attention.needed, true);
-    assert.equal(childTask.attention.reason, 'blocked_failed_dependency');
+    assert.equal(childTask.queueState.phase, 'blocked');
+    assert.equal(childTask.queueState.detail, 'blocked_by_dependency');
+    assert.equal(childTask.queueState.reason, 'blocked_failed_dependency');
     assert.match(childTask.nextAction, /blocked by failed dependencies: dep-prd/);
-    assert.deepEqual(childAttention.blockers, ['dep-prd']);
+    assert.deepEqual(childAction.blockers, ['dep-prd']);
   } finally {
     fs.rmSync(homeDir, { recursive: true, force: true });
   }
 });
 
-test('queue command marks pending tasks blocked by failed coordination owners as attention', () => {
+test('queue command marks pending tasks blocked by failed coordination owners as queue actions', () => {
   const homeDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-queue-failed-coordination-home-'));
 
   try {
@@ -255,17 +314,18 @@ test('queue command marks pending tasks blocked by failed coordination owners as
     const result = runCli(['queue'], { HOME: homeDir });
     const output = JSON.parse(result.stdout);
     const laterTask = output.tasks.find((task) => task.id === 'later-task');
-    const laterAttention = output.attention.find((task) => task.id === 'later-task');
+    const laterAction = output.actions.find((task) => task.id === 'later-task');
 
     assert.equal(result.status, 0, result.stderr);
-    assert.equal(output.summary.totalAttention, 2);
+    assert.equal(output.actions.length, 2);
     assert.equal(laterTask.reason, 'coordination');
     assert.deepEqual(laterTask.blockers, ['failed-owner']);
     assert.deepEqual(laterTask.failedBlockers, ['failed-owner']);
-    assert.equal(laterTask.attention.needed, true);
-    assert.equal(laterTask.attention.reason, 'blocked_failed_coordination');
+    assert.equal(laterTask.queueState.phase, 'blocked');
+    assert.equal(laterTask.queueState.detail, 'blocked_by_coordination');
+    assert.equal(laterTask.queueState.reason, 'blocked_failed_coordination');
     assert.match(laterTask.nextAction, /blocked by failed overlapping task/);
-    assert.deepEqual(laterAttention.blockers, ['failed-owner']);
+    assert.deepEqual(laterAction.blockers, ['failed-owner']);
   } finally {
     fs.rmSync(homeDir, { recursive: true, force: true });
   }
@@ -342,7 +402,237 @@ test('queue command includes completed tasks that still block integration', () =
     assert.equal(output.tasks.length, 1);
     assert.equal(output.tasks[0].id, 'completed-blocker');
     assert.equal(output.tasks[0].status, 'completed');
+    assert.equal(output.repoCount, 1);
+    assert.deepEqual(output.repoPaths, ['/tmp/repo']);
     assert.match(output.tasks[0].nextAction, /manager should integrate this completed task/i);
+  } finally {
+    fs.rmSync(homeDir, { recursive: true, force: true });
+  }
+});
+
+test('queue command reports completed integrated tasks with deferred target sync as delivery pending', () => {
+  const homeDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-queue-deferred-target-sync-home-'));
+
+  try {
+    const taskDir = path.join(homeDir, '.ralph', 'tasks', 'completed-deferred-sync');
+    fs.mkdirSync(taskDir, { recursive: true });
+    fs.writeFileSync(path.join(taskDir, 'state.json'), JSON.stringify({
+      id: 'completed-deferred-sync',
+      prdPath: '/tmp/prd.json',
+      prdId: 'completed-deferred-prd',
+      prdDependencies: [],
+      status: 'completed',
+      startTime: Date.now(),
+      completedUS: ['US-001'],
+      worktree: '/tmp/worktree',
+      logPath: path.join(taskDir, 'agent.log'),
+      agent: 'codex',
+      repoPath: '/tmp/repo',
+      integrationStatus: 'integrated',
+      integratedAt: Date.now(),
+      integrationCommitSha: 'abc123',
+      targetSyncStatus: 'deferred_dirty_checkout',
+      targetSyncDeferredReason: 'sync deferred because main has local edits',
+      loopCount: 0,
+      consecutiveNoProgress: 0,
+      consecutiveErrors: 0,
+      lastProgressTime: Date.now(),
+      lastFilesChanged: 0,
+    }, null, 2));
+
+    const result = runCli(['queue'], { HOME: homeDir });
+    const output = JSON.parse(result.stdout);
+
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(output.tasks.length, 1);
+    assert.equal(output.tasks[0].id, 'completed-deferred-sync');
+    assert.equal(output.tasks[0].queueState.phase, 'blocked');
+    assert.equal(output.tasks[0].queueState.detail, 'blocked_by_environment');
+    assert.equal(output.tasks[0].queueState.reason, 'target_sync_deferred_dirty_checkout');
+    assert.match(output.tasks[0].nextAction, /retry if target sync is enabled/);
+    assert.equal(output.summary.delivery.completedPendingTargetSync, 1);
+    assert.equal(output.summary.delivery.completedTargetSyncFailed, 0);
+    assert.equal(output.actions[0].reason, 'target_sync_deferred_dirty_checkout');
+  } finally {
+    fs.rmSync(homeDir, { recursive: true, force: true });
+  }
+});
+
+test('queue command marks target sync failures as environment blocks', () => {
+  const homeDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-queue-failed-target-sync-home-'));
+
+  try {
+    const taskDir = path.join(homeDir, '.ralph', 'tasks', 'completed-failed-sync');
+    fs.mkdirSync(taskDir, { recursive: true });
+    fs.writeFileSync(path.join(taskDir, 'state.json'), JSON.stringify({
+      id: 'completed-failed-sync',
+      prdPath: '/tmp/prd.json',
+      prdId: 'completed-failed-prd',
+      prdDependencies: [],
+      status: 'completed',
+      startTime: Date.now(),
+      completedUS: ['US-001'],
+      worktree: '/tmp/worktree',
+      logPath: path.join(taskDir, 'agent.log'),
+      agent: 'codex',
+      repoPath: '/tmp/repo',
+      integrationStatus: 'integrated',
+      integratedAt: Date.now(),
+      integrationCommitSha: 'abc123',
+      targetSyncStatus: 'failed',
+      targetSyncDeferredReason: 'target branch is not a fast-forward',
+      loopCount: 0,
+      consecutiveNoProgress: 0,
+      consecutiveErrors: 0,
+      lastProgressTime: Date.now(),
+      lastFilesChanged: 0,
+    }, null, 2));
+
+    const result = runCli(['queue', '--compact'], { HOME: homeDir });
+    const output = JSON.parse(result.stdout);
+
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(output.tasks.length, 1);
+    assert.equal(output.tasks[0].queueState.phase, 'blocked');
+    assert.equal(output.tasks[0].queueState.detail, 'blocked_by_environment');
+    assert.equal(output.tasks[0].queueState.reason, 'target_sync_failed');
+    assert.equal(output.summary.delivery.completedTargetSyncFailed, 1);
+    assert.match(output.tasks[0].nextAction, /target branch was not updated/);
+  } finally {
+    fs.rmSync(homeDir, { recursive: true, force: true });
+  }
+});
+
+test('queue command reports capacity and queued blocker buckets', () => {
+  const homeDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-queue-capacity-home-'));
+
+  try {
+    fs.mkdirSync(path.join(homeDir, '.ralph'), { recursive: true });
+    fs.writeFileSync(path.join(homeDir, '.ralph', 'config.json'), JSON.stringify({
+      runner: {
+        maxConcurrent: 2,
+      },
+    }, null, 2));
+
+    const runningTaskDir = path.join(homeDir, '.ralph', 'tasks', 'running-task');
+    const queuedTaskDir = path.join(homeDir, '.ralph', 'tasks', 'queued-task');
+    const blockedTaskDir = path.join(homeDir, '.ralph', 'tasks', 'blocked-task');
+    fs.mkdirSync(runningTaskDir, { recursive: true });
+    fs.mkdirSync(queuedTaskDir, { recursive: true });
+    fs.mkdirSync(blockedTaskDir, { recursive: true });
+
+    fs.writeFileSync(path.join(runningTaskDir, 'state.json'), JSON.stringify({
+      id: 'running-task',
+      prdPath: '/tmp/running.json',
+      prdId: 'running-prd',
+      prdDependencies: [],
+      status: 'running',
+      pid: process.pid,
+      startTime: 1,
+      completedUS: [],
+      currentUS: 'US-001',
+      worktree: '/tmp/running',
+      logPath: path.join(runningTaskDir, 'agent.log'),
+      agent: 'codex',
+      repoPath: '/tmp/repo',
+      loopCount: 0,
+      consecutiveNoProgress: 0,
+      consecutiveErrors: 0,
+      lastProgressTime: 1,
+      lastFilesChanged: 0,
+    }, null, 2));
+    fs.writeFileSync(path.join(queuedTaskDir, 'state.json'), JSON.stringify({
+      id: 'queued-task',
+      prdPath: '/tmp/queued.json',
+      prdId: 'queued-prd',
+      prdDependencies: [],
+      status: 'pending',
+      startTime: 2,
+      completedUS: [],
+      worktree: '',
+      logPath: path.join(queuedTaskDir, 'agent.log'),
+      agent: 'codex',
+      repoPath: '/tmp/repo',
+      loopCount: 0,
+      consecutiveNoProgress: 0,
+      consecutiveErrors: 0,
+      lastProgressTime: 2,
+      lastFilesChanged: 0,
+    }, null, 2));
+    fs.writeFileSync(path.join(blockedTaskDir, 'state.json'), JSON.stringify({
+      id: 'blocked-task',
+      prdPath: '/tmp/blocked.json',
+      prdId: 'blocked-prd',
+      prdDependencies: ['missing-prd'],
+      status: 'pending',
+      startTime: 3,
+      completedUS: [],
+      worktree: '',
+      logPath: path.join(blockedTaskDir, 'agent.log'),
+      agent: 'codex',
+      repoPath: '/tmp/repo',
+      loopCount: 0,
+      consecutiveNoProgress: 0,
+      consecutiveErrors: 0,
+      lastProgressTime: 3,
+      lastFilesChanged: 0,
+    }, null, 2));
+
+    const result = runCli(['queue'], { HOME: homeDir });
+    const output = JSON.parse(result.stdout);
+
+    assert.equal(result.status, 0, result.stderr);
+    assert.deepEqual(output.summary.capacity, {
+      maxConcurrent: 2,
+      running: 1,
+      available: 1,
+      queuedRunnable: 1,
+      queuedBlockedByDependencies: 1,
+      queuedBlockedByCoordination: 0,
+    });
+  } finally {
+    fs.rmSync(homeDir, { recursive: true, force: true });
+  }
+});
+
+test('queue command reports repo paths for auto-recovering failed tasks', () => {
+  const homeDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-queue-recovering-failed-home-'));
+
+  try {
+    const taskDir = path.join(homeDir, '.ralph', 'tasks', 'recovering-failed');
+    fs.mkdirSync(taskDir, { recursive: true });
+    fs.writeFileSync(path.join(taskDir, 'state.json'), JSON.stringify({
+      id: 'recovering-failed',
+      prdPath: '/tmp/prd.json',
+      prdId: 'recovering-prd',
+      prdDependencies: [],
+      status: 'failed',
+      startTime: Date.now(),
+      completedUS: [],
+      worktree: '/tmp/worktree',
+      logPath: path.join(taskDir, 'agent.log'),
+      agent: 'codex',
+      repoPath: '/tmp/recovering-repo',
+      autoRecoveryKind: 'transient',
+      autoRecoveryNextEligibleAt: Date.now() + 60_000,
+      lastErrorRetryable: true,
+      loopCount: 0,
+      consecutiveNoProgress: 0,
+      consecutiveErrors: 0,
+      lastProgressTime: Date.now(),
+      lastFilesChanged: 0,
+    }, null, 2));
+
+    const result = runCli(['queue'], { HOME: homeDir });
+    const output = JSON.parse(result.stdout);
+
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(output.tasks.length, 1);
+    assert.equal(output.tasks[0].id, 'recovering-failed');
+    assert.equal(output.tasks[0].queueState.phase, 'recovering');
+    assert.equal(output.tasks[0].queueState.detail, 'retrying_transient');
+    assert.equal(output.repoCount, 1);
+    assert.deepEqual(output.repoPaths, ['/tmp/recovering-repo']);
   } finally {
     fs.rmSync(homeDir, { recursive: true, force: true });
   }
@@ -399,9 +689,84 @@ test('queue command includes manager state and aggregate summary in one snapshot
     assert.equal(output.manager.state.pid, process.pid);
     assert.equal(output.summary.totalActive, 1);
     assert.equal(output.summary.byStatus.running, 1);
-    assert.ok(Array.isArray(output.attention));
+    assert.ok(Array.isArray(output.actions));
   } finally {
     fs.rmSync(homeDir, { recursive: true, force: true });
+  }
+});
+
+test('queue command reports not-ingested and changed PRD inventory', () => {
+  const homeDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-queue-prd-inventory-home-'));
+  const watchDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-queue-prd-inventory-watch-'));
+
+  try {
+    const changedPrdPath = path.join(watchDir, 'ez4ielts-changed.json');
+    const notIngestedPrdPath = path.join(watchDir, 'ez4ielts-new.json');
+    fs.writeFileSync(changedPrdPath, JSON.stringify({
+      id: 'changed-prd',
+      title: 'Changed PRD',
+      description: 'changed since enqueue',
+      userStories: [],
+    }, null, 2));
+    fs.writeFileSync(notIngestedPrdPath, JSON.stringify({
+      id: 'new-prd',
+      title: 'New PRD',
+      description: 'not ingested',
+      userStories: [],
+    }, null, 2));
+
+    fs.mkdirSync(path.join(homeDir, '.ralph'), { recursive: true });
+    fs.writeFileSync(path.join(homeDir, '.ralph', 'config.json'), JSON.stringify({
+      ingestion: {
+        ez4ielts: {
+          enabled: true,
+          watchDir,
+          pattern: 'ez4ielts-*.json',
+        },
+      },
+    }, null, 2));
+
+    const taskDir = path.join(homeDir, '.ralph', 'tasks', 'changed-task');
+    fs.mkdirSync(taskDir, { recursive: true });
+    fs.writeFileSync(path.join(taskDir, 'state.json'), JSON.stringify({
+      id: 'changed-task',
+      prdPath: changedPrdPath,
+      prdId: 'changed-prd',
+      prdTitle: 'Changed PRD',
+      prdSourceHash: `${hashFile(changedPrdPath)}-old`,
+      prdDependencies: [],
+      status: 'completed',
+      startTime: Date.now(),
+      completedUS: ['US-001'],
+      worktree: '/tmp/worktree',
+      logPath: path.join(taskDir, 'agent.log'),
+      agent: 'codex',
+      repoPath: '/tmp/repo',
+      integrationStatus: 'integrated',
+      loopCount: 0,
+      consecutiveNoProgress: 0,
+      consecutiveErrors: 0,
+      lastProgressTime: Date.now(),
+      lastFilesChanged: 0,
+    }, null, 2));
+
+    const result = runCli(['queue'], { HOME: homeDir });
+    const output = JSON.parse(result.stdout);
+    const statuses = Object.fromEntries(output.prdInventory.items.map((item) => [path.basename(item.path), item.status]));
+
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(output.ingestion.configuredEnabled, true);
+    assert.equal(output.ingestion.watchDir, watchDir);
+    assert.equal(output.ingestion.notIngestedCount, 1);
+    assert.equal(output.ingestion.changedSinceIngestedCount, 1);
+    assert.equal(output.prdInventory.enabled, true);
+    assert.equal(output.prdInventory.totalFiles, 2);
+    assert.equal(statuses['ez4ielts-changed.json'], 'changed_since_ingested');
+    assert.equal(statuses['ez4ielts-new.json'], 'not_ingested');
+    assert.match(output.ingestion.nextAction, /changed PRD files/);
+  } finally {
+    fs.rmSync(homeDir, { recursive: true, force: true });
+    fs.rmSync(watchDir, { recursive: true, force: true });
   }
 });
 
@@ -499,7 +864,7 @@ test('queue command compact mode trims heavy task payload fields', () => {
   }
 });
 
-test('queue command suppresses attention for auto-recovering merge repairs already resolved for finalize', () => {
+test('queue command suppresses action items for auto-recovering merge repairs already resolved for finalize', () => {
   const homeDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-queue-resolved-merge-repair-home-'));
 
   try {
@@ -530,9 +895,9 @@ test('queue command suppresses attention for auto-recovering merge repairs alrea
     const output = JSON.parse(result.stdout);
 
     assert.equal(result.status, 0, result.stderr);
-    assert.equal(output.summary.totalAttention, 0);
+    assert.equal(output.actions.length, 0);
     assert.equal(output.tasks.length, 1);
-    assert.equal(output.tasks[0].attention.needed, false);
+    assert.equal(output.tasks[0].queueState.phase, 'finalizing');
   } finally {
     fs.rmSync(homeDir, { recursive: true, force: true });
   }
@@ -597,6 +962,7 @@ test('queue command includes recent integrated tasks within the configured windo
 
     assert.equal(result.status, 0, result.stderr);
     assert.equal(output.summary.recentCompletedCount, 1);
+    assert.equal(output.summary.totalCompletedCount, 2);
     assert.equal(output.recentCompleted.length, 1);
     assert.equal(output.recentCompleted[0].id, 'recent-completed');
   } finally {
@@ -1133,7 +1499,8 @@ test('manager-install dry-run resolves launchd manager config without writing pl
       repoDir,
       '--interval',
       '12345',
-      '--disable-auto-ingest-ez4ielts',
+      '--auto-ingest-ez4ielts',
+      '--ingest-existing-ez4ielts',
     ], { HOME: homeDir });
     const output = JSON.parse(result.stdout);
 
@@ -1142,6 +1509,7 @@ test('manager-install dry-run resolves launchd manager config without writing pl
     assert.equal(output.loaded, false);
     assert.equal(output.label, 'com.test.ralph.manager');
     assert.equal(output.plistPath, plistPath);
+    assert.equal(output.workingDirectory, repoDir);
     assert.deepEqual(output.managerArgs.slice(0, 5), [
       'manager',
       '--interval',
@@ -1149,7 +1517,8 @@ test('manager-install dry-run resolves launchd manager config without writing pl
       '--repo',
       repoDir,
     ]);
-    assert.ok(output.managerArgs.includes('--disable-auto-ingest-ez4ielts'));
+    assert.ok(output.managerArgs.includes('--auto-ingest-ez4ielts'));
+    assert.ok(output.managerArgs.includes('--ingest-existing-ez4ielts'));
     assert.equal(fs.existsSync(plistPath), false);
   } finally {
     fs.rmSync(homeDir, { recursive: true, force: true });

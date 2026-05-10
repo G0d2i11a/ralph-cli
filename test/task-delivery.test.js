@@ -52,6 +52,70 @@ test('delivery status surfaces inconsistent explicit failure with integration ma
   assert.equal(delivery.integrationInconsistent, true);
 });
 
+test('auto recovery state suppresses stale recovery on integrated completed tasks', () => {
+  const recovery = buildAutoRecoveryState({
+    status: 'completed',
+    integrationStatus: 'integrated',
+    integratedAt: 100,
+    autoRecoveryKind: 'baseline_repair',
+    autoRecoveryLastReason: 'Waiting for baseline repair task old-repair',
+  });
+
+  assert.equal(recovery.active, false);
+  assert.equal(recovery.kind, 'baseline_repair');
+  assert.equal(recovery.staleInvalidReason, 'completed_integrated_task');
+});
+
+test('auto recovery state suppresses stale recovery while task is running', () => {
+  const recovery = buildAutoRecoveryState({
+    status: 'running',
+    autoRecoveryKind: 'stagnant',
+    autoRecoveryTotalRequeues: 14,
+    autoRecoveryLastReason: 'Automatically requeued after stagnation timeout',
+  });
+
+  assert.equal(recovery.active, false);
+  assert.equal(recovery.kind, 'stagnant');
+  assert.equal(recovery.totalRequeues, 14);
+  assert.equal(recovery.staleInvalidReason, 'task_running_not_waiting_for_recovery');
+});
+
+test('auto recovery state exposes autonomy repair as active recovery', () => {
+  const recovery = buildAutoRecoveryState({
+    status: 'failed_finalize',
+    autoRecoveryKind: undefined,
+    autonomyRepairKind: 'baseline_exhaustion',
+    autonomyRepairStartedAt: 10,
+    autonomyRepairDeadlineAt: 1000,
+    autonomyRepairTotalRequeues: 1,
+    autonomyRepairLastSignature: 'test|apps/web|quality_gate_failure',
+    autonomyRepairLastProgressReason: 'reclassifying current finalizer failure',
+    autonomyRepairLastRequeuedAt: 20,
+    autonomyRepairLastReason: 'Baseline repair exhausted; reclassifying',
+    lastErrorKind: 'quality_gate_failure',
+    lastErrorRetryable: false,
+  });
+
+  assert.equal(recovery.active, true);
+  assert.equal(recovery.kind, 'baseline_exhaustion');
+  assert.equal(recovery.reason, 'autonomy_repair');
+  assert.equal(recovery.totalRequeues, 1);
+  assert.equal(recovery.autonomyRepair.kind, 'baseline_exhaustion');
+  assert.equal(recovery.autonomyRepair.startedAt, new Date(10).toISOString());
+});
+
+test('auto recovery state preserves recovery for blocked completed integration', () => {
+  const recovery = buildAutoRecoveryState({
+    status: 'completed',
+    integrationStatus: 'blocked_conflict',
+    autoRecoveryKind: 'merge_repair',
+    autoRecoveryLastReason: 'Merge repair can resolve integration conflicts',
+  });
+
+  assert.equal(recovery.active, true);
+  assert.equal(recovery.kind, 'merge_repair');
+});
+
 test('auto recovery state exposes typed stopped fields at top level', () => {
   const recovery = buildAutoRecoveryState({
     autoRecoveryKind: 'merge_repair',

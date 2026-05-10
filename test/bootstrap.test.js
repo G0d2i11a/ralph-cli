@@ -145,15 +145,15 @@ test('bootstrapWorktreeDeps reuses workspace-level node_modules from repo artifa
   fs.mkdirSync(path.join(repoPath, 'node_modules', '.bin'), { recursive: true });
   fs.mkdirSync(path.join(repoPath, 'apps', 'web', 'node_modules', '.bin'), { recursive: true });
   writeJson(path.join(repoPath, 'apps', 'web', 'package.json'), {
-    scripts: { build: 'next build' },
-    dependencies: { next: '^15.0.0' },
+    scripts: { build: 'vite build' },
+    dependencies: { vite: '^6.0.0' },
   });
 
   writeJson(path.join(worktreePath, 'package.json'), manifest);
   writeFile(path.join(worktreePath, 'package-lock.json'));
   writeJson(path.join(worktreePath, 'apps', 'web', 'package.json'), {
-    scripts: { build: 'next build' },
-    dependencies: { next: '^15.0.0' },
+    scripts: { build: 'vite build' },
+    dependencies: { vite: '^6.0.0' },
   });
   fs.mkdirSync(path.join(worktreePath, 'apps', 'web', 'node_modules', 'next'), { recursive: true });
 
@@ -168,6 +168,127 @@ test('bootstrapWorktreeDeps reuses workspace-level node_modules from repo artifa
   assert.equal(
     fs.realpathSync.native(path.join(worktreePath, 'apps', 'web', 'node_modules')),
     fs.realpathSync.native(path.join(repoPath, 'apps', 'web', 'node_modules')),
+  );
+});
+
+test('bootstrapWorktreeDeps skips Next workspace node_modules reuse for Turbopack safety', (t) => {
+  const worktreePath = makeTempDir(t);
+  const repoPath = makeTempDir(t);
+  const manifest = {
+    private: true,
+    workspaces: ['apps/*'],
+  };
+
+  writeJson(path.join(repoPath, 'package.json'), manifest);
+  writeFile(path.join(repoPath, 'package-lock.json'));
+  fs.mkdirSync(path.join(repoPath, 'node_modules', '.bin'), { recursive: true });
+  fs.mkdirSync(path.join(repoPath, 'apps', 'web', 'node_modules', '.bin'), { recursive: true });
+  writeJson(path.join(repoPath, 'apps', 'web', 'package.json'), {
+    scripts: { build: 'next build' },
+    dependencies: { next: '^15.0.0' },
+  });
+
+  writeJson(path.join(worktreePath, 'package.json'), manifest);
+  writeFile(path.join(worktreePath, 'package-lock.json'));
+  writeJson(path.join(worktreePath, 'apps', 'web', 'package.json'), {
+    scripts: { build: 'next build' },
+    dependencies: { next: '^15.0.0' },
+  });
+
+  const result = bootstrapWorktreeDeps(worktreePath, {
+    repoPath,
+    installIfNeeded: false,
+    logger: () => {},
+  });
+
+  assert.equal(result.bootstrapped, false);
+  assert.equal(result.needsInstall, true);
+  assert.equal(result.installReason, 'next_turbopack_requires_local_install');
+  assert.equal(fs.existsSync(path.join(worktreePath, 'node_modules')), false);
+  assert.equal(fs.existsSync(path.join(worktreePath, 'apps', 'web', 'node_modules')), false);
+});
+
+test('bootstrapWorktreeDeps installs local artifacts for stale Next Turbopack symlinks', (t) => {
+  const worktreePath = makeTempDir(t);
+  const repoPath = makeTempDir(t);
+  const outsideArtifacts = makeTempDir(t);
+  const calls = [];
+  const manifest = {
+    private: true,
+    workspaces: ['apps/*', 'packages/*'],
+  };
+
+  writeJson(path.join(repoPath, 'package.json'), manifest);
+  writeFile(path.join(repoPath, 'pnpm-lock.yaml'));
+  fs.mkdirSync(path.join(repoPath, 'node_modules', '.pnpm'), { recursive: true });
+  writeJson(path.join(repoPath, 'apps', 'web', 'package.json'), {
+    scripts: { build: 'next build' },
+    dependencies: { next: '^15.0.0' },
+  });
+  writeJson(path.join(repoPath, 'packages', 'db', 'package.json'), {
+    dependencies: { '@prisma/client': '^6.0.0' },
+  });
+
+  writeJson(path.join(worktreePath, 'package.json'), manifest);
+  writeFile(path.join(worktreePath, 'pnpm-lock.yaml'));
+  writeJson(path.join(worktreePath, 'apps', 'web', 'package.json'), {
+    scripts: { build: 'next build' },
+    dependencies: { next: '^15.0.0' },
+  });
+  writeJson(path.join(worktreePath, 'packages', 'db', 'package.json'), {
+    dependencies: { '@prisma/client': '^6.0.0' },
+  });
+  fs.mkdirSync(path.join(worktreePath, 'apps', 'web', 'node_modules'), { recursive: true });
+  fs.symlinkSync(
+    path.join(repoPath, 'node_modules'),
+    path.join(worktreePath, 'node_modules'),
+    'dir',
+  );
+  fs.symlinkSync(
+    outsideArtifacts,
+    path.join(worktreePath, 'apps', 'web', 'node_modules', 'next'),
+    'dir',
+  );
+  fs.mkdirSync(path.join(repoPath, 'packages', 'db', 'node_modules'), { recursive: true });
+  fs.symlinkSync(
+    path.join(repoPath, 'packages', 'db', 'node_modules'),
+    path.join(worktreePath, 'packages', 'db', 'node_modules'),
+    'dir',
+  );
+
+  const result = bootstrapWorktreeDeps(worktreePath, {
+    repoPath,
+    commandRunner: (command, args, cwd) => {
+      calls.push({ command, args, cwd });
+      fs.mkdirSync(path.join(worktreePath, 'node_modules', '.pnpm'), { recursive: true });
+      fs.mkdirSync(path.join(worktreePath, 'apps', 'web', 'node_modules'), { recursive: true });
+      fs.mkdirSync(path.join(worktreePath, 'packages', 'db', 'node_modules'), { recursive: true });
+      fs.mkdirSync(path.join(worktreePath, 'node_modules', '.pnpm', 'next', 'node_modules', 'next'), { recursive: true });
+      fs.symlinkSync(
+        path.join(worktreePath, 'node_modules', '.pnpm', 'next', 'node_modules', 'next'),
+        path.join(worktreePath, 'apps', 'web', 'node_modules', 'next'),
+        'dir',
+      );
+      return { status: 0, stdout: '', stderr: '' };
+    },
+    logger: () => {},
+  });
+
+  assert.equal(result.bootstrapped, true);
+  assert.deepEqual(calls, [
+    {
+      command: 'pnpm',
+      args: ['install', '--frozen-lockfile'],
+      cwd: worktreePath,
+    },
+  ]);
+  assert.equal(fs.lstatSync(path.join(worktreePath, 'node_modules')).isSymbolicLink(), false);
+  assert.equal(fs.lstatSync(path.join(worktreePath, 'apps', 'web', 'node_modules', 'next')).isSymbolicLink(), true);
+  assert.equal(fs.lstatSync(path.join(worktreePath, 'packages', 'db', 'node_modules')).isSymbolicLink(), false);
+  assert.equal(
+    fs.realpathSync.native(path.join(worktreePath, 'apps', 'web', 'node_modules', 'next'))
+      .startsWith(fs.realpathSync.native(worktreePath)),
+    true,
   );
 });
 

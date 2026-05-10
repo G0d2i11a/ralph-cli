@@ -1,5 +1,9 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const os = require('node:os');
+const path = require('node:path');
+const { execFileSync } = require('node:child_process');
 
 const { DependencyWatcher } = require('../dist/core/dependency-watcher.js');
 const {
@@ -55,6 +59,88 @@ function createConfigManager(overrides = {}) {
       return values[key];
     },
   };
+}
+
+function git(cwd, args) {
+  return execFileSync('git', args, {
+    cwd,
+    encoding: 'utf8',
+    stdio: ['ignore', 'pipe', 'pipe'],
+  }).trim();
+}
+
+function makeBaselineRecoveryTasks(repoDir, repairSha, overrides = {}) {
+  return [
+    {
+      id: 'baseline-blocked-task',
+      prdPath: '/tmp/baseline-blocked.json',
+      status: 'failed_finalize',
+      startTime: 100,
+      completedUS: ['US-001'],
+      storyProgress: [
+        { id: 'US-001', status: 'passed', attempts: 1, updatedAt: 100 },
+      ],
+      worktree: repoDir,
+      logPath: '/tmp/baseline-blocked.log',
+      agent: 'codex',
+      repoPath: repoDir,
+      loopCount: 1,
+      consecutiveNoProgress: 0,
+      consecutiveErrors: 0,
+      lastProgressTime: 100,
+      lastFilesChanged: 1,
+      lastErrorKind: 'baseline_quality_gate_failure',
+      autoRecoveryKind: 'baseline_repair',
+      baselineQualityGate: {
+        kind: 'baseline_quality_gate_failure',
+        observedAt: 100,
+        targetBranch: 'main',
+        gate: 'test',
+        packageLabel: 'apps/web',
+        signature: 'test|apps/web',
+        taskFailureSignature: 'test|apps/web',
+        message: 'baseline failed',
+        repairTaskId: 'baseline-repair-task',
+      },
+      baselineRepair: {
+        repairKey: 'baseline-quality-gate|main|test|apps/web',
+        rootCause: 'shared_baseline_code_debt',
+        targetBranch: 'main',
+        gate: 'test',
+        packageLabel: 'apps/web',
+        demandTaskIds: ['baseline-blocked-task'],
+        repairTaskId: 'baseline-repair-task',
+        startedAt: 100,
+        updatedAt: 100,
+        status: 'waiting',
+      },
+      finalizeRepairStoppedAt: 100,
+      finalizeRepairStopReason: 'baseline_quality_gate_failure',
+      ...overrides.task,
+    },
+    {
+      id: 'baseline-repair-task',
+      prdPath: '/tmp/baseline-repair.json',
+      prdId: 'baseline-quality-gate:abc',
+      status: 'completed',
+      startTime: 90,
+      completedUS: ['US-001'],
+      worktree: repoDir,
+      logPath: '/tmp/baseline-repair.log',
+      agent: 'codex',
+      repoPath: repoDir,
+      loopCount: 1,
+      consecutiveNoProgress: 0,
+      consecutiveErrors: 0,
+      lastProgressTime: 100,
+      lastFilesChanged: 1,
+      integrationStatus: 'integrated',
+      integratedAt: 200,
+      integrationCommitSha: repairSha,
+      finalizerCommitSha: repairSha,
+      ...overrides.repairTask,
+    },
+  ];
 }
 
 test('dependency watcher finalizes ready_to_finalize tasks before scheduling pending work', async () => {
@@ -118,6 +204,84 @@ test('dependency watcher finalizes ready_to_finalize tasks before scheduling pen
   assert.equal(finalizedTask.finalizerCommitMessage, 'feat: finalize test');
   assert.equal(finalizedTask.mergedAt, undefined);
   assert.equal(started.length, 1);
+});
+
+test('dependency watcher cleans stale worktree locks before finalizer quality gates', async () => {
+  const stateManager = new FakeStateManager([
+    {
+      id: 'clean-before-finalize',
+      prdPath: '/tmp/prd.json',
+      status: 'ready_to_finalize',
+      startTime: 100,
+      completedUS: ['US-001'],
+      worktree: '/repo/.ralph-worktrees/clean-before-finalize',
+      logPath: '/tmp/clean-before-finalize.log',
+      agent: 'codex',
+      repoPath: '/repo',
+      loopCount: 1,
+      consecutiveNoProgress: 0,
+      consecutiveErrors: 0,
+      lastProgressTime: 100,
+      lastFilesChanged: 1,
+    },
+  ]);
+  const cleanupCalls = [];
+  const logs = [];
+  const watcher = new DependencyWatcher(
+    {},
+    {
+      stateManager,
+      configManager: createConfigManager({
+        'runner.worktreeCleanupLockGlobs': '**/.next/lock, **/.vite/lock',
+      }),
+      sleep: async () => undefined,
+      logger: {
+        log: (msg) => logs.push(String(msg)),
+        error: (msg) => logs.push(`ERR:${String(msg)}`),
+      },
+      cleanupWorktreeProcesses: async (options) => {
+        cleanupCalls.push(options);
+        return {
+          taskId: options.taskId,
+          worktreePath: options.worktreePath,
+          reason: options.reason,
+          lockPaths: [`${options.worktreePath}/apps/web/.next/lock`],
+          killed: [
+            {
+              pid: 300,
+              pgid: 300,
+              command: 'next build',
+              cwd: `${options.worktreePath}/apps/web`,
+              lockPath: `${options.worktreePath}/apps/web/.next/lock`,
+              signalPid: -300,
+              signalScope: 'process_group',
+            },
+          ],
+          skipped: [],
+        };
+      },
+      finalizer: () => {
+        assert.equal(cleanupCalls.length, 1);
+        return {
+          success: true,
+          committed: true,
+          message: 'Committed task changes successfully',
+          commitMessage: 'feat: finalize test',
+        };
+      },
+    }
+  );
+
+  await watcher.finalizeReadyTasks();
+
+  const finalizedTask = stateManager.tasks.get('clean-before-finalize');
+  assert.equal(finalizedTask.status, 'completed');
+  assert.equal(cleanupCalls.length, 1);
+  assert.equal(cleanupCalls[0].reason, 'before_finalizer_quality_gates');
+  assert.equal(cleanupCalls[0].allowProtectedDescendantCleanup, true);
+  assert.deepEqual(cleanupCalls[0].lockGlobs, ['**/.next/lock', '**/.vite/lock']);
+  assert.ok(cleanupCalls[0].protectedPids.includes(process.pid));
+  assert.ok(logs.some((line) => line.includes('Cleaned 1 worktree lock holder process')));
 });
 
 test('dependency watcher refuses to finalize tasks with incomplete stories', async () => {
@@ -611,6 +775,709 @@ test('dependency watcher routes failed_finalize tasks back to pending repair onc
   assert.equal(typeof task.finalizeRepairDeadlineAt, 'number');
   assert.equal(typeof task.finalizeRepairLastFailureSnapshot?.capturedAt, 'number');
   assert.equal(task.finalizeRepairTotalRequeues, 1);
+});
+
+test('dependency watcher stops finalize repair when baseline quality gate fails', async () => {
+  const stateManager = new FakeStateManager([
+    {
+      id: 'baseline-failure-task',
+      prdPath: '/tmp/prd.json',
+      status: 'failed_finalize',
+      startTime: 100,
+      completedUS: ['US-001'],
+      storyProgress: [
+        {
+          id: 'US-001',
+          status: 'passed',
+          attempts: 1,
+          updatedAt: 100,
+        },
+      ],
+      worktree: '/repo/.ralph-worktrees/baseline-failure-task',
+      logPath: '/tmp/baseline-failure.log',
+      agent: 'codex',
+      repoPath: '/repo',
+      loopCount: 1,
+      consecutiveNoProgress: 0,
+      consecutiveErrors: 0,
+      lastProgressTime: 100,
+      lastFilesChanged: 1,
+      finalizerAttempts: 1,
+      lastError: 'Quality gate "typecheck" failed',
+      lastErrorKind: 'quality_gate_failure',
+      finalizerFailure: {
+        failureKind: 'quality_gate',
+        class: 'typescript_diagnostics',
+        gate: 'typecheck',
+        requestedGate: 'typecheck',
+        packageLabel: 'apps/api',
+        cwd: '/repo/.ralph-worktrees/baseline-failure-task/apps/api',
+        command: 'npm run typecheck',
+        exitCode: 2,
+        rawMessage: 'typecheck failed',
+      },
+    },
+  ]);
+
+  const watcher = new DependencyWatcher(
+    {},
+    {
+      stateManager,
+      configManager: createConfigManager({
+        'finalizer.maxRepairAttempts': 1,
+      }),
+      scheduler: {
+        schedulePendingTasks: async () => [],
+      },
+      sleep: async () => undefined,
+      logger: { log() {}, error() {} },
+      classifyBaselineQualityGateFailure: async () => ({
+        kind: 'baseline_quality_gate_failure',
+        signature: 'typecheck|apps/api',
+        message: 'target baseline quality gate failed with the same gate context',
+        baselineFailure: {
+          failureKind: 'quality_gate',
+          class: 'typescript_diagnostics',
+          gate: 'typecheck',
+          requestedGate: 'typecheck',
+          packageLabel: 'apps/api',
+          cwd: '/repo/apps/api',
+          command: 'npm run typecheck',
+          exitCode: 2,
+          rawMessage: 'baseline typecheck failed',
+        },
+      }),
+    }
+  );
+
+  await watcher.recoverFailedFinalizeTasks();
+
+  const task = stateManager.tasks.get('baseline-failure-task');
+  assert.equal(task.status, 'failed_finalize');
+  assert.equal(task.baselineQualityGate.kind, 'baseline_quality_gate_failure');
+  assert.equal(task.baselineQualityGate.targetBranch, 'main');
+  assert.equal(task.finalizeRepairStopReason, 'baseline_quality_gate_failure');
+  assert.equal(task.autoRecoveryKind, undefined);
+  assert.equal(task.autoRecoveryStopReason, undefined);
+  assert.equal(task.repairContext, undefined);
+  assert.deepEqual(task.completedUS, ['US-001']);
+  assert.equal(task.storyProgress[0].status, 'passed');
+});
+
+test('dependency watcher attaches failed finalize tasks to one shared baseline repair when enabled', async () => {
+  const makeTask = (id) => ({
+    id,
+    prdPath: `/tmp/${id}.json`,
+    status: 'failed_finalize',
+    startTime: id === 'baseline-demand-a' ? 100 : 101,
+    completedUS: ['US-001'],
+    storyProgress: [
+      { id: 'US-001', status: 'passed', attempts: 1, updatedAt: 100 },
+    ],
+    worktree: `/repo/.ralph-worktrees/${id}`,
+    logPath: `/tmp/${id}.log`,
+    agent: 'codex',
+    repoPath: '/repo',
+    loopCount: 1,
+    consecutiveNoProgress: 0,
+    consecutiveErrors: 0,
+    lastProgressTime: 100,
+    lastFilesChanged: 1,
+    finalizerAttempts: 1,
+    lastError: 'Quality gate "test" failed',
+    lastErrorKind: 'quality_gate_failure',
+    finalizerFailure: {
+      failureKind: 'quality_gate',
+      class: 'typescript_diagnostics',
+      gate: 'test',
+      requestedGate: 'test',
+      packageLabel: 'apps/web',
+      cwd: `/repo/.ralph-worktrees/${id}/apps/web`,
+      command: 'npm test',
+      exitCode: 1,
+      rawMessage: 'web tests failed',
+    },
+  });
+  const stateManager = new FakeStateManager([
+    makeTask('baseline-demand-a'),
+    makeTask('baseline-demand-b'),
+  ]);
+  const repairCalls = [];
+  const watcher = new DependencyWatcher(
+    {},
+    {
+      stateManager,
+      configManager: createConfigManager({
+        'runner.autoRemediateBaselineQualityGateFailures': true,
+      }),
+      scheduler: {
+        schedulePendingTasks: async () => [],
+      },
+      sleep: async () => undefined,
+      logger: { log() {}, error() {} },
+      classifyBaselineQualityGateFailure: async () => ({
+        kind: 'baseline_quality_gate_failure',
+        signature: 'test|apps/web|same',
+        baselineFailureSignature: 'test|apps/web|same-baseline',
+        repairKey: 'baseline-quality-gate|main|test|apps/web|same-baseline',
+        rootCause: 'shared_baseline_code_debt',
+        message: 'target baseline quality gate failed with the same gate context',
+        baselineFailure: {
+          failureKind: 'quality_gate',
+          class: 'typescript_diagnostics',
+          gate: 'test',
+          requestedGate: 'test',
+          packageLabel: 'apps/web',
+          cwd: '/repo/apps/web',
+          command: 'npm test',
+          exitCode: 1,
+          rawMessage: 'baseline tests failed',
+        },
+      }),
+      ensureBaselineRepairTask: async (input) => {
+        repairCalls.push(input);
+        return { taskId: 'baseline-repair-task', alreadyExists: repairCalls.length > 1 };
+      },
+    }
+  );
+
+  await watcher.classifyBaselineQualityGateFailures();
+
+  const taskA = stateManager.tasks.get('baseline-demand-a');
+  const taskB = stateManager.tasks.get('baseline-demand-b');
+  assert.equal(taskA.baselineQualityGate.repairTaskId, 'baseline-repair-task');
+  assert.equal(taskB.baselineQualityGate.repairTaskId, 'baseline-repair-task');
+  assert.equal(taskA.autoRecoveryKind, 'baseline_repair');
+  assert.equal(taskB.autoRecoveryKind, 'baseline_repair');
+  assert.equal(taskA.autoRecoveryStoppedAt, undefined);
+  assert.equal(taskA.lastErrorKind, 'baseline_quality_gate_failure');
+  assert.equal(repairCalls.length, 2);
+});
+
+test('dependency watcher recovers baseline-blocked failed finalize tasks after repair integrates', async () => {
+  const repoDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-baseline-recover-repo-'));
+  git(repoDir, ['init', '-b', 'main']);
+  git(repoDir, ['config', 'user.name', 'Ralph Test']);
+  git(repoDir, ['config', 'user.email', 'ralph@example.com']);
+  fs.mkdirSync(path.join(repoDir, 'packages', 'contracts', 'src'), { recursive: true });
+  fs.writeFileSync(path.join(repoDir, 'packages', 'contracts', 'src', 'index.ts'), 'export const base = true;\n');
+  git(repoDir, ['add', '.']);
+  git(repoDir, ['commit', '-m', 'base']);
+  const baseSha = git(repoDir, ['rev-parse', 'HEAD']);
+  fs.writeFileSync(path.join(repoDir, 'packages', 'contracts', 'src', 'entitlement.js'), 'export const entitlement = true;\n');
+  git(repoDir, ['add', '.']);
+  git(repoDir, ['commit', '-m', 'repair baseline']);
+  const repairSha = git(repoDir, ['rev-parse', 'HEAD']);
+  git(repoDir, ['checkout', '-b', 'task-branch', baseSha]);
+
+  const stateManager = new FakeStateManager([
+    {
+      id: 'baseline-blocked-task',
+      prdPath: '/tmp/baseline-blocked.json',
+      status: 'failed_finalize',
+      startTime: 100,
+      completedUS: ['US-001'],
+      storyProgress: [
+        { id: 'US-001', status: 'passed', attempts: 1, updatedAt: 100 },
+      ],
+      worktree: repoDir,
+      logPath: '/tmp/baseline-blocked.log',
+      agent: 'codex',
+      repoPath: repoDir,
+      loopCount: 1,
+      consecutiveNoProgress: 0,
+      consecutiveErrors: 0,
+      lastProgressTime: 100,
+      lastFilesChanged: 1,
+      lastErrorKind: 'baseline_quality_gate_failure',
+      autoRecoveryKind: 'baseline_repair',
+      baselineQualityGate: {
+        kind: 'baseline_quality_gate_failure',
+        observedAt: 100,
+        targetBranch: 'main',
+        gate: 'test',
+        packageLabel: 'apps/web',
+        signature: 'test|apps/web',
+        message: 'baseline failed',
+        repairTaskId: 'baseline-repair-task',
+      },
+      baselineRepair: {
+        repairKey: 'baseline-quality-gate|main|test|apps/web',
+        rootCause: 'shared_baseline_code_debt',
+        targetBranch: 'main',
+        gate: 'test',
+        packageLabel: 'apps/web',
+        demandTaskIds: ['baseline-blocked-task'],
+        repairTaskId: 'baseline-repair-task',
+        startedAt: 100,
+        updatedAt: 100,
+        status: 'waiting',
+      },
+      finalizeRepairStoppedAt: 100,
+      finalizeRepairStopReason: 'baseline_quality_gate_failure',
+    },
+    {
+      id: 'baseline-repair-task',
+      prdPath: '/tmp/baseline-repair.json',
+      prdId: 'baseline-quality-gate:abc',
+      status: 'completed',
+      startTime: 90,
+      completedUS: ['US-001'],
+      worktree: repoDir,
+      logPath: '/tmp/baseline-repair.log',
+      agent: 'codex',
+      repoPath: repoDir,
+      loopCount: 1,
+      consecutiveNoProgress: 0,
+      consecutiveErrors: 0,
+      lastProgressTime: 100,
+      lastFilesChanged: 1,
+      integrationStatus: 'integrated',
+      integratedAt: 200,
+      integrationCommitSha: repairSha,
+      finalizerCommitSha: repairSha,
+    },
+  ]);
+  try {
+    const watcher = new DependencyWatcher(
+      {},
+      {
+        stateManager,
+        configManager: createConfigManager(),
+        scheduler: {
+          schedulePendingTasks: async () => [],
+        },
+        sleep: async () => undefined,
+        logger: { log() {}, error() {} },
+      }
+    );
+
+    await watcher.recoverBaselineBlockedFinalizeTasks();
+
+    const task = stateManager.tasks.get('baseline-blocked-task');
+    assert.equal(task.status, 'ready_to_finalize');
+    assert.equal(task.autoRecoveryKind, undefined);
+    assert.equal(task.finalizeRepairStoppedAt, undefined);
+    assert.equal(task.finalizeRepairStopReason, undefined);
+    assert.deepEqual(task.completedUS, ['US-001']);
+    assert.equal(task.storyProgress[0].status, 'passed');
+    assert.equal(task.baselineRepair.appliedRepairCommitSha, repairSha);
+    assert.deepEqual(task.baselineRepair.appliedRepairFiles, ['packages/contracts/src/entitlement.js']);
+    assert.equal(fs.existsSync(path.join(repoDir, 'packages', 'contracts', 'src', 'entitlement.js')), true);
+  } finally {
+    fs.rmSync(repoDir, { recursive: true, force: true });
+  }
+});
+
+test('dependency watcher waits when baseline repair task is itself auto-recovering', async () => {
+  const stateManager = new FakeStateManager([
+    {
+      id: 'feature-task',
+      prdPath: '/tmp/feature.json',
+      status: 'failed_finalize',
+      startTime: 100,
+      completedUS: ['US-001'],
+      storyProgress: [
+        { id: 'US-001', status: 'passed', attempts: 1, updatedAt: 100 },
+      ],
+      worktree: '/repo/.ralph-worktrees/feature-task',
+      logPath: '/tmp/feature.log',
+      agent: 'codex',
+      repoPath: '/repo',
+      loopCount: 1,
+      consecutiveNoProgress: 0,
+      consecutiveErrors: 0,
+      lastProgressTime: 100,
+      lastFilesChanged: 1,
+      lastErrorKind: 'baseline_quality_gate_failure',
+      autoRecoveryKind: 'baseline_repair',
+      baselineQualityGate: {
+        kind: 'baseline_quality_gate_failure',
+        observedAt: 100,
+        targetBranch: 'main',
+        gate: 'test',
+        packageLabel: 'apps/api',
+        signature: 'test|apps/api|feature',
+        message: 'baseline failed',
+        repairTaskId: 'baseline-repair-task',
+      },
+      baselineRepair: {
+        repairKey: 'baseline-quality-gate|main|test|apps/api|feature',
+        rootCause: 'shared_baseline_code_debt',
+        targetBranch: 'main',
+        gate: 'test',
+        packageLabel: 'apps/api',
+        demandTaskIds: ['feature-task'],
+        repairTaskId: 'baseline-repair-task',
+        startedAt: 100,
+        updatedAt: 100,
+        status: 'waiting',
+      },
+    },
+    {
+      id: 'baseline-repair-task',
+      prdPath: '/tmp/baseline-repair.json',
+      prdId: 'baseline-quality-gate:old',
+      status: 'failed_finalize',
+      startTime: 90,
+      completedUS: ['US-001'],
+      storyProgress: [
+        { id: 'US-001', status: 'passed', attempts: 1, updatedAt: 90 },
+      ],
+      worktree: '/repo/.ralph-worktrees/baseline-repair-task',
+      logPath: '/tmp/baseline-repair.log',
+      agent: 'codex',
+      repoPath: '/repo',
+      loopCount: 1,
+      consecutiveNoProgress: 0,
+      consecutiveErrors: 0,
+      lastProgressTime: 90,
+      lastFilesChanged: 1,
+      lastErrorKind: 'baseline_quality_gate_failure',
+      autoRecoveryKind: 'baseline_repair',
+      baselineQualityGate: {
+        kind: 'baseline_quality_gate_failure',
+        observedAt: 200,
+        targetBranch: 'main',
+        gate: 'test',
+        packageLabel: 'apps/api',
+        signature: 'test|apps/api|repair',
+        message: 'repair task hit another baseline failure',
+        repairTaskId: 'nested-baseline-repair-task',
+      },
+      baselineRepair: {
+        repairKey: 'baseline-quality-gate|main|test|apps/api|repair',
+        rootCause: 'shared_baseline_code_debt',
+        targetBranch: 'main',
+        gate: 'test',
+        packageLabel: 'apps/api',
+        demandTaskIds: ['baseline-repair-task'],
+        repairTaskId: 'nested-baseline-repair-task',
+        startedAt: 200,
+        updatedAt: 200,
+        status: 'waiting',
+      },
+    },
+    {
+      id: 'nested-baseline-repair-task',
+      prdPath: '/tmp/nested-baseline-repair.json',
+      prdId: 'baseline-quality-gate:nested',
+      status: 'pending',
+      startTime: 200,
+      completedUS: [],
+      storyProgress: [
+        { id: 'US-001', status: 'pending', attempts: 0, updatedAt: 200 },
+      ],
+      worktree: '',
+      logPath: '/tmp/nested-baseline-repair.log',
+      agent: 'codex',
+      repoPath: '/repo',
+      loopCount: 0,
+      consecutiveNoProgress: 0,
+      consecutiveErrors: 0,
+      lastProgressTime: 200,
+      lastFilesChanged: 0,
+    },
+  ]);
+  const watcher = new DependencyWatcher(
+    {},
+    {
+      stateManager,
+      configManager: createConfigManager(),
+      scheduler: { schedulePendingTasks: async () => [] },
+      sleep: async () => undefined,
+      logger: { log() {}, error() {} },
+    }
+  );
+
+  await watcher.recoverBaselineBlockedFinalizeTasks();
+
+  const task = stateManager.tasks.get('feature-task');
+  assert.equal(task.status, 'failed_finalize');
+  assert.equal(task.autoRecoveryKind, 'baseline_repair');
+  assert.equal(task.autoRecoveryStopReason, undefined);
+  assert.equal(task.baselineQualityGate.phase, 'waiting_for_baseline_repair');
+  assert.equal(task.baselineQualityGate.stopReason, undefined);
+  assert.equal(task.baselineRepair.status, 'waiting');
+  assert.match(task.autoRecoveryLastReason, /Waiting for baseline repair task baseline-repair-task auto-recovery/);
+});
+
+test('dependency watcher treats equivalent overlapping baseline repair files as recovered', async () => {
+  const repoDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-baseline-equivalent-repo-'));
+  git(repoDir, ['init', '-b', 'main']);
+  git(repoDir, ['config', 'user.name', 'Ralph Test']);
+  git(repoDir, ['config', 'user.email', 'ralph@example.com']);
+  fs.mkdirSync(path.join(repoDir, 'apps', 'web'), { recursive: true });
+  fs.writeFileSync(path.join(repoDir, 'apps', 'web', 'fixture.ts'), 'export const value = "base";\n');
+  git(repoDir, ['add', '.']);
+  git(repoDir, ['commit', '-m', 'base']);
+  const baseSha = git(repoDir, ['rev-parse', 'HEAD']);
+  fs.writeFileSync(path.join(repoDir, 'apps', 'web', 'fixture.ts'), 'export const value = "repair";\n');
+  git(repoDir, ['add', '.']);
+  git(repoDir, ['commit', '-m', 'repair baseline']);
+  const repairSha = git(repoDir, ['rev-parse', 'HEAD']);
+  git(repoDir, ['checkout', '-b', 'task-branch', baseSha]);
+  fs.writeFileSync(path.join(repoDir, 'apps', 'web', 'fixture.ts'), 'export const value = "repair";\n');
+
+  const stateManager = new FakeStateManager(makeBaselineRecoveryTasks(repoDir, repairSha));
+  try {
+    const watcher = new DependencyWatcher(
+      {},
+      {
+        stateManager,
+        configManager: createConfigManager(),
+        scheduler: { schedulePendingTasks: async () => [] },
+        sleep: async () => undefined,
+        logger: { log() {}, error() {} },
+      }
+    );
+
+    await watcher.recoverBaselineBlockedFinalizeTasks();
+
+    const task = stateManager.tasks.get('baseline-blocked-task');
+    assert.equal(task.status, 'ready_to_finalize');
+    assert.equal(task.baselineRepair.applySkippedReason, `baseline repair commit ${repairSha} is already present in task worktree`);
+    assert.deepEqual(task.baselineRepair.applyConflictFiles, undefined);
+    assert.equal(fs.readFileSync(path.join(repoDir, 'apps', 'web', 'fixture.ts'), 'utf8'), 'export const value = "repair";\n');
+  } finally {
+    fs.rmSync(repoDir, { recursive: true, force: true });
+  }
+});
+
+test('dependency watcher stops baseline repair retry loop after integrated repair is already present', async () => {
+  const repoDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-baseline-exhausted-repo-'));
+  git(repoDir, ['init', '-b', 'main']);
+  git(repoDir, ['config', 'user.name', 'Ralph Test']);
+  git(repoDir, ['config', 'user.email', 'ralph@example.com']);
+  fs.mkdirSync(path.join(repoDir, 'apps', 'web'), { recursive: true });
+  fs.writeFileSync(path.join(repoDir, 'apps', 'web', 'fixture.ts'), 'export const value = "base";\n');
+  git(repoDir, ['add', '.']);
+  git(repoDir, ['commit', '-m', 'base']);
+  const baseSha = git(repoDir, ['rev-parse', 'HEAD']);
+  fs.writeFileSync(path.join(repoDir, 'apps', 'web', 'fixture.ts'), 'export const value = "repair";\n');
+  git(repoDir, ['add', '.']);
+  git(repoDir, ['commit', '-m', 'repair baseline']);
+  const repairSha = git(repoDir, ['rev-parse', 'HEAD']);
+  git(repoDir, ['checkout', '-b', 'task-branch', baseSha]);
+  fs.writeFileSync(path.join(repoDir, 'apps', 'web', 'fixture.ts'), 'export const value = "repair";\n');
+
+  const tasks = makeBaselineRecoveryTasks(repoDir, repairSha);
+  tasks[0] = {
+    ...tasks[0],
+    autoRecoveryKind: undefined,
+    baselineQualityGate: {
+      ...tasks[0].baselineQualityGate,
+      phase: 'baseline_repair_integrated',
+      taskFailureSignature: 'test|apps/web|quality_gate_failure|pnpm run test|tests still fail after repair',
+      latestFailureSignature: 'test|apps/web|quality_gate_failure|pnpm run test|tests still fail after repair',
+    },
+    baselineRepair: {
+      ...tasks[0].baselineRepair,
+      status: 'needs_more_repair',
+      appliedRepairCommitSha: repairSha,
+      appliedRepairFiles: ['apps/web/fixture.ts'],
+      message: 'Baseline repair task baseline-repair-task integrated',
+    },
+    finalizerFailure: {
+      failureKind: 'quality_gate',
+      class: 'quality_gate_failure',
+      gate: 'test',
+      requestedGate: 'test',
+      packageLabel: 'apps/web',
+      cwd: path.join(repoDir, 'apps', 'web'),
+      command: 'pnpm run test',
+      exitCode: 1,
+      rawMessage: 'tests still fail after repair',
+    },
+  };
+
+  const stateManager = new FakeStateManager(tasks);
+  try {
+    const watcher = new DependencyWatcher(
+      {},
+      {
+        stateManager,
+        configManager: createConfigManager(),
+        scheduler: { schedulePendingTasks: async () => [] },
+        sleep: async () => undefined,
+        logger: { log() {}, error() {} },
+      }
+    );
+
+    await watcher.recoverBaselineBlockedFinalizeTasks();
+
+    const task = stateManager.tasks.get('baseline-blocked-task');
+    assert.equal(task.status, 'failed_finalize');
+    assert.equal(task.autoRecoveryKind, undefined);
+    assert.equal(task.autoRecoveryStopReason, undefined);
+    assert.equal(task.autoRecoveryStoppedAt, undefined);
+    assert.equal(task.autonomyRepairKind, 'baseline_exhaustion');
+    assert.equal(task.autonomyRepairStoppedAt, undefined);
+    assert.match(task.autonomyRepairLastReason, /reclassifying the current failure/);
+    assert.equal(task.baselineQualityGate.phase, 'stopped');
+    assert.equal(task.baselineQualityGate.stopReason, 'baseline_repair_exhausted');
+    assert.equal(task.baselineRepair.status, 'needs_more_repair');
+    assert.equal(task.baselineRepair.appliedRepairCommitSha, repairSha);
+    assert.equal(task.baselineRepair.applySkippedReason, `baseline repair commit ${repairSha} is already present in task worktree`);
+  } finally {
+    fs.rmSync(repoDir, { recursive: true, force: true });
+  }
+});
+
+test('dependency watcher applies overlapping baseline repair commits with safe 3-way patch', async () => {
+  const repoDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-baseline-three-way-repo-'));
+  git(repoDir, ['init', '-b', 'main']);
+  git(repoDir, ['config', 'user.name', 'Ralph Test']);
+  git(repoDir, ['config', 'user.email', 'ralph@example.com']);
+  fs.mkdirSync(path.join(repoDir, 'apps', 'web'), { recursive: true });
+  fs.writeFileSync(path.join(repoDir, 'apps', 'web', 'fixture.ts'), 'const repaired = false;\nconst keep = true;\nconst taskValue = "base";\n');
+  git(repoDir, ['add', '.']);
+  git(repoDir, ['commit', '-m', 'base']);
+  const baseSha = git(repoDir, ['rev-parse', 'HEAD']);
+  fs.writeFileSync(path.join(repoDir, 'apps', 'web', 'fixture.ts'), 'const repaired = true;\nconst keep = true;\nconst taskValue = "base";\n');
+  git(repoDir, ['add', '.']);
+  git(repoDir, ['commit', '-m', 'repair baseline']);
+  const repairSha = git(repoDir, ['rev-parse', 'HEAD']);
+  git(repoDir, ['checkout', '-b', 'task-branch', baseSha]);
+  fs.writeFileSync(path.join(repoDir, 'apps', 'web', 'fixture.ts'), 'const repaired = false;\nconst keep = true;\nconst taskValue = "local";\n');
+
+  const stateManager = new FakeStateManager(makeBaselineRecoveryTasks(repoDir, repairSha));
+  try {
+    const watcher = new DependencyWatcher(
+      {},
+      {
+        stateManager,
+        configManager: createConfigManager(),
+        scheduler: { schedulePendingTasks: async () => [] },
+        sleep: async () => undefined,
+        logger: { log() {}, error() {} },
+      }
+    );
+
+    await watcher.recoverBaselineBlockedFinalizeTasks();
+
+    const task = stateManager.tasks.get('baseline-blocked-task');
+    assert.equal(task.status, 'ready_to_finalize');
+    assert.equal(task.baselineRepair.appliedRepairCommitSha, repairSha);
+    assert.deepEqual(task.baselineRepair.applyConflictFiles, undefined);
+    assert.equal(
+      fs.readFileSync(path.join(repoDir, 'apps', 'web', 'fixture.ts'), 'utf8'),
+      'const repaired = true;\nconst keep = true;\nconst taskValue = "local";\n'
+    );
+  } finally {
+    fs.rmSync(repoDir, { recursive: true, force: true });
+  }
+});
+
+test('dependency watcher requeues bounded reconcile when baseline repair apply conflicts', async () => {
+  const repoDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-baseline-reconcile-repo-'));
+  git(repoDir, ['init', '-b', 'main']);
+  git(repoDir, ['config', 'user.name', 'Ralph Test']);
+  git(repoDir, ['config', 'user.email', 'ralph@example.com']);
+  fs.mkdirSync(path.join(repoDir, 'apps', 'web'), { recursive: true });
+  fs.writeFileSync(path.join(repoDir, 'apps', 'web', 'fixture.ts'), 'export const value = "base";\n');
+  git(repoDir, ['add', '.']);
+  git(repoDir, ['commit', '-m', 'base']);
+  const baseSha = git(repoDir, ['rev-parse', 'HEAD']);
+  fs.writeFileSync(path.join(repoDir, 'apps', 'web', 'fixture.ts'), 'export const value = "repair";\n');
+  git(repoDir, ['add', '.']);
+  git(repoDir, ['commit', '-m', 'repair baseline']);
+  const repairSha = git(repoDir, ['rev-parse', 'HEAD']);
+  git(repoDir, ['checkout', '-b', 'task-branch', baseSha]);
+  fs.writeFileSync(path.join(repoDir, 'apps', 'web', 'fixture.ts'), 'export const value = "task";\n');
+
+  const stateManager = new FakeStateManager(makeBaselineRecoveryTasks(repoDir, repairSha));
+  try {
+    const watcher = new DependencyWatcher(
+      {},
+      {
+        stateManager,
+        configManager: createConfigManager({ 'finalizer.maxRepairAttempts': 1 }),
+        scheduler: { schedulePendingTasks: async () => [] },
+        sleep: async () => undefined,
+        logger: { log() {}, error() {} },
+      }
+    );
+
+    await watcher.recoverBaselineBlockedFinalizeTasks();
+
+    const task = stateManager.tasks.get('baseline-blocked-task');
+    assert.equal(task.status, 'pending');
+    assert.equal(task.repairContext.mode, 'finalize');
+    assert.equal(task.baselineRepair.applyReconcileAttempts, 1);
+    assert.deepEqual(task.baselineRepair.applyConflictFiles, ['apps/web/fixture.ts']);
+    assert.equal(task.storyProgress[0].status, 'needs_repair');
+    assert.deepEqual(task.completedUS, []);
+  } finally {
+    fs.rmSync(repoDir, { recursive: true, force: true });
+  }
+});
+
+test('dependency watcher revives stopped baseline repair apply failures for reconcile', async () => {
+  const repoDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-baseline-stopped-reconcile-repo-'));
+  git(repoDir, ['init', '-b', 'main']);
+  git(repoDir, ['config', 'user.name', 'Ralph Test']);
+  git(repoDir, ['config', 'user.email', 'ralph@example.com']);
+  fs.mkdirSync(path.join(repoDir, 'apps', 'web'), { recursive: true });
+  fs.writeFileSync(path.join(repoDir, 'apps', 'web', 'fixture.ts'), 'export const value = "base";\n');
+  git(repoDir, ['add', '.']);
+  git(repoDir, ['commit', '-m', 'base']);
+  const baseSha = git(repoDir, ['rev-parse', 'HEAD']);
+  fs.writeFileSync(path.join(repoDir, 'apps', 'web', 'fixture.ts'), 'export const value = "repair";\n');
+  git(repoDir, ['add', '.']);
+  git(repoDir, ['commit', '-m', 'repair baseline']);
+  const repairSha = git(repoDir, ['rev-parse', 'HEAD']);
+  git(repoDir, ['checkout', '-b', 'task-branch', baseSha]);
+  fs.writeFileSync(path.join(repoDir, 'apps', 'web', 'fixture.ts'), 'export const value = "task";\n');
+
+  const tasks = makeBaselineRecoveryTasks(repoDir, repairSha);
+  tasks[0] = {
+    ...tasks[0],
+    autoRecoveryKind: undefined,
+    autoRecoveryStoppedAt: 150,
+    autoRecoveryStopReason: 'baseline_repair_apply_failed',
+    baselineQualityGate: {
+      ...tasks[0].baselineQualityGate,
+      phase: 'stopped',
+      stoppedAt: 150,
+      stopReason: 'baseline_repair_apply_failed',
+    },
+    baselineRepair: {
+      ...tasks[0].baselineRepair,
+      status: 'failed',
+      message: 'previous apply failed',
+    },
+  };
+
+  const stateManager = new FakeStateManager(tasks);
+  try {
+    const watcher = new DependencyWatcher(
+      {},
+      {
+        stateManager,
+        configManager: createConfigManager({ 'finalizer.maxRepairAttempts': 1 }),
+        scheduler: { schedulePendingTasks: async () => [] },
+        sleep: async () => undefined,
+        logger: { log() {}, error() {} },
+      }
+    );
+
+    await watcher.recoverBaselineBlockedFinalizeTasks();
+
+    const task = stateManager.tasks.get('baseline-blocked-task');
+    assert.equal(task.status, 'pending');
+    assert.equal(task.autoRecoveryKind, 'baseline_repair');
+    assert.equal(task.autoRecoveryStoppedAt, undefined);
+    assert.equal(task.autoRecoveryStopReason, undefined);
+    assert.equal(task.baselineQualityGate.phase, 'baseline_repair_integrated');
+    assert.equal(task.baselineQualityGate.stoppedAt, undefined);
+    assert.equal(task.baselineQualityGate.stopReason, undefined);
+    assert.equal(task.baselineRepair.applyReconcileAttempts, 1);
+    assert.deepEqual(task.baselineRepair.applyConflictFiles, ['apps/web/fixture.ts']);
+    assert.equal(task.storyProgress[0].status, 'needs_repair');
+  } finally {
+    fs.rmSync(repoDir, { recursive: true, force: true });
+  }
 });
 
 test('dependency watcher routes merge conflicts through merge repair context', async () => {

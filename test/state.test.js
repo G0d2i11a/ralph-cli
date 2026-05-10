@@ -105,6 +105,62 @@ test('StateManager isolates task storage by RALPH_HOME', async () => {
   }
 });
 
+test('StateManager strips removed operator-needed fields on read and write', async () => {
+  const homeDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-state-removed-fields-'));
+  const previousHome = process.env.HOME;
+  const previousRalphHome = process.env.RALPH_HOME;
+
+  try {
+    process.env.HOME = homeDir;
+    delete process.env.RALPH_HOME;
+    const stateManager = new StateManager();
+    const task = createTask({
+      id: 'removed-fields-task',
+      attention: { needed: true, reason: 'old operator bucket' },
+      humanAttention: true,
+      recoverableAttention: false,
+      attentionReason: 'old reason',
+      attentionRepairKind: 'baseline_exhaustion',
+      attentionRepairTotalRequeues: 2,
+      autonomyRepairKind: 'baseline_exhaustion',
+      autonomyRepairTotalRequeues: 2,
+    });
+    const taskDir = path.join(homeDir, '.ralph', 'tasks', task.id);
+    const statePath = path.join(taskDir, 'state.json');
+    fs.mkdirSync(taskDir, { recursive: true });
+    fs.writeFileSync(statePath, JSON.stringify(task, null, 2));
+
+    const loadedTask = await stateManager.loadTask(task.id);
+    assert.equal(Object.hasOwn(loadedTask, 'attention'), false);
+    assert.equal(Object.hasOwn(loadedTask, 'humanAttention'), false);
+    assert.equal(Object.hasOwn(loadedTask, 'recoverableAttention'), false);
+    assert.equal(Object.hasOwn(loadedTask, 'attentionReason'), false);
+    assert.equal(Object.hasOwn(loadedTask, 'attentionRepairKind'), false);
+    assert.equal(Object.hasOwn(loadedTask, 'attentionRepairTotalRequeues'), false);
+    assert.equal(loadedTask.autonomyRepairKind, 'baseline_exhaustion');
+    assert.equal(loadedTask.autonomyRepairTotalRequeues, 2);
+
+    await stateManager.updateTask(task.id, { status: 'running' });
+    const persistedTask = JSON.parse(fs.readFileSync(statePath, 'utf-8'));
+    assert.equal(Object.hasOwn(persistedTask, 'attention'), false);
+    assert.equal(Object.hasOwn(persistedTask, 'humanAttention'), false);
+    assert.equal(Object.hasOwn(persistedTask, 'recoverableAttention'), false);
+    assert.equal(Object.hasOwn(persistedTask, 'attentionReason'), false);
+    assert.equal(Object.hasOwn(persistedTask, 'attentionRepairKind'), false);
+    assert.equal(Object.hasOwn(persistedTask, 'attentionRepairTotalRequeues'), false);
+    assert.equal(persistedTask.autonomyRepairKind, 'baseline_exhaustion');
+    assert.equal(persistedTask.autonomyRepairTotalRequeues, 2);
+  } finally {
+    process.env.HOME = previousHome;
+    if (previousRalphHome === undefined) {
+      delete process.env.RALPH_HOME;
+    } else {
+      process.env.RALPH_HOME = previousRalphHome;
+    }
+    fs.rmSync(homeDir, { recursive: true, force: true });
+  }
+});
+
 test('StateManager updateTaskIf refuses stale conditional updates', async () => {
   const homeDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-state-conditional-'));
   const previousHome = process.env.HOME;

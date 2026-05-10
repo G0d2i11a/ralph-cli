@@ -21,6 +21,26 @@ test('classifyAgentFailureOutput marks reconnecting transport failures as retrya
   assert.equal(result.explicit, true);
 });
 
+test('classifyAgentFailureOutput marks Codex context-window exhaustion as retryable agent-session errors', () => {
+  const result = classifyAgentFailureOutput(
+    'ERROR: Codex ran out of room in the model context window. Start a new thread or clear earlier history before retrying.',
+  );
+
+  assert.equal(result.kind, 'agent_context_window_exhausted');
+  assert.equal(result.class, 'agent_session');
+  assert.equal(result.retryable, true);
+  assert.equal(result.explicit, true);
+});
+
+test('classifyAgentFailureOutput still treats browser context closed as browser automation failure', () => {
+  const result = classifyAgentFailureOutput('Playwright target closed because the browser context closed.');
+
+  assert.equal(result.kind, 'browser_automation_failure');
+  assert.equal(result.class, 'browser_automation');
+  assert.equal(result.retryable, true);
+  assert.equal(result.explicit, true);
+});
+
 test('classifyAgentFailureOutput marks auth/config failures as explicit non-retryable errors', () => {
   const result = classifyAgentFailureOutput('Unauthorized: API key missing, login required.');
 

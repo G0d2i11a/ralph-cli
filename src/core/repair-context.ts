@@ -121,7 +121,7 @@ function buildFinalizeRepairStory(
     'Ralph is asking for a finalize repair, not a new feature pass.',
     'All PRD stories for this task have already passed. This user story is only the scheduling anchor for the repair.',
     'Repair only the failed integration/finalize condition. Do not expand product scope.',
-    `Repair reason: ${task.repairContext?.reason || lastStoryError || 'Finalizer failed.'}`,
+    `Repair reason: ${formatRepairReason(task.repairContext?.reason || lastStoryError || 'Finalizer failed.')}`,
   ];
 
   if (task.prdTitle || task.prdId) {
@@ -158,6 +158,9 @@ function buildFinalizeRepairStory(
       `Repair the failed finalizer${failure?.gate ? ` quality gate (${failure.gate})` : ''} without adding new product scope.`,
       'Preserve behavior already delivered by the completed PRD stories.',
       'Validate against the exact failed gate before finishing and report concrete evidence in the summary.',
+      ...(failure?.validationCommands?.length
+        ? ['Do not run the full finalizer sequence inside the repair worker; leave the worktree ready for Ralph restricted finalizer to validate and integrate.']
+        : []),
       ...story.acceptanceCriteria.map((criterion) => `Preserve original requirement: ${criterion}`),
     ],
   };
@@ -184,7 +187,7 @@ function buildMergeRepairStory(
       ? 'Materialize the repair in the branch/worktree that the exact probe uses. Do not stop at a temp clone, merge-tree transcript, or origin/main comparison.'
       : 'Do not stop at a temp clone, a manual merge transcript, a merge-tree grep, or a narrative about how the conflict could be resolved. Apply the resolution in this task worktree/branch.',
     'If you validate in a temp clone, treat that as advisory only. The real proof must still be the exact probe becoming clean without further manual edits.',
-    `Repair reason: ${task.repairContext?.reason || lastStoryError || 'Merge repair required.'}`,
+    `Repair reason: ${formatRepairReason(task.repairContext?.reason || lastStoryError || 'Merge repair required.')}`,
   ];
 
   if (mergeFiles) {
@@ -232,6 +235,16 @@ function buildFinalizerFailureLines(failure: FinalizerFailureDetails): string[] 
 
   if (failure.command) {
     lines.push(`Gate command: ${failure.command}`);
+  }
+
+  const preparationCommands = formatInlineList(failure.preparationCommands);
+  if (preparationCommands) {
+    lines.push(`Finalizer preparation commands already run before this gate: ${preparationCommands}`);
+  }
+
+  const validationCommands = formatInlineList(failure.validationCommands);
+  if (validationCommands) {
+    lines.push(`Ralph restricted finalizer will validate this sequence after the repair worker finishes: ${validationCommands}`);
   }
 
   if (failure.diagnosticCount) {
@@ -295,6 +308,10 @@ function formatInlineList(values?: string[], limit = 12): string | undefined {
     ? `, ... ${values.length - limit} more omitted`
     : '';
   return `${visible.join(', ')}${suffix}`;
+}
+
+function formatRepairReason(reason: string): string {
+  return truncate(reason.replace(/\s+/g, ' ').trim(), 1600);
 }
 
 function truncate(value: string, maxLength: number): string {

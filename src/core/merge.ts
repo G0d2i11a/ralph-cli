@@ -103,9 +103,26 @@ export class MergeQueue {
   }
 }
 
+function resolveGitCommandTimeoutMs(): number {
+  const configured = Number(process.env.RALPH_GIT_COMMAND_TIMEOUT_MS ?? process.env.RALPH_GIT_TIMEOUT_MS);
+  return Number.isFinite(configured) && configured > 0 ? configured : 120_000;
+}
+
+function buildGitCommandEnv(env: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
+  return {
+    ...process.env,
+    ...env,
+    GIT_TERMINAL_PROMPT: env.GIT_TERMINAL_PROMPT ?? '0',
+    GIT_SSH_COMMAND: env.GIT_SSH_COMMAND
+      ?? 'ssh -o BatchMode=yes -o ConnectTimeout=20 -o ServerAliveInterval=10 -o ServerAliveCountMax=2',
+  };
+}
+
 function runGit(cwd: string, args: string[]): string {
   return execFileSync('git', args, {
     cwd,
+    env: buildGitCommandEnv(),
+    timeout: resolveGitCommandTimeoutMs(),
     encoding: 'utf-8',
     stdio: ['ignore', 'pipe', 'pipe'],
   }).trim();
@@ -114,6 +131,8 @@ function runGit(cwd: string, args: string[]): string {
 function runGitRaw(cwd: string, args: string[]): string {
   return execFileSync('git', args, {
     cwd,
+    env: buildGitCommandEnv(),
+    timeout: resolveGitCommandTimeoutMs(),
     encoding: 'utf-8',
     stdio: ['ignore', 'pipe', 'pipe'],
   });
@@ -122,7 +141,8 @@ function runGitRaw(cwd: string, args: string[]): string {
 function runGitWithEnv(cwd: string, args: string[], env: NodeJS.ProcessEnv, input?: string): string {
   return execFileSync('git', args, {
     cwd,
-    env,
+    env: buildGitCommandEnv(env),
+    timeout: resolveGitCommandTimeoutMs(),
     input,
     encoding: 'utf-8',
     stdio: ['pipe', 'pipe', 'pipe'],
@@ -132,7 +152,8 @@ function runGitWithEnv(cwd: string, args: string[], env: NodeJS.ProcessEnv, inpu
 function runGitRawWithEnv(cwd: string, args: string[], env: NodeJS.ProcessEnv): string {
   return execFileSync('git', args, {
     cwd,
-    env,
+    env: buildGitCommandEnv(env),
+    timeout: resolveGitCommandTimeoutMs(),
     encoding: 'utf-8',
     stdio: ['ignore', 'pipe', 'pipe'],
   });
@@ -720,17 +741,32 @@ function mergeIntoIntegration(
   }
 }
 
-function syncTargetBranchIfSafe(
+export function syncTargetBranchIfSafe(
   repoPath: string,
   targetBranch: string,
   commitSha: string,
 ): { synced: boolean; message: string } {
   const normalizedTarget = normalizeBranchName(targetBranch);
+  const currentTarget = tryRunGit(repoPath, ['rev-parse', normalizedTarget]);
+
+  if (currentTarget && tryRunGit(repoPath, ['merge-base', '--is-ancestor', commitSha, currentTarget]) !== null) {
+    return {
+      synced: true,
+      message: `${normalizedTarget} already contains ${commitSha}`,
+    };
+  }
+
   const targetCheckouts = listWorktrees(repoPath).filter((worktree) => worktree.branch === normalizedTarget);
 
   if (targetCheckouts.length === 0) {
-    const currentTarget = tryRunGit(repoPath, ['rev-parse', normalizedTarget]);
     if (currentTarget) {
+      const canFastForward = tryRunGit(repoPath, ['merge-base', '--is-ancestor', currentTarget, commitSha]) !== null;
+      if (!canFastForward) {
+        return {
+          synced: false,
+          message: `${normalizedTarget} sync failed: ${currentTarget} is not an ancestor of ${commitSha}`,
+        };
+      }
       runGit(repoPath, ['update-ref', `refs/heads/${normalizedTarget}`, commitSha, currentTarget]);
     } else {
       runGit(repoPath, ['update-ref', `refs/heads/${normalizedTarget}`, commitSha]);

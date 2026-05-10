@@ -1,58 +1,65 @@
-import * as fs from 'fs';
-import { StateManager } from '../core/state';
-import { WorktreeManager } from '../core/worktree';
-import { Task } from '../types/task';
+import { ReclamationCandidateReport, ReclamationService } from '../core/reclamation';
 
 interface CleanupOptions {
   olderThanHours?: string;
   dryRun?: boolean;
+  includeOrphans?: boolean;
+  repo?: string;
+  maxRemovals?: string;
 }
 
-const TERMINAL_STATUSES = new Set([
-  'completed',
-  'failed',
-  'failed_finalize',
-  'stagnant',
-]);
+function parseNonNegativeNumber(value: string | undefined, fallback: number): number {
+  const numeric = Number(value ?? fallback);
+  return Number.isFinite(numeric) && numeric >= 0 ? numeric : fallback;
+}
 
-function isCleanupCandidate(task: Task, cutoffTime: number): boolean {
-  if (!TERMINAL_STATUSES.has(task.status)) {
-    return false;
+function parsePositiveInteger(value: string | undefined): number | undefined {
+  if (value === undefined) {
+    return undefined;
   }
 
-  const finishedAt = task.endTime ?? task.updatedAt ?? task.startTime;
-  return finishedAt <= cutoffTime && Boolean(task.worktree);
+  const numeric = Number(value);
+  return Number.isInteger(numeric) && numeric > 0 ? numeric : undefined;
+}
+
+function toCleanupCandidate(candidate: ReclamationCandidateReport): {
+  taskId?: string;
+  status?: ReclamationCandidateReport['status'];
+  worktree: string;
+  existed: boolean;
+  removed: boolean;
+  kind: ReclamationCandidateReport['kind'];
+  reason?: string;
+} {
+  return {
+    taskId: candidate.taskId,
+    status: candidate.status,
+    worktree: candidate.worktree,
+    existed: candidate.existed,
+    removed: candidate.removed,
+    kind: candidate.kind,
+    reason: candidate.reason,
+  };
 }
 
 export async function cleanupCommand(options: CleanupOptions = {}): Promise<void> {
-  const olderThanHours = Number(options.olderThanHours ?? 24);
-  const cutoffTime = Date.now() - (Number.isFinite(olderThanHours) && olderThanHours >= 0 ? olderThanHours : 24) * 60 * 60 * 1000;
-  const stateManager = new StateManager();
-  const worktreeManager = new WorktreeManager();
-  const tasks = await stateManager.listTasks();
-  const candidates = tasks.filter((task) => isCleanupCandidate(task, cutoffTime));
-  const results = [];
-
-  for (const task of candidates) {
-    const existed = fs.existsSync(task.worktree);
-
-    if (existed && !options.dryRun) {
-      await worktreeManager.removeWorktree(task.repoPath, task.worktree);
-    }
-
-    results.push({
-      taskId: task.id,
-      status: task.status,
-      worktree: task.worktree,
-      existed,
-      removed: existed && !options.dryRun,
-    });
-  }
-
-  console.log(JSON.stringify({
+  const olderThanHours = parseNonNegativeNumber(options.olderThanHours, 24);
+  const service = new ReclamationService();
+  const report = await service.run({
+    mode: 'manual',
     dryRun: Boolean(options.dryRun),
     olderThanHours,
-    removed: results.filter((result) => result.removed).length,
-    candidates: results,
+    repoPath: options.repo,
+    includeOrphanWorktrees: Boolean(options.includeOrphans),
+    maxRemovals: parsePositiveInteger(options.maxRemovals),
+  });
+
+  console.log(JSON.stringify({
+    ...report,
+    dryRun: Boolean(options.dryRun),
+    olderThanHours,
+    removed: report.removed,
+    candidates: report.candidates.map(toCleanupCandidate),
+    skipped: report.skipped.map(toCleanupCandidate),
   }));
 }

@@ -9,6 +9,7 @@ const {
   mergeBranch,
   probeTaskMergeability,
   probeTaskWorktreeMergeability,
+  syncTargetBranchIfSafe,
 } = require('../dist/core/merge.js');
 
 function git(args, cwd) {
@@ -137,6 +138,23 @@ test('mergeBranch keeps real dirty paths with spaces as target sync blockers', a
   }
 });
 
+test('syncTargetBranchIfSafe marks dirty checkout synced when target already contains commit', () => {
+  const repoDir = createRepo();
+
+  try {
+    const commitSha = git(['rev-parse', 'main'], repoDir);
+    fs.writeFileSync(path.join(repoDir, 'dirty.txt'), 'dirty\n');
+
+    const result = syncTargetBranchIfSafe(repoDir, 'main', commitSha);
+
+    assert.equal(result.synced, true);
+    assert.match(result.message, /main already contains/);
+    assert.equal(fs.readFileSync(path.join(repoDir, 'dirty.txt'), 'utf-8'), 'dirty\n');
+  } finally {
+    fs.rmSync(repoDir, { recursive: true, force: true });
+  }
+});
+
 test('mergeBranch blocks target sync on mixed real and operational renames', async () => {
   const repoDir = createRepo();
 
@@ -172,6 +190,56 @@ test('mergeBranch fast-forwards clean target checkout after integration merge', 
     assert.match(git(['show', 'main:feature.txt'], repoDir), /task change/);
     assert.match(fs.readFileSync(path.join(repoDir, 'feature.txt'), 'utf-8'), /task change/);
     assert.equal(git(['rev-parse', '--abbrev-ref', 'HEAD'], repoDir), 'main');
+  } finally {
+    fs.rmSync(repoDir, { recursive: true, force: true });
+  }
+});
+
+test('syncTargetBranchIfSafe fast-forwards an unchecked-out target ref', () => {
+  const repoDir = createRepo();
+
+  try {
+    git(['checkout', '-b', 'integration'], repoDir);
+    fs.writeFileSync(path.join(repoDir, 'integrated.txt'), 'integrated\n');
+    git(['add', 'integrated.txt'], repoDir);
+    git(['commit', '-m', 'feat: integrated'], repoDir);
+    const integrationSha = git(['rev-parse', 'HEAD'], repoDir);
+    git(['checkout', '-b', 'operator'], repoDir);
+
+    const result = syncTargetBranchIfSafe(repoDir, 'main', integrationSha);
+
+    assert.equal(result.synced, true, result.message);
+    assert.match(result.message, /main updated/);
+    assert.equal(git(['rev-parse', 'main'], repoDir), integrationSha);
+    assert.equal(git(['rev-parse', '--abbrev-ref', 'HEAD'], repoDir), 'operator');
+  } finally {
+    fs.rmSync(repoDir, { recursive: true, force: true });
+  }
+});
+
+test('syncTargetBranchIfSafe refuses non-fast-forward unchecked-out target ref updates', () => {
+  const repoDir = createRepo();
+
+  try {
+    git(['checkout', '-b', 'integration'], repoDir);
+    fs.writeFileSync(path.join(repoDir, 'integrated.txt'), 'integrated\n');
+    git(['add', 'integrated.txt'], repoDir);
+    git(['commit', '-m', 'feat: integrated'], repoDir);
+    const integrationSha = git(['rev-parse', 'HEAD'], repoDir);
+
+    git(['checkout', 'main'], repoDir);
+    fs.writeFileSync(path.join(repoDir, 'main-only.txt'), 'main\n');
+    git(['add', 'main-only.txt'], repoDir);
+    git(['commit', '-m', 'feat: main only'], repoDir);
+    const mainSha = git(['rev-parse', 'main'], repoDir);
+    git(['checkout', '-b', 'operator'], repoDir);
+
+    const result = syncTargetBranchIfSafe(repoDir, 'main', integrationSha);
+
+    assert.equal(result.synced, false);
+    assert.match(result.message, /not an ancestor/);
+    assert.equal(git(['rev-parse', 'main'], repoDir), mainSha);
+    assert.equal(git(['rev-parse', '--abbrev-ref', 'HEAD'], repoDir), 'operator');
   } finally {
     fs.rmSync(repoDir, { recursive: true, force: true });
   }

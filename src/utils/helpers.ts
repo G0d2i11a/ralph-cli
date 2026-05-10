@@ -318,7 +318,7 @@ export interface DependencyBlocker {
   reason: string;
   retryable?: boolean;
   autoRecoveryActive?: boolean;
-  attentionRequired: boolean;
+  actionRequired: boolean;
 }
 
 export interface DependencyCheckResult {
@@ -336,7 +336,7 @@ function classifyDependencyBlocker(depId: string, depTask: Task | null): Depende
       prdId: depId,
       kind: 'missing',
       reason: 'dependency task has not been enqueued',
-      attentionRequired: false,
+      actionRequired: false,
     };
   }
 
@@ -364,7 +364,7 @@ function classifyDependencyBlocker(depId: string, depTask: Task | null): Depende
       ...base,
       kind: 'task_failed',
       reason: depTask.lastError || 'dependency task failed',
-      attentionRequired: !autoRecoveryActive,
+      actionRequired: !autoRecoveryActive,
     };
   }
 
@@ -373,7 +373,7 @@ function classifyDependencyBlocker(depId: string, depTask: Task | null): Depende
       ...base,
       kind: 'task_stagnant',
       reason: depTask.lastError || 'dependency task is stagnant',
-      attentionRequired: !autoRecoveryActive,
+      actionRequired: !autoRecoveryActive,
     };
   }
 
@@ -382,7 +382,7 @@ function classifyDependencyBlocker(depId: string, depTask: Task | null): Depende
       ...base,
       kind: 'finalize_failed',
       reason: depTask.lastError || 'dependency finalization failed',
-      attentionRequired: !autoRecoveryActive,
+      actionRequired: !autoRecoveryActive,
     };
   }
 
@@ -392,7 +392,7 @@ function classifyDependencyBlocker(depId: string, depTask: Task | null): Depende
         ...base,
         kind: 'integration_failed',
         reason: depTask.mergeError || depTask.lastError || 'dependency integration failed',
-        attentionRequired: !autoRecoveryActive,
+        actionRequired: !autoRecoveryActive,
       };
     }
 
@@ -401,7 +401,7 @@ function classifyDependencyBlocker(depId: string, depTask: Task | null): Depende
         ...base,
         kind: 'integration_blocked_conflict',
         reason: depTask.mergeError || depTask.lastError || 'dependency integration is blocked by conflicts',
-        attentionRequired: !autoRecoveryActive,
+        actionRequired: !autoRecoveryActive,
       };
     }
 
@@ -409,7 +409,7 @@ function classifyDependencyBlocker(depId: string, depTask: Task | null): Depende
       ...base,
       kind: 'not_integrated',
       reason: 'dependency completed but has not been integrated',
-      attentionRequired: false,
+      actionRequired: false,
     };
   }
 
@@ -418,7 +418,7 @@ function classifyDependencyBlocker(depId: string, depTask: Task | null): Depende
       ...base,
       kind: 'running',
       reason: 'dependency task is still running',
-      attentionRequired: false,
+      actionRequired: false,
     };
   }
 
@@ -427,7 +427,7 @@ function classifyDependencyBlocker(depId: string, depTask: Task | null): Depende
       ...base,
       kind: 'finalizing',
       reason: 'dependency task is waiting for finalization',
-      attentionRequired: false,
+      actionRequired: false,
     };
   }
 
@@ -435,8 +435,30 @@ function classifyDependencyBlocker(depId: string, depTask: Task | null): Depende
     ...base,
     kind: 'pending',
     reason: 'dependency task is still pending',
-    attentionRequired: false,
+    actionRequired: false,
   };
+}
+
+function isActiveBaselineRepairDependency(task: Task | null): boolean {
+  if (!task || !task.prdId?.startsWith('baseline-quality-gate:')) {
+    return false;
+  }
+
+  if (
+    task.status === 'pending'
+    || task.status === 'running'
+    || task.status === 'ready_to_finalize'
+    || task.status === 'finalizing'
+  ) {
+    return true;
+  }
+
+  if (task.status === 'completed') {
+    return resolveTaskIntegrationStatus(task) !== 'integrated';
+  }
+
+  return (task.status === 'failed' || task.status === 'stagnant')
+    && evaluateAutoRecovery(task).active;
 }
 
 export async function checkDependencies(
@@ -464,6 +486,25 @@ export async function checkDependencies(
 
     const blocker = classifyDependencyBlocker(depId, depTask);
     if (blocker) {
+      const repairTaskId = depTask?.baselineQualityGate?.repairTaskId;
+      if (
+        blocker.actionRequired
+        && depTask?.status === 'failed_finalize'
+        && depTask.baselineQualityGate?.kind === 'baseline_quality_gate_failure'
+        && repairTaskId
+      ) {
+        const repairTask = await stateManager.loadTask(repairTaskId);
+        if (isActiveBaselineRepairDependency(repairTask)) {
+          blockers.push({
+            ...blocker,
+            reason: `dependency finalization is waiting for active baseline repair task ${repairTaskId}`,
+            autoRecoveryActive: true,
+            actionRequired: false,
+          });
+          continue;
+        }
+      }
+
       blockers.push(blocker);
     }
   }
@@ -475,10 +516,10 @@ export async function checkDependencies(
     pending,
     blockers,
     failed: blockers
-      .filter((blocker) => blocker.attentionRequired)
+      .filter((blocker) => blocker.actionRequired)
       .map((blocker) => blocker.prdId),
     recovering: blockers
-      .filter((blocker) => blocker.autoRecoveryActive && !blocker.attentionRequired)
+      .filter((blocker) => blocker.autoRecoveryActive && !blocker.actionRequired)
       .map((blocker) => blocker.prdId),
     missing: blockers
       .filter((blocker) => blocker.kind === 'missing')

@@ -20,6 +20,7 @@ test('ManagerStateWriter records loop heartbeat and stopped state', () => {
       homeDir,
       pollIntervalMs: 10000,
       autoIngestEnabled: false,
+      autoIngestExistingOnStartup: true,
       repo: '/tmp/repo',
       agent: 'codex',
       backend: 'cli',
@@ -41,6 +42,7 @@ test('ManagerStateWriter records loop heartbeat and stopped state', () => {
     assert.equal(runningStatus.active, true);
     assert.equal(runningStatus.heartbeatStale, false);
     assert.equal(runningStatus.state.status, 'running');
+    assert.equal(runningStatus.state.autoIngestExistingOnStartup, true);
     assert.equal(runningStatus.state.lastLoopStartedAt, 2000);
     assert.equal(runningStatus.state.lastLoopCompletedAt, 3000);
 

@@ -65,3 +65,74 @@ test('DependencyWatcher requires a watch directory before enabling ez4ielts auto
     );
   }, /watch directory/);
 });
+
+test('DependencyWatcher exposes explicit startup backlog ingestion mode', () => {
+  const watcher = new DependencyWatcher(
+    { ingestExistingEz4ielts: true },
+    {
+      stateManager: new FakeStateManager(),
+      scheduler: {
+        schedulePendingTasks: async () => [],
+      },
+      configManager: {
+        get: () => undefined,
+      },
+      autoIngestor: {
+        initialize: async () => undefined,
+        scan: async () => [],
+      },
+    }
+  );
+
+  assert.equal(watcher.isAutoIngestExistingOnStartupEnabled(), true);
+});
+
+test('DependencyWatcher runs startup reclamation after configured delay', async () => {
+  const sleeps = [];
+  const reclamationRuns = [];
+  let watcher;
+
+  watcher = new DependencyWatcher(
+    {},
+    {
+      stateManager: new FakeStateManager(),
+      scheduler: {
+        recoverStaleTasks: async () => undefined,
+        schedulePendingTasks: async () => [],
+      },
+      configManager: {
+        get: (key) => key === 'runner.pollInterval' ? 1 : undefined,
+      },
+      autoIngestor: {
+        initialize: async () => undefined,
+        scan: async () => [],
+      },
+      reclamationService: {
+        isAutomaticReclamationEnabled: () => true,
+        getStartupDelayMs: () => 0,
+        getIntervalMs: () => 60 * 1000,
+        run: async (options) => {
+          reclamationRuns.push(options);
+          return {
+            removed: 0,
+            errors: [],
+            worktrees: { skipped: 0 },
+          };
+        },
+      },
+      sleep: async (ms) => {
+        sleeps.push(ms);
+        watcher.stop();
+      },
+      logger: {
+        log: () => undefined,
+        error: () => undefined,
+      },
+    }
+  );
+
+  await watcher.start();
+
+  assert.deepEqual(reclamationRuns, [{ mode: 'manager_startup' }]);
+  assert.deepEqual(sleeps, [1000]);
+});

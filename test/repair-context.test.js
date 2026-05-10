@@ -31,6 +31,8 @@ test('buildStoryExecutionPayload rewrites anchored story into finalize repair pr
       packageLabel: 'apps/api',
       cwd: '/repo/apps/api',
       command: 'pnpm --filter api check-types',
+      preparationCommands: ["cd 'packages/db' && pnpm run build"],
+      validationCommands: ["cd 'packages/db' && pnpm run build", "cd 'apps/api' && pnpm --filter api check-types"],
       diagnosticCount: 2,
       failedFiles: ['src/service.ts'],
       failedCodes: ['TS2353'],
@@ -55,9 +57,12 @@ test('buildStoryExecutionPayload rewrites anchored story into finalize repair pr
   assert.match(result.title, /Finalize repair/);
   assert.match(result.description, /not a new feature pass/i);
   assert.match(result.description, /Failed gate: requested=typecheck, actual=typecheck, package=apps\/api/);
+  assert.match(result.description, /Finalizer preparation commands already run before this gate: cd 'packages\/db' && pnpm run build/);
+  assert.match(result.description, /Ralph restricted finalizer will validate this sequence after the repair worker finishes: cd 'packages\/db' && pnpm run build, cd 'apps\/api' && pnpm --filter api check-types/);
   assert.match(result.description, /Failed symbols: sourceType/);
   assert.match(result.description, /Observed package surface: apps\/api, packages\/db/);
   assert.match(result.acceptanceCriteria[0], /Repair the failed finalizer quality gate/);
+  assert.match(result.acceptanceCriteria[3], /Do not run the full finalizer sequence inside the repair worker/);
   assert.match(result.acceptanceCriteria[result.acceptanceCriteria.length - 1], /Preserve original requirement/);
 });
 
@@ -109,4 +114,27 @@ test('buildStoryExecutionPayload truncates oversized inline repair context lists
   assert.match(result.description, /packages\/app\/file-1\.ts/);
   assert.match(result.description, /\.\.\. 3 more omitted/);
   assert.doesNotMatch(result.description, /packages\/app\/file-15\.ts/);
+});
+
+test('buildStoryExecutionPayload truncates oversized repair reasons', () => {
+  const story = {
+    id: 'US-004',
+    title: 'Repair test gate',
+    description: 'Original repair anchor.',
+    acceptanceCriteria: ['existing behavior preserved'],
+  };
+  const oversizedReason = `Quality gate failed. ${'visibleSets.slice is not a function '.repeat(50000)}`;
+
+  const result = buildStoryExecutionPayload({
+    repairContext: buildTaskRepairContext({
+      mode: 'finalize',
+      storyId: 'US-004',
+      reason: oversizedReason,
+      createdAt: 1,
+    }),
+  }, story);
+
+  assert.ok(result.description.length < 5000);
+  assert.match(result.description, /Repair reason: Quality gate failed/);
+  assert.match(result.description, /\.\.\./);
 });

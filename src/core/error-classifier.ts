@@ -6,6 +6,7 @@ export type AgentErrorKind =
   | 'transport_reconnecting'
   | 'transport_timeout'
   | 'browser_automation_failure'
+  | 'agent_context_window_exhausted'
   | 'auth_or_config_error'
   | 'agent_no_objective_evidence'
   | 'quality_gate_failure'
@@ -83,6 +84,24 @@ export function classifyAgentFailureOutput(output: string): ErrorClassification 
     };
   }
 
+  if (
+    /ran out of room in the model'?s? context window/i.test(normalized)
+    || /start a new thread or clear earlier history/i.test(normalized)
+    || /context[_ -]?length[_ -]?exceeded/i.test(normalized)
+    || /maximum context length/i.test(normalized)
+    || /conversation is too long/i.test(normalized)
+    || (/context window/i.test(normalized) && /too large|exhausted|out of room|clear earlier history/i.test(normalized))
+  ) {
+    return {
+      kind: 'agent_context_window_exhausted',
+      class: 'agent_session',
+      retryable: true,
+      explicit: true,
+      signature: 'agent_context_window_exhausted',
+      message: 'Agent conversation exceeded the model context window; retry requires a fresh conversation',
+    };
+  }
+
   if (/unauthorized|forbidden|permission|api key|authentication|login required/i.test(normalized)) {
     return {
       kind: 'auth_or_config_error',
@@ -103,4 +122,3 @@ export function classifyAgentFailureOutput(output: string): ErrorClassification 
     message: normalized,
   };
 }
-

@@ -1,10 +1,12 @@
 import * as fs from 'fs';
 import * as path from 'path';
+import { createHash } from 'crypto';
 import { AgentBackend, AgentType, DEFAULT_AGENT, resolveAgentBackend, resolveAgentType } from './agent';
 import { TaskScheduler } from './scheduler';
 import { StateManager } from './state';
 import { enqueueTaskFromPrd } from './task-intake';
 import { assertPrdHasExplicitTitle, parsePRD } from '../utils/helpers';
+import { Task } from '../types/task';
 
 export const DEFAULT_EZ4IELTS_WATCH_DIR = '';
 export const DEFAULT_EZ4IELTS_PATTERN = 'ez4ielts-*.json';
@@ -23,6 +25,7 @@ export interface PrdAutoIngestOptions {
   agent?: string;
   backend?: string;
   settleMs?: number;
+  ingestExistingOnStartup?: boolean;
   logger?: (message: string) => void;
 }
 
@@ -56,6 +59,7 @@ export class PrdAutoIngestor {
   private readonly watchDir: string;
   private readonly pattern: string;
   private readonly settleMs: number;
+  private readonly ingestExistingOnStartup: boolean;
   private readonly now: () => number;
   private readonly logger: (message: string) => void;
   private readonly listFilesFn: (watchDir: string) => string[];
@@ -79,6 +83,7 @@ export class PrdAutoIngestor {
     this.backend = resolveAgentBackend(options.backend);
     this.pattern = options.pattern || DEFAULT_EZ4IELTS_PATTERN;
     this.settleMs = options.settleMs ?? DEFAULT_EZ4IELTS_SETTLE_MS;
+    this.ingestExistingOnStartup = options.ingestExistingOnStartup === true;
     this.now = deps.now ?? (() => Date.now());
     this.logger = options.logger ?? (() => undefined);
     this.listFilesFn = deps.listFiles ?? defaultListFiles;
@@ -91,12 +96,22 @@ export class PrdAutoIngestor {
     }
 
     const existingFiles = this.listMatchingFiles();
-    existingFiles.forEach((filePath) => this.ignoredExistingPaths.add(filePath));
+    if (this.ingestExistingOnStartup) {
+      for (const filePath of existingFiles) {
+        this.candidates.set(filePath, {
+          signature: this.statSignature(filePath),
+          stableSince: this.now() - this.settleMs,
+        });
+      }
+    } else {
+      existingFiles.forEach((filePath) => this.ignoredExistingPaths.add(filePath));
+    }
     this.initialized = true;
 
-    this.logger(
-      `[watch] ez4ielts auto-ingest enabled for ${this.watchDir} (${existingFiles.length} existing matching file(s) ignored)`
-    );
+    const mode = this.ingestExistingOnStartup
+      ? `will inspect ${existingFiles.length} existing matching file(s)`
+      : `${existingFiles.length} existing matching file(s) ignored`;
+    this.logger(`[watch] ez4ielts auto-ingest enabled for ${this.watchDir} (${mode})`);
   }
 
   async scan(): Promise<PrdAutoIngestResult[]> {
@@ -118,7 +133,7 @@ export class PrdAutoIngestor {
         continue;
       }
 
-      const existingTask = await this.stateManager.getTaskByPrdPath(filePath);
+      const existingTask = await this.findTrackedTask(filePath);
       if (existingTask) {
         this.trackedPaths.add(filePath);
         results.push({
@@ -215,6 +230,32 @@ export class PrdAutoIngestor {
   private statSignature(filePath: string): string {
     return this.statSignatureFn(filePath);
   }
+
+  private async findTrackedTask(filePath: string): Promise<Task | null> {
+    const resolvedPath = path.resolve(filePath);
+    const pathMatch = await this.stateManager.getTaskByPrdPath(resolvedPath);
+    if (pathMatch) {
+      return pathMatch;
+    }
+
+    let prdId: string | undefined;
+    let sourceHash: string | undefined;
+    try {
+      prdId = parsePRD(resolvedPath).id;
+      sourceHash = hashFile(resolvedPath);
+    } catch {
+      return null;
+    }
+
+    const tasks = await this.stateManager.listTasks();
+    return tasks.find((task) => (
+      path.resolve(task.repoPath) === this.repoPath
+      && (
+        (prdId !== undefined && task.prdId === prdId)
+        || (sourceHash !== undefined && task.prdSourceHash === sourceHash)
+      )
+    )) ?? null;
+  }
 }
 
 function defaultListFiles(watchDir: string): string[] {
@@ -230,6 +271,10 @@ function defaultListFiles(watchDir: string): string[] {
 function defaultStatSignature(filePath: string): string {
   const stats = fs.statSync(filePath);
   return `${stats.size}:${Math.trunc(stats.mtimeMs)}`;
+}
+
+function hashFile(filePath: string): string {
+  return createHash('sha256').update(fs.readFileSync(filePath)).digest('hex');
 }
 
 function matchesGlob(value: string, pattern: string): boolean {

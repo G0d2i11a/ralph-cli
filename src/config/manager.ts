@@ -11,6 +11,8 @@ export interface RalphConfig {
     agentRunnersPath: string;
     sdkRunnerPath: string;
     timeout: number;
+    extendIdleTimeoutForLongRunningCommands: boolean;
+    longRunningCommandPatterns: string[];
     model: string;
     codexConversationScope: 'attempt' | 'story' | 'task';
   };
@@ -28,11 +30,84 @@ export interface RalphConfig {
     transientRecoveryMaxDelaySeconds: number;
     transientRecoveryDeadlineSeconds: number;
     maxTransientRecoverySameSignature: number;
+    transientRecoveryProgressAwareSameSignature: boolean;
     autoRecoveryHardCap: number;
     autoRemediateFailedBlockers: boolean;
     maxFailedBlockerStoryRequeues: number;
     failedBlockerRecoveryDeadlineSeconds: number;
     failedBlockerRecoveryHardCap: number;
+    autoRemediateStoryFailures: boolean;
+    maxStoryRepairRequeues: number;
+    storyRepairRecoveryDeadlineSeconds: number;
+    storyRepairRecoveryHardCap: number;
+    autoRemediateAgentContextFailures: boolean;
+    maxAgentContextRecoveryRequeues: number;
+    agentContextRecoveryDeadlineSeconds: number;
+    agentContextRecoveryHardCap: number;
+    autoClassifyBaselineQualityGateFailures: boolean;
+    autoRemediateBaselineQualityGateFailures: boolean;
+    baselineQualityGateRepairHardCap: number;
+    baselineQualityGateEnvSelfHealEnabled: boolean;
+    baselineQualityGateEnvSelfHealMaxAttempts: number;
+    baselineQualityGateProbeMaxAttempts: number;
+    baselineQualityGateRepairDeadlineSeconds: number;
+    baselineQualityGateMaxSameSignatureNoProgress: number;
+    baselineQualityGateTreatProbeBufferOverflowAsProbeFailure: boolean;
+    autoRecoverBlockedTasks: boolean;
+    autonomyRepairDeadlineSeconds: number;
+    autonomyRepairHardCap: number;
+    autonomyRepairCooldownBaseSeconds: number;
+    autonomyRepairCooldownMaxSeconds: number;
+    deadlockAutoUnblockEnabled: boolean;
+    deadlockAutoUnblockRequiresObservedDisjointSurface: boolean;
+    worktreeCleanupLockGlobs: string[];
+  };
+  reclamation: {
+    enabled: boolean;
+    intervalSeconds: number;
+    startupDelaySeconds: number;
+    maxRunSeconds: number;
+    diskPressure: {
+      enabled: boolean;
+      checkIntervalSeconds: number;
+      minFreePercent: number;
+      minFreeBytes: number;
+      targetFreeBytes: number;
+      emergencyFreeBytes: number;
+    };
+    worktrees: {
+      enabled: boolean;
+      completedRetentionHours: number;
+      failedRetentionHours: number;
+      failedFinalizeRetentionHours: number;
+      stagnantRetentionHours: number;
+      targetSyncDeferredRetentionHours: number;
+      orphanRetentionHours: number;
+      cleanupOrphans: boolean;
+      keepNewestPerRepo: number;
+      maxRemovalsPerRun: number;
+      removeDirtyFailedWorktrees: boolean;
+      dirtyFailedRetentionHours: number;
+      pruneBranches: boolean;
+      pruneGitWorktreeMetadata: boolean;
+    };
+    tempDirs: {
+      enabled: boolean;
+      roots: string[];
+      markedRetentionHours: number;
+      legacyRetentionHours: number;
+      pressureMarkedRetentionHours: number;
+      pressureLegacyRetentionHours: number;
+      cleanupLegacyUnmarked: boolean;
+      legacyNamePatterns: string[];
+      maxRemovalsPerRun: number;
+    };
+    reporting: {
+      logJsonl: boolean;
+      logPath: string;
+      writeLastRun: boolean;
+      emitTaskEvents: boolean;
+    };
   };
   ingestion: {
     ez4ielts: {
@@ -40,6 +115,7 @@ export interface RalphConfig {
       watchDir: string;
       pattern: string;
       settleMs: number;
+      ingestExistingOnStartup: boolean;
     };
   };
   autoMerge: boolean;
@@ -77,6 +153,8 @@ const DEFAULT_CONFIG: RalphConfig = {
     agentRunnersPath: process.env.RALPH_AGENT_RUNNERS_CLI || process.env.RALPH_SDK_RUNNER_CLI || '',
     sdkRunnerPath: process.env.RALPH_SDK_RUNNER_CLI || '',
     timeout: 600,
+    extendIdleTimeoutForLongRunningCommands: true,
+    longRunningCommandPatterns: ['next build', 'pnpm run build', 'npm run build', 'yarn build', 'turbo build', 'tsc'],
     model: 'claude-opus-4-6-thinking-xchai',
     codexConversationScope: 'story',
   },
@@ -94,11 +172,84 @@ const DEFAULT_CONFIG: RalphConfig = {
     transientRecoveryMaxDelaySeconds: 900,
     transientRecoveryDeadlineSeconds: 7200,
     maxTransientRecoverySameSignature: 3,
+    transientRecoveryProgressAwareSameSignature: true,
     autoRecoveryHardCap: 20,
     autoRemediateFailedBlockers: true,
     maxFailedBlockerStoryRequeues: 1,
     failedBlockerRecoveryDeadlineSeconds: 7200,
     failedBlockerRecoveryHardCap: 2,
+    autoRemediateStoryFailures: true,
+    maxStoryRepairRequeues: 1,
+    storyRepairRecoveryDeadlineSeconds: 7200,
+    storyRepairRecoveryHardCap: 2,
+    autoRemediateAgentContextFailures: true,
+    maxAgentContextRecoveryRequeues: 1,
+    agentContextRecoveryDeadlineSeconds: 7200,
+    agentContextRecoveryHardCap: 2,
+    autoClassifyBaselineQualityGateFailures: true,
+    autoRemediateBaselineQualityGateFailures: true,
+    baselineQualityGateRepairHardCap: 3,
+    baselineQualityGateEnvSelfHealEnabled: true,
+    baselineQualityGateEnvSelfHealMaxAttempts: 3,
+    baselineQualityGateProbeMaxAttempts: 2,
+    baselineQualityGateRepairDeadlineSeconds: 21600,
+    baselineQualityGateMaxSameSignatureNoProgress: 2,
+    baselineQualityGateTreatProbeBufferOverflowAsProbeFailure: true,
+    autoRecoverBlockedTasks: true,
+    autonomyRepairDeadlineSeconds: 86400,
+    autonomyRepairHardCap: 10,
+    autonomyRepairCooldownBaseSeconds: 60,
+    autonomyRepairCooldownMaxSeconds: 1800,
+    deadlockAutoUnblockEnabled: true,
+    deadlockAutoUnblockRequiresObservedDisjointSurface: true,
+    worktreeCleanupLockGlobs: ['**/.next/lock', '**/.next.stale-build*/lock'],
+  },
+  reclamation: {
+    enabled: true,
+    intervalSeconds: 900,
+    startupDelaySeconds: 30,
+    maxRunSeconds: 30,
+    diskPressure: {
+      enabled: true,
+      checkIntervalSeconds: 60,
+      minFreePercent: 10,
+      minFreeBytes: 10 * 1024 * 1024 * 1024,
+      targetFreeBytes: 30 * 1024 * 1024 * 1024,
+      emergencyFreeBytes: 5 * 1024 * 1024 * 1024,
+    },
+    worktrees: {
+      enabled: true,
+      completedRetentionHours: 24,
+      failedRetentionHours: 168,
+      failedFinalizeRetentionHours: 168,
+      stagnantRetentionHours: 168,
+      targetSyncDeferredRetentionHours: 72,
+      orphanRetentionHours: 24,
+      cleanupOrphans: true,
+      keepNewestPerRepo: 5,
+      maxRemovalsPerRun: 25,
+      removeDirtyFailedWorktrees: false,
+      dirtyFailedRetentionHours: 336,
+      pruneBranches: false,
+      pruneGitWorktreeMetadata: true,
+    },
+    tempDirs: {
+      enabled: true,
+      roots: ['/private/tmp'],
+      markedRetentionHours: 24,
+      legacyRetentionHours: 24,
+      pressureMarkedRetentionHours: 1,
+      pressureLegacyRetentionHours: 1,
+      cleanupLegacyUnmarked: true,
+      legacyNamePatterns: ['ralph-*', 'ez4ielts-*', 'content-gen-*'],
+      maxRemovalsPerRun: 500,
+    },
+    reporting: {
+      logJsonl: true,
+      logPath: '',
+      writeLastRun: true,
+      emitTaskEvents: true,
+    },
   },
   ingestion: {
     ez4ielts: {
@@ -106,6 +257,7 @@ const DEFAULT_CONFIG: RalphConfig = {
       watchDir: process.env.RALPH_EZ4IELTS_WATCH_DIR || '',
       pattern: 'ez4ielts-*.json',
       settleMs: 2000,
+      ingestExistingOnStartup: false,
     },
   },
   autoMerge: false,

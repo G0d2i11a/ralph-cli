@@ -152,7 +152,11 @@ async function dependencyChecker(prd, stateManager, options = {}) {
 
 function createScheduler(tasks, prds, options = {}) {
   let nextPid = options.initialPid || 4000;
-  const stateManager = new FakeStateManager(tasks, { ralphHome: options.stateManagerRalphHome });
+  const defaultRalphHome = path.join(
+    os.tmpdir(),
+    `ralph-scheduler-home-${process.pid}-${Math.random().toString(36).slice(2)}`
+  );
+  const stateManager = new FakeStateManager(tasks, { ralphHome: options.stateManagerRalphHome ?? defaultRalphHome });
   const worktreeCalls = [];
   const forkCalls = [];
   const lockDir = path.join(
@@ -185,6 +189,7 @@ function createScheduler(tasks, prds, options = {}) {
     isProcessRunning: options.isProcessRunning || (() => true),
     getProcessInfo: options.getProcessInfo,
     terminateProcess: options.terminateProcess,
+    cleanupWorktreeProcesses: options.cleanupWorktreeProcesses,
     managerOwnedScheduling: options.managerOwnedScheduling,
     lockDir,
     now: options.now,
@@ -234,6 +239,50 @@ test('schedulePendingTasks passes RALPH_HOME to worker processes', async () => {
   await scheduler.schedulePendingTasks();
 
   assert.equal(capturedEnv.RALPH_HOME, ralphHome);
+});
+
+test('schedulePendingTasks cleans worktree lock holders before worker fork', async () => {
+  const order = [];
+  const pendingTask = createTask({
+    id: 'pending-cleanup-task',
+    prdId: 'pending-cleanup-task',
+    prdPath: '/pending-cleanup-task.json',
+    worktree: '/worktrees/pending-cleanup-task',
+    startTime: 100,
+  });
+
+  const { scheduler, forkCalls } = createScheduler(
+    [pendingTask],
+    {
+      '/pending-cleanup-task.json': { id: 'pending-cleanup-task', dependencies: [] },
+    },
+    {
+      maxConcurrent: 1,
+      config: {
+        'runner.worktreeCleanupLockGlobs': ['**/.framework-cache/lock'],
+      },
+      cleanupWorktreeProcesses: async (options) => {
+        order.push(`cleanup:${options.taskId}:${options.reason}`);
+        assert.deepEqual(options.lockGlobs, ['**/.framework-cache/lock']);
+        return {
+          taskId: options.taskId,
+          worktreePath: options.worktreePath,
+          reason: options.reason,
+          lockPaths: [],
+          killed: [],
+          skipped: [],
+        };
+      },
+      onFork: () => {
+        order.push('fork');
+      },
+    }
+  );
+
+  await scheduler.schedulePendingTasks();
+
+  assert.deepEqual(forkCalls, ['pending-cleanup-task']);
+  assert.deepEqual(order, ['cleanup:pending-cleanup-task:before_worker_start', 'fork']);
 });
 
 test('schedulePendingTasks defers worker starts to an active external manager', async () => {
@@ -740,8 +789,67 @@ test('schedulePendingTasks recovers stale running tasks before claiming concurre
   assert.equal(recoveredTask.pid, undefined);
   assert.equal(recoveredTask.currentUS, undefined);
   assert.match(recoveredTask.lastError, /no longer running/i);
+  assert.equal(recoveredTask.lastErrorKind, 'worker_process_exited');
+  assert.equal(recoveredTask.lastErrorClass, 'transient_backend');
+  assert.equal(recoveredTask.lastErrorRetryable, true);
+  assert.equal(recoveredTask.lastErrorObservedAt > 0, true);
+  assert.equal(recoveredTask.lastErrorSignature, 'worker_exit:worker/US-001:US-001');
   assert.equal(startedQueuedTask.status, 'running');
   assert.deepEqual(forkCalls, ['queued-after-stale']);
+});
+
+test('schedulePendingTasks classifies dead merge repair workers as retryable without clearing repair context', async () => {
+  const now = 123_456;
+  const mergeRepairTask = createTask({
+    id: 'dead-merge-repair-task',
+    prdId: 'dead-merge-repair-task',
+    prdPath: '/dead-merge-repair.json',
+    status: 'running',
+    startTime: 100,
+    currentUS: 'US-004',
+    worktree: '/worktrees/dead-merge-repair-task',
+    pid: 8181,
+    repairContext: {
+      mode: 'merge',
+      storyId: 'US-004',
+      createdAt: 100,
+      reason: 'resolve integration conflicts',
+    },
+    mergeConflictFiles: ['apps/web/page.tsx'],
+    mergeRepairDisplayStatus: 'unresolved',
+    postFinalizeMergeProbeRequired: true,
+    observedWriteSurface: ['apps/web/page.tsx'],
+  });
+
+  const { scheduler, stateManager } = createScheduler(
+    [mergeRepairTask],
+    {
+      '/dead-merge-repair.json': { id: 'dead-merge-repair-task', dependencies: [] },
+    },
+    {
+      maxConcurrent: 1,
+      now: () => now,
+      isProcessRunning: (pid) => pid !== 8181,
+    }
+  );
+
+  const startedTasks = await scheduler.schedulePendingTasks();
+  const recoveredTask = await stateManager.loadTask('dead-merge-repair-task');
+
+  assert.equal(startedTasks.length, 0);
+  assert.equal(recoveredTask.status, 'failed');
+  assert.equal(recoveredTask.pid, undefined);
+  assert.equal(recoveredTask.currentUS, undefined);
+  assert.equal(recoveredTask.lastErrorKind, 'merge_repair_worker_exited');
+  assert.equal(recoveredTask.lastErrorClass, 'transient_backend');
+  assert.equal(recoveredTask.lastErrorRetryable, true);
+  assert.equal(recoveredTask.lastErrorObservedAt, now);
+  assert.equal(recoveredTask.lastErrorSignature, 'worker_exit:merge/US-004:US-004');
+  assert.deepEqual(recoveredTask.repairContext, mergeRepairTask.repairContext);
+  assert.deepEqual(recoveredTask.mergeConflictFiles, ['apps/web/page.tsx']);
+  assert.equal(recoveredTask.mergeRepairDisplayStatus, 'unresolved');
+  assert.equal(recoveredTask.postFinalizeMergeProbeRequired, true);
+  assert.deepEqual(recoveredTask.observedWriteSurface, ['apps/web/page.tsx']);
 });
 
 test('schedulePendingTasks recovers running tasks with missing PID and stale lease', async () => {
@@ -850,6 +958,60 @@ test('schedulePendingTasks recovers live running tasks that exceed stagnation ti
   assert.deepEqual(forkCalls, ['queued-after-stagnant']);
 });
 
+test('schedulePendingTasks does not mark active worker with fresh lease as stagnant', async () => {
+  let now = 100_000;
+  const terminateSignals = [];
+  const runningTask = createTask({
+    id: 'active-long-running-task',
+    prdId: 'active-long-running-task',
+    prdPath: '/active-long-running.json',
+    status: 'running',
+    startTime: 100,
+    currentUS: 'US-003',
+    worktree: '/worktrees/active-long-running-task',
+    pid: 4343,
+    leaseOwner: 'worker:4343',
+    leaseHeartbeatAt: now - 5_000,
+    leaseExpiresAt: now + 295_000,
+    lastProgressTime: 0,
+  });
+  const queuedTask = createTask({
+    id: 'queued-behind-active-long-running',
+    prdId: 'queued-behind-active-long-running',
+    prdPath: '/queued-behind-active-long-running.json',
+    startTime: 200,
+  });
+
+  const { scheduler, stateManager, forkCalls } = createScheduler(
+    [runningTask, queuedTask],
+    {
+      '/active-long-running.json': { id: 'active-long-running-task', dependencies: [] },
+      '/queued-behind-active-long-running.json': { id: 'queued-behind-active-long-running', dependencies: [] },
+    },
+    {
+      maxConcurrent: 1,
+      config: {
+        'runner.stagnationTimeout': 30,
+        'runner.leaseTimeout': 300,
+      },
+      now: () => now,
+      isProcessRunning: () => true,
+      terminateProcess: (_pid, signal) => terminateSignals.push(signal),
+    }
+  );
+
+  const startedTasks = await scheduler.schedulePendingTasks();
+  const stillRunning = await stateManager.loadTask('active-long-running-task');
+  const queuedAfter = await stateManager.loadTask('queued-behind-active-long-running');
+
+  assert.equal(startedTasks.length, 0);
+  assert.equal(stillRunning.status, 'running');
+  assert.equal(stillRunning.pid, 4343);
+  assert.equal(queuedAfter.status, 'pending');
+  assert.deepEqual(terminateSignals, []);
+  assert.deepEqual(forkCalls, []);
+});
+
 test('schedulePendingTasks reclaims orphaned worker leases from a previous manager', async () => {
   let processAlive = true;
   let now = 100_000;
@@ -864,8 +1026,8 @@ test('schedulePendingTasks reclaims orphaned worker leases from a previous manag
     worktree: '/worktrees/orphaned-running-task',
     pid: 5151,
     leaseOwner: 'worker:5151',
-    leaseHeartbeatAt: now,
-    leaseExpiresAt: now + 60_000,
+    leaseHeartbeatAt: now - 600_000,
+    leaseExpiresAt: now - 1,
     lastProgressTime: now,
   });
   const queuedTask = createTask({
@@ -913,6 +1075,62 @@ test('schedulePendingTasks reclaims orphaned worker leases from a previous manag
   assert.equal(queuedAfter.status, 'pending');
   assert.deepEqual(terminateSignals, ['SIGTERM']);
   assert.deepEqual(forkCalls, ['orphaned-running-task']);
+});
+
+test('schedulePendingTasks adopts orphaned worker with fresh lease after manager restart', async () => {
+  const now = 100_000;
+  const terminateSignals = [];
+  const orphanedTask = createTask({
+    id: 'fresh-orphaned-running-task',
+    prdId: 'fresh-orphaned-running-task',
+    prdPath: '/fresh-orphaned-running.json',
+    status: 'running',
+    startTime: 100,
+    currentUS: 'US-002',
+    worktree: '/worktrees/fresh-orphaned-running-task',
+    pid: 5252,
+    leaseOwner: 'worker:5252',
+    leaseHeartbeatAt: now - 5_000,
+    leaseExpiresAt: now + 295_000,
+    lastProgressTime: now - 120_000,
+  });
+  const queuedTask = createTask({
+    id: 'queued-behind-fresh-orphan',
+    prdId: 'queued-behind-fresh-orphan',
+    prdPath: '/queued-behind-fresh-orphan.json',
+    startTime: 200,
+  });
+
+  const { scheduler, stateManager, forkCalls } = createScheduler(
+    [orphanedTask, queuedTask],
+    {
+      '/fresh-orphaned-running.json': { id: 'fresh-orphaned-running-task', dependencies: [] },
+      '/queued-behind-fresh-orphan.json': { id: 'queued-behind-fresh-orphan', dependencies: [] },
+    },
+    {
+      maxConcurrent: 1,
+      now: () => now,
+      isProcessRunning: () => true,
+      getProcessInfo: () => ({
+        ppid: 1,
+        command: 'node /repo/dist/worker.js fresh-orphaned-running-task',
+      }),
+      terminateProcess: (_pid, signal) => terminateSignals.push(signal),
+    }
+  );
+
+  const startedTasks = await scheduler.schedulePendingTasks();
+  const stillRunning = await stateManager.loadTask('fresh-orphaned-running-task');
+  const queuedAfter = await stateManager.loadTask('queued-behind-fresh-orphan');
+
+  assert.equal(startedTasks.length, 0);
+  assert.equal(stillRunning.status, 'running');
+  assert.equal(stillRunning.pid, 5252);
+  assert.equal(stillRunning.currentUS, 'US-002');
+  assert.equal(stillRunning.lastErrorKind, undefined);
+  assert.equal(queuedAfter.status, 'pending');
+  assert.deepEqual(terminateSignals, []);
+  assert.deepEqual(forkCalls, []);
 });
 
 test('schedulePendingTasks keeps current-manager worker leases active', async () => {
@@ -1122,6 +1340,36 @@ test('recoverStaleTasks returns stale finalizing tasks to ready_to_finalize', as
   assert.match(recoveredTask.lastError, /finalizer lease is stale/i);
 });
 
+test('recoverStaleTasks returns finalizing tasks with dead lease owner to ready_to_finalize', async () => {
+  const finalizingTask = createTask({
+    id: 'dead-owner-finalizing',
+    prdId: 'dead-owner-finalizing',
+    status: 'finalizing',
+    startTime: 100,
+    worktree: '/worktrees/dead-owner-finalizing',
+    leaseOwner: 'finalizer:4242',
+    leaseHeartbeatAt: 9_000,
+    leaseExpiresAt: 20_000,
+  });
+
+  const { scheduler, stateManager } = createScheduler(
+    [finalizingTask],
+    {},
+    {
+      maxConcurrent: 1,
+      now: () => 10_000,
+      isProcessRunning: () => false,
+    }
+  );
+
+  await scheduler.recoverStaleTasks();
+
+  const recoveredTask = await stateManager.loadTask('dead-owner-finalizing');
+  assert.equal(recoveredTask.status, 'ready_to_finalize');
+  assert.equal(recoveredTask.leaseOwner, undefined);
+  assert.match(recoveredTask.lastError, /lease owner process 4242 is not running/i);
+});
+
 test('recoverStaleTasks treats configured finalizer lease timeouts as seconds', async () => {
   const finalizingTask = createTask({
     id: 'fresh-finalizing',
@@ -1173,7 +1421,12 @@ test('schedulePendingTasks claims a slot before fork so stale worker snapshots c
     startTime: 300,
   });
 
-  const stateManager = new FakeStateManager([runningTask, raceTask, queuedTask]);
+  const stateManager = new FakeStateManager([runningTask, raceTask, queuedTask], {
+    ralphHome: path.join(
+      os.tmpdir(),
+      `ralph-scheduler-race-home-${process.pid}-${Math.random().toString(36).slice(2)}`
+    ),
+  });
   const forkCalls = [];
   const lockDir = path.join(
     os.tmpdir(),

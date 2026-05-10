@@ -7,6 +7,9 @@ const OPERATIONAL_ARTIFACT_DIRS = [
   '.ralph-integration',
   '.ralph-integration-probe',
 ];
+const OPERATIONAL_ARTIFACT_DIR_PREFIXES = [
+  '.next.stale-build',
+];
 
 function normalizeRelativePath(value: string): string {
   return value
@@ -24,7 +27,10 @@ export function isOperationalArtifactPath(relativePath: string): boolean {
 
   return normalized
     .split('/')
-    .some((segment) => OPERATIONAL_ARTIFACT_DIRS.includes(segment));
+    .some((segment) => (
+      OPERATIONAL_ARTIFACT_DIRS.includes(segment)
+      || OPERATIONAL_ARTIFACT_DIR_PREFIXES.some((prefix) => segment.startsWith(prefix))
+    ));
 }
 
 export function filterOperationalArtifactPaths(paths: string[]): string[] {
@@ -36,8 +42,14 @@ export function filterOperationalArtifactPaths(paths: string[]): string[] {
 }
 
 export function buildOperationalArtifactExcludePathspecs(): string[] {
-  return OPERATIONAL_ARTIFACT_DIRS.flatMap((dir) => ([
-    `:(glob,exclude)**/${dir}`,
-    `:(glob,exclude)**/${dir}/**`,
-  ]));
+  return [
+    ...OPERATIONAL_ARTIFACT_DIRS.flatMap((dir) => ([
+      `:(glob,exclude)**/${dir}`,
+      `:(glob,exclude)**/${dir}/**`,
+    ])),
+    ...OPERATIONAL_ARTIFACT_DIR_PREFIXES.flatMap((prefix) => ([
+      `:(glob,exclude)**/${prefix}*`,
+      `:(glob,exclude)**/${prefix}*/**`,
+    ])),
+  ];
 }

@@ -12,6 +12,25 @@ interface StateManagerOptions extends RalphHomeOptions {
   baseDir?: string;
 }
 
+const REMOVED_TASK_STATE_KEYS = new Set([
+  'attention',
+  'attentionReason',
+  'recoverableAttention',
+  'humanAttention',
+]);
+
+function sanitizeTaskState(rawTask: Task): Task {
+  const task = { ...rawTask } as Task & Record<string, unknown>;
+
+  for (const key of Object.keys(task)) {
+    if (key.startsWith('attentionRepair') || REMOVED_TASK_STATE_KEYS.has(key)) {
+      delete task[key];
+    }
+  }
+
+  return task as Task;
+}
+
 export class StateManager {
   private baseDir: string;
   private readonly ralphHome: string;
@@ -53,7 +72,7 @@ export class StateManager {
     }
 
     const content = fs.readFileSync(statePath, 'utf-8');
-    return JSON.parse(content) as Task;
+    return sanitizeTaskState(JSON.parse(content) as Task);
   }
 
   async saveTask(task: Task, options: SaveTaskOptions = {}): Promise<void> {
@@ -77,11 +96,11 @@ export class StateManager {
       throw new Error(`Stale task write rejected for ${task.id}: revision ${taskRevision} < ${latestRevision}`);
     }
 
-    const nextTask: Task = {
+    const nextTask: Task = sanitizeTaskState({
       ...task,
       revision: latestRevision + 1,
       updatedAt: Date.now(),
-    };
+    });
 
     fs.writeFileSync(tempPath, JSON.stringify(nextTask, null, 2));
     fs.renameSync(tempPath, statePath);

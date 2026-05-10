@@ -1,12 +1,17 @@
+import { spawnSync } from 'child_process';
+import * as fs from 'fs';
+import * as os from 'os';
+import * as path from 'path';
 import { StateManager } from './core/state';
 import { AgentRunner, AgentType, resolveAgentBackend, resolveConfiguredBackend } from './core/agent';
 import { appendTaskEvent } from './core/events';
 import { ConfigManager } from './config/manager';
-import { bootstrapWorktreeDeps } from './core/bootstrap';
+import { bootstrapWorktreeDeps, findInstallRoot } from './core/bootstrap';
 import { buildStoryExecutionPayload } from './core/repair-context';
 import { finalizeTask, markTaskReadyToFinalize } from './core/scheduler';
 import { resolveIntegrationPolicy } from './core/integration-policy';
 import { probeTaskWorktreeMergeability } from './core/merge';
+import { buildRalphToolchainEnv } from './core/toolchain-env';
 import {
   buildMergeRepairProof,
   deriveMergeRepairDisplayStatus,
@@ -31,6 +36,17 @@ import {
   detectProgress,
   ProgressResult,
 } from './core/worktree-progress';
+import {
+  cleanupWorktreeProcesses,
+  resolveConfiguredWorktreeCleanupLockGlobs,
+  WorktreeCleanupResult,
+} from './core/worktree-process-cleanup';
+
+function requiresFreshAgentConversation(
+  classification?: ErrorClassification,
+): classification is ErrorClassification & { kind: 'agent_context_window_exhausted' } {
+  return classification?.kind === 'agent_context_window_exhausted';
+}
 
 async function runWorker(taskId: string) {
   console.log(`[Worker] Starting worker for task ${taskId}`);
@@ -130,12 +146,22 @@ async function runWorker(taskId: string) {
           task.transientRecoveryLastFailureKind = latestTaskState.transientRecoveryLastFailureKind;
           task.transientRecoveryLastFailureClass = latestTaskState.transientRecoveryLastFailureClass;
           task.transientRecoveryLastFailureSignature = latestTaskState.transientRecoveryLastFailureSignature;
+          task.transientRecoveryLastFailureObservedAt = latestTaskState.transientRecoveryLastFailureObservedAt;
+          task.transientRecoveryLastFailureStoryId = latestTaskState.transientRecoveryLastFailureStoryId;
+          task.transientRecoveryLastProgressReason = latestTaskState.transientRecoveryLastProgressReason;
           task.transientRecoveryLastDelayMs = latestTaskState.transientRecoveryLastDelayMs;
           task.transientRecoveryNextEligibleAt = latestTaskState.transientRecoveryNextEligibleAt;
           task.transientRecoveryStoppedAt = latestTaskState.transientRecoveryStoppedAt;
           task.transientRecoveryStopReason = latestTaskState.transientRecoveryStopReason;
           task.transientRecoveryLastRequeuedStoryId = latestTaskState.transientRecoveryLastRequeuedStoryId;
           task.transientRecoveryLastHadObjectiveProgress = latestTaskState.transientRecoveryLastHadObjectiveProgress;
+          task.agentContextRecoveryStartedAt = latestTaskState.agentContextRecoveryStartedAt;
+          task.agentContextRecoveryDeadlineAt = latestTaskState.agentContextRecoveryDeadlineAt;
+          task.agentContextRecoveryTotalRequeues = latestTaskState.agentContextRecoveryTotalRequeues;
+          task.agentContextRecoveryLastSignature = latestTaskState.agentContextRecoveryLastSignature;
+          task.agentContextRecoveryLastRequeuedStoryId = latestTaskState.agentContextRecoveryLastRequeuedStoryId;
+          task.agentContextRecoveryStoppedAt = latestTaskState.agentContextRecoveryStoppedAt;
+          task.agentContextRecoveryStopReason = latestTaskState.agentContextRecoveryStopReason;
           task.mergeRepairRecoveryStartedAt = latestTaskState.mergeRepairRecoveryStartedAt;
           task.mergeRepairRecoveryDeadlineAt = latestTaskState.mergeRepairRecoveryDeadlineAt;
           task.mergeRepairRecoveryTotalRequeues = latestTaskState.mergeRepairRecoveryTotalRequeues;
@@ -194,6 +220,9 @@ async function runWorker(taskId: string) {
         let failureClassification: ErrorClassification | undefined;
         let mergeRepairVerification:
           | Awaited<ReturnType<typeof verifyMergeRepairReadiness>>
+          | undefined;
+        let finalizeRepairVerification:
+          | Awaited<ReturnType<typeof verifyFinalizeRepairReadiness>>
           | undefined;
 
         while (true) {
@@ -276,6 +305,7 @@ async function runWorker(taskId: string) {
             failureClassification?.explicit
             && failureClassification.retryable
             && !hasObjectiveEvidence
+            && !requiresFreshAgentConversation(failureClassification)
           ) {
             const nextTransientRetryCount = transientRetryCountForStory + 1;
 
@@ -378,7 +408,112 @@ async function runWorker(taskId: string) {
         const isMergeRepairAttempt = task.repairContext?.mode === 'merge';
 
         if (isMergeRepairAttempt) {
-          mergeRepairVerification = await verifyMergeRepairReadiness(task, configManager);
+          while (true) {
+            mergeRepairVerification = await verifyMergeRepairReadiness(task, configManager);
+            if (mergeRepairVerification.ok || !mergeRepairVerification.retryableTransient) {
+              break;
+            }
+
+            const classification = mergeRepairVerification.errorClassification;
+            const nextTransientRetryCount = transientRetryCountForStory + 1;
+            const observedAt = Date.now();
+            const retryMessage = `Transient exact mergeability probe failure for ${us.id} (${classification?.kind || 'transport_timeout'}): ${mergeRepairVerification.message}`;
+
+            lastStoryError = retryMessage;
+            task.lastError = retryMessage;
+            task.lastErrorKind = classification?.kind || 'transport_timeout';
+            task.lastErrorClass = classification?.class || 'transport';
+            task.lastErrorRetryable = true;
+            task.lastErrorObservedAt = observedAt;
+            task.lastErrorSignature = classification?.signature || normalizeErrorSignature(mergeRepairVerification.message);
+            task.lastErrorHadObjectiveProgress = hasObjectiveEvidence;
+            task.transientRetryBudget = maxTransientRetries;
+
+            if (nextTransientRetryCount > maxTransientRetries) {
+              const exhaustedMessage = `Transient exact mergeability probe retry budget exhausted for ${us.id}: ${mergeRepairVerification.message}`;
+              task.lastError = exhaustedMessage;
+              task.storyProgress = upsertStoryProgress(task, us.id, {
+                status: 'failed',
+                lastError: exhaustedMessage,
+                historyMessage: exhaustedMessage,
+                updatedAt: observedAt,
+              });
+              await stateManager.updateTask(task.id, {
+                storyProgress: task.storyProgress,
+                lastError: task.lastError,
+                lastErrorKind: task.lastErrorKind,
+                lastErrorClass: task.lastErrorClass,
+                lastErrorRetryable: task.lastErrorRetryable,
+                lastErrorObservedAt: task.lastErrorObservedAt,
+                lastErrorSignature: task.lastErrorSignature,
+                lastErrorHadObjectiveProgress: task.lastErrorHadObjectiveProgress,
+                transientRetryCount: task.transientRetryCount,
+                transientRetryBudget: task.transientRetryBudget,
+                transientRetryLastDelayMs: task.transientRetryLastDelayMs,
+                ...createWorkerLeaseUpdate(configManager),
+              });
+              appendTaskEvent(task, {
+                type: 'story_failed',
+                storyId: us.id,
+                status: 'failed',
+                message: exhaustedMessage,
+                data: {
+                  attempt,
+                  errorKind: task.lastErrorKind,
+                  exactMergeabilityProbeTransient: true,
+                  transientRetryCount: transientRetryCountForStory,
+                  transientRetryBudget: maxTransientRetries,
+                },
+              });
+              console.error(exhaustedMessage);
+              await finalizeTask(task, 'failed', { stateManager });
+              process.exit(1);
+            }
+
+            transientRetryCountForStory = nextTransientRetryCount;
+            const delayMs = resolveTransientRetryDelayMs(
+              transientRetryCountForStory,
+              configManager,
+            );
+            task.transientRetryCount = transientRetryCountForStory;
+            task.transientRetryLastDelayMs = delayMs;
+            task.storyProgress = upsertStoryProgress(task, us.id, {
+              status: 'in_progress',
+              historyMessage: `${retryMessage}; retrying probe in ${Math.round(delayMs / 1000)}s without rerunning the agent`,
+              updatedAt: observedAt,
+            });
+            await stateManager.updateTask(task.id, {
+              storyProgress: task.storyProgress,
+              lastError: task.lastError,
+              lastErrorKind: task.lastErrorKind,
+              lastErrorClass: task.lastErrorClass,
+              lastErrorRetryable: task.lastErrorRetryable,
+              lastErrorObservedAt: task.lastErrorObservedAt,
+              lastErrorSignature: task.lastErrorSignature,
+              lastErrorHadObjectiveProgress: task.lastErrorHadObjectiveProgress,
+              transientRetryCount: task.transientRetryCount,
+              transientRetryBudget: task.transientRetryBudget,
+              transientRetryLastDelayMs: task.transientRetryLastDelayMs,
+              ...createWorkerLeaseUpdate(configManager),
+            });
+            appendTaskEvent(task, {
+              type: 'story_transient_retry',
+              storyId: us.id,
+              message: `${retryMessage}; retrying probe in ${Math.round(delayMs / 1000)}s without rerunning the agent`,
+              data: {
+                attempt,
+                errorKind: task.lastErrorKind,
+                exactMergeabilityProbeTransient: true,
+                transientRetryCount: task.transientRetryCount,
+                transientRetryBudget: maxTransientRetries,
+                delayMs,
+              },
+            });
+            console.log(
+              `[Worker] Transient exact mergeability probe failure for ${us.id} (${task.lastErrorKind}), retrying probe in ${delayMs}ms without rerunning the agent (${transientRetryCountForStory}/${maxTransientRetries})`
+            );
+            await sleep(delayMs);
+          }
         }
 
         const softSuccess = !result.success
@@ -387,11 +522,18 @@ async function runWorker(taskId: string) {
               progress: progressDetected,
             })
           : undefined;
+        const isFinalizeRepairAttempt = task.repairContext?.mode === 'finalize';
+        if (isFinalizeRepairAttempt && (result.success || softSuccess?.shouldTreatAsSuccess)) {
+          finalizeRepairVerification = await verifyFinalizeRepairReadiness(task, configManager);
+        }
+
         const effectiveSuccess = result.success
           || Boolean(softSuccess?.shouldTreatAsSuccess)
           || Boolean(isMergeRepairAttempt && mergeRepairVerification?.ok);
 
-        const hasCompletionEvidence = hasObjectiveEvidence || Boolean(mergeRepairVerification?.ok);
+        const hasCompletionEvidence = hasObjectiveEvidence
+          || Boolean(mergeRepairVerification?.ok)
+          || Boolean(finalizeRepairVerification?.ok);
 
         task.loopCount++;
         task.lastFilesChanged = progressDetected.filesChanged;
@@ -399,7 +541,13 @@ async function runWorker(taskId: string) {
         if (hasCompletionEvidence) {
           task.consecutiveNoProgress = 0;
           task.lastProgressTime = Date.now();
-          console.log(`[Worker] Progress detected: ${mergeRepairVerification?.ok ? mergeRepairVerification.message : progressDetected.reason}`);
+          console.log(`[Worker] Progress detected: ${
+            mergeRepairVerification?.ok
+              ? mergeRepairVerification.message
+              : finalizeRepairVerification?.ok
+                ? finalizeRepairVerification.message
+                : progressDetected.reason
+          }`);
         } else {
           task.consecutiveNoProgress++;
           console.log(`[Worker] No progress detected (consecutive: ${task.consecutiveNoProgress})`);
@@ -503,6 +651,55 @@ async function runWorker(taskId: string) {
               ...createWorkerLeaseUpdate(configManager),
             });
           } else {
+            if (requiresFreshAgentConversation(failureClassification)) {
+              const contextClassification = failureClassification;
+              const observedAt = Date.now();
+              const contextMessage = `Agent context window exhausted for ${us.id}; Ralph will retry this story in a fresh conversation`;
+              lastStoryError = result.output.slice(-500);
+              task.lastError = lastStoryError;
+              task.lastErrorKind = contextClassification.kind;
+              task.lastErrorClass = contextClassification.class;
+              task.lastErrorRetryable = true;
+              task.lastErrorObservedAt = observedAt;
+              task.lastErrorSignature = contextClassification.signature;
+              task.lastErrorHadObjectiveProgress = hasObjectiveEvidence;
+              task.storyProgress = upsertStoryProgress(task, us.id, {
+                status: 'failed',
+                lastError: contextMessage,
+                historyMessage: contextMessage,
+                updatedAt: observedAt,
+              });
+              await stateManager.updateTask(task.id, {
+                storyProgress: task.storyProgress,
+                lastError: task.lastError,
+                lastErrorKind: task.lastErrorKind,
+                lastErrorClass: task.lastErrorClass,
+                lastErrorRetryable: task.lastErrorRetryable,
+                lastErrorObservedAt: task.lastErrorObservedAt,
+                lastErrorSignature: task.lastErrorSignature,
+                lastErrorHadObjectiveProgress: task.lastErrorHadObjectiveProgress,
+                transientRetryCount: task.transientRetryCount,
+                transientRetryBudget: maxTransientRetries,
+                transientRetryLastDelayMs: task.transientRetryLastDelayMs,
+                ...createWorkerLeaseUpdate(configManager),
+              });
+              appendTaskEvent(task, {
+                type: 'story_failed',
+                storyId: us.id,
+                status: 'failed',
+                message: contextMessage,
+                data: {
+                  attempt,
+                  errorKind: contextClassification.kind,
+                  requiresFreshConversation: true,
+                  hadObjectiveProgress: hasObjectiveEvidence,
+                },
+              });
+              console.error(contextMessage);
+              await finalizeTask(task, 'failed', { stateManager });
+              process.exit(1);
+            }
+
             lastStoryError = result.output.slice(-500);
             const hasAttemptsLeft = attempt < maxStoryAttempts;
             task.storyProgress = upsertStoryProgress(task, us.id, {
@@ -548,9 +745,11 @@ async function runWorker(taskId: string) {
         const storyCompletionDecision = resolveStoryCompletionDecision({
           storyId: us.id,
           isMergeRepairAttempt,
+          isFinalizeRepairAttempt,
           hasObjectiveEvidence,
           progressReason: progressDetected.reason,
           mergeRepairVerification,
+          finalizeRepairVerification,
         });
 
         if (!storyCompletionDecision.accepted) {
@@ -581,6 +780,14 @@ async function runWorker(taskId: string) {
             task.lastErrorObservedAt = observedAt;
             task.lastErrorSignature = buildMergeRepairErrorSignature(task.mergeConflictFiles, task.mergeError || lastStoryError);
             task.lastErrorHadObjectiveProgress = hasObjectiveEvidence;
+          } else {
+            const observedAt = Date.now();
+            task.lastErrorKind = 'no_objective_evidence';
+            task.lastErrorClass = 'story_validation';
+            task.lastErrorRetryable = true;
+            task.lastErrorObservedAt = observedAt;
+            task.lastErrorSignature = `${us.id}:no_objective_evidence`;
+            task.lastErrorHadObjectiveProgress = false;
           }
           task.storyProgress = upsertStoryProgress(task, us.id, {
             status: hasAttemptsLeft ? 'needs_repair' : 'failed',
@@ -617,11 +824,14 @@ async function runWorker(taskId: string) {
               data: {
                 attempt,
                 exactMergeability: isMergeRepairAttempt ? mergeRepairVerification?.ok === true : undefined,
+                exactFinalizeGate: isFinalizeRepairAttempt ? finalizeRepairVerification?.ok === true : undefined,
                 conflictFiles: task.mergeConflictFiles,
               },
             });
             console.log(isMergeRepairAttempt
               ? `[Worker] Retrying merge repair for ${us.id} after exact mergeability probe failure`
+              : isFinalizeRepairAttempt
+                ? `[Worker] Retrying finalize repair for ${us.id} after exact quality gate failure`
               : `[Worker] Retrying User Story ${us.id} after missing objective evidence`);
             continue;
           }
@@ -634,6 +844,7 @@ async function runWorker(taskId: string) {
             data: {
               attempt,
               exactMergeability: isMergeRepairAttempt ? mergeRepairVerification?.ok === true : undefined,
+              exactFinalizeGate: isFinalizeRepairAttempt ? finalizeRepairVerification?.ok === true : undefined,
               conflictFiles: task.mergeConflictFiles,
             },
           });
@@ -664,10 +875,29 @@ async function runWorker(taskId: string) {
           task.autoRecoveryStoppedAt = undefined;
           task.autoRecoveryStopReason = undefined;
           task.autoRecoveryLastReason = undefined;
+          task.transientRecoveryStartedAt = undefined;
+          task.transientRecoveryDeadlineAt = undefined;
+          task.transientRecoveryTotalRequeues = undefined;
+          task.transientRecoveryConsecutiveSameSignature = 0;
+          task.transientRecoveryLastFailureKind = undefined;
+          task.transientRecoveryLastFailureClass = undefined;
+          task.transientRecoveryLastFailureSignature = undefined;
+          task.transientRecoveryLastFailureObservedAt = undefined;
+          task.transientRecoveryLastFailureStoryId = undefined;
+          task.transientRecoveryLastProgressReason = undefined;
           task.transientRecoveryNextEligibleAt = undefined;
           task.transientRecoveryStoppedAt = undefined;
           task.transientRecoveryStopReason = undefined;
           task.transientRecoveryLastDelayMs = undefined;
+          task.transientRecoveryLastRequeuedStoryId = undefined;
+          task.transientRecoveryLastHadObjectiveProgress = undefined;
+          task.agentContextRecoveryStartedAt = undefined;
+          task.agentContextRecoveryDeadlineAt = undefined;
+          task.agentContextRecoveryTotalRequeues = undefined;
+          task.agentContextRecoveryLastSignature = undefined;
+          task.agentContextRecoveryLastRequeuedStoryId = undefined;
+          task.agentContextRecoveryStoppedAt = undefined;
+          task.agentContextRecoveryStopReason = undefined;
           task.mergeRepairDisplayStatus = mergeRepairVerification?.probeResult
             ? deriveMergeRepairDisplayStatus(mergeRepairVerification.probeResult)
             : undefined;
@@ -693,10 +923,29 @@ async function runWorker(taskId: string) {
             autoRecoveryStoppedAt: task.autoRecoveryStoppedAt,
             autoRecoveryStopReason: task.autoRecoveryStopReason,
             autoRecoveryLastReason: task.autoRecoveryLastReason,
+            transientRecoveryStartedAt: task.transientRecoveryStartedAt,
+            transientRecoveryDeadlineAt: task.transientRecoveryDeadlineAt,
+            transientRecoveryTotalRequeues: task.transientRecoveryTotalRequeues,
+            transientRecoveryConsecutiveSameSignature: task.transientRecoveryConsecutiveSameSignature,
+            transientRecoveryLastFailureKind: task.transientRecoveryLastFailureKind,
+            transientRecoveryLastFailureClass: task.transientRecoveryLastFailureClass,
+            transientRecoveryLastFailureSignature: task.transientRecoveryLastFailureSignature,
+            transientRecoveryLastFailureObservedAt: task.transientRecoveryLastFailureObservedAt,
+            transientRecoveryLastFailureStoryId: task.transientRecoveryLastFailureStoryId,
+            transientRecoveryLastProgressReason: task.transientRecoveryLastProgressReason,
             transientRecoveryNextEligibleAt: task.transientRecoveryNextEligibleAt,
             transientRecoveryStoppedAt: task.transientRecoveryStoppedAt,
             transientRecoveryStopReason: task.transientRecoveryStopReason,
             transientRecoveryLastDelayMs: task.transientRecoveryLastDelayMs,
+            transientRecoveryLastRequeuedStoryId: task.transientRecoveryLastRequeuedStoryId,
+            transientRecoveryLastHadObjectiveProgress: task.transientRecoveryLastHadObjectiveProgress,
+            agentContextRecoveryStartedAt: task.agentContextRecoveryStartedAt,
+            agentContextRecoveryDeadlineAt: task.agentContextRecoveryDeadlineAt,
+            agentContextRecoveryTotalRequeues: task.agentContextRecoveryTotalRequeues,
+            agentContextRecoveryLastSignature: task.agentContextRecoveryLastSignature,
+            agentContextRecoveryLastRequeuedStoryId: task.agentContextRecoveryLastRequeuedStoryId,
+            agentContextRecoveryStoppedAt: task.agentContextRecoveryStoppedAt,
+            agentContextRecoveryStopReason: task.agentContextRecoveryStopReason,
             mergeRepairDisplayStatus: task.mergeRepairDisplayStatus,
             mergeRepairProof: task.mergeRepairProof,
             postFinalizeMergeProbeRequired: task.postFinalizeMergeProbeRequired,
@@ -875,6 +1124,109 @@ async function sleep(ms: number): Promise<void> {
   await new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+function sanitizeTempName(value: string): string {
+  return value.replace(/[^a-zA-Z0-9_.-]+/g, '-').slice(0, 80) || 'task';
+}
+
+function resolveQualityGateTimeoutMs(config: Pick<ConfigManager, 'get'>): number {
+  const configuredTimeout = Number(config.get('finalizer.qualityGateTimeout'));
+
+  if (!Number.isFinite(configuredTimeout) || configuredTimeout <= 0) {
+    return 600_000;
+  }
+
+  return configuredTimeout >= 1000 ? configuredTimeout : configuredTimeout * 1000;
+}
+
+function isNextBuildLockFailureOutput(output: string): boolean {
+  return /another next build process is already running/i.test(output)
+    || /previous build that didn't exit cleanly/i.test(output)
+    || /wait for the build to complete/i.test(output);
+}
+
+async function cleanupTaskWorktreeProcesses(
+  task: Pick<Task, 'id' | 'worktree' | 'logPath' | 'eventLogPath' | 'status'>,
+  configManager: Pick<ConfigManager, 'get'>,
+  reason: string,
+  protectedPids: number[] = [process.pid],
+): Promise<WorktreeCleanupResult> {
+  const result = await cleanupWorktreeProcesses({
+    taskId: task.id,
+    worktreePath: task.worktree,
+    reason,
+    protectedPids,
+    allowProtectedDescendantCleanup: true,
+    lockGlobs: resolveConfiguredWorktreeCleanupLockGlobs(configManager),
+  });
+
+  if (result.killed.length > 0 || result.skipped.length > 0) {
+    const message = result.killed.length > 0
+      ? `Cleaned ${result.killed.length} worktree lock holder process(es): ${reason}`
+      : `Skipped ${result.skipped.length} worktree lock holder process(es): ${reason}`;
+    console.error(`[Worker] Task ${task.id}: ${message}`);
+    appendTaskEvent(task, {
+      type: 'worktree_process_cleanup',
+      status: task.status,
+      message,
+      data: {
+        reason,
+        worktree: task.worktree,
+        lockPaths: result.lockPaths,
+        killed: result.killed.map((entry) => ({
+          pid: entry.pid,
+          pgid: entry.pgid,
+          signalPid: entry.signalPid,
+          signalScope: entry.signalScope,
+          cwd: entry.cwd,
+          command: entry.command,
+          lockPath: entry.lockPath,
+        })),
+        skipped: result.skipped,
+      },
+    });
+  }
+
+  return result;
+}
+
+function createFinalizeRepairSandbox(task: Task): { env: NodeJS.ProcessEnv; cleanup: () => void } {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), `ralph-repair-gate-${sanitizeTempName(task.id)}-`));
+  const home = path.join(root, 'home');
+  const ralphHome = path.join(root, 'ralph-home');
+  fs.mkdirSync(home, { recursive: true });
+  fs.mkdirSync(ralphHome, { recursive: true });
+
+  const installRoot = findInstallRoot(task.worktree, task.repoPath) ?? undefined;
+  const { env } = buildRalphToolchainEnv({
+    baseEnv: {
+      ...process.env,
+      HOME: home,
+      USERPROFILE: home,
+      RALPH_HOME: ralphHome,
+      XDG_CONFIG_HOME: path.join(home, '.config'),
+      XDG_CACHE_HOME: path.join(home, '.cache'),
+      RALPH_QUALITY_GATE_HOME: ralphHome,
+    },
+    installRoot,
+    ralphHome: process.env.RALPH_HOME,
+    sandboxHome: home,
+  });
+
+  return {
+    env,
+    cleanup: () => fs.rmSync(root, { recursive: true, force: true }),
+  };
+}
+
+function tailForRepairMessage(value: string, limit = 4000): string {
+  const normalized = value.replace(/\s+$/g, '');
+  if (normalized.length <= limit) {
+    return normalized;
+  }
+
+  return normalized.slice(-limit);
+}
+
 function getStoryAttempts(task: Task, storyId: string): number {
   return task.storyProgress?.find((story) => story.id === storyId)?.attempts ?? 0;
 }
@@ -974,9 +1326,14 @@ function upsertStoryProgress(
 function resolveStoryCompletionDecision(input: {
   storyId: string;
   isMergeRepairAttempt: boolean;
+  isFinalizeRepairAttempt?: boolean;
   hasObjectiveEvidence: boolean;
   progressReason: string;
   mergeRepairVerification?: {
+    ok: boolean;
+    message: string;
+  };
+  finalizeRepairVerification?: {
     ok: boolean;
     message: string;
   };
@@ -1004,6 +1361,25 @@ function resolveStoryCompletionDecision(input: {
     };
   }
 
+  if (input.isFinalizeRepairAttempt) {
+    if (!input.finalizeRepairVerification?.ok) {
+      return {
+        accepted: false,
+        message: input.finalizeRepairVerification?.message
+          || `Finalize repair for ${input.storyId} did not pass the exact failed quality gate`,
+        exactMergeabilityVerified: false,
+      };
+    }
+
+    return {
+      accepted: true,
+      message: input.hasObjectiveEvidence
+        ? `${input.progressReason}; ${input.finalizeRepairVerification.message}`
+        : input.finalizeRepairVerification.message,
+      exactMergeabilityVerified: false,
+    };
+  }
+
   if (!input.hasObjectiveEvidence) {
     return {
       accepted: false,
@@ -1019,6 +1395,118 @@ function resolveStoryCompletionDecision(input: {
   };
 }
 
+async function verifyFinalizeRepairReadiness(
+  task: Task,
+  configManager: Pick<ConfigManager, 'get'>,
+): Promise<{
+  ok: boolean;
+  message: string;
+  command?: string;
+  exitCode?: number | null;
+  timedOut?: boolean;
+}> {
+  const failure = task.finalizerFailure;
+  if (!failure) {
+    return {
+      ok: false,
+      message: `Finalize repair for ${task.id} has no recorded finalizer failure to verify`,
+    };
+  }
+
+  const validationCommands = failure.validationCommands?.length
+    ? failure.validationCommands
+    : [failure.command].filter(Boolean);
+
+  if (validationCommands.length === 0) {
+    return {
+      ok: false,
+      message: `Finalize repair for ${task.id} has no recorded quality gate command to verify`,
+    };
+  }
+
+  const timeoutMs = resolveQualityGateTimeoutMs(configManager);
+  const sandbox = createFinalizeRepairSandbox(task);
+
+  try {
+    for (const command of validationCommands) {
+      await cleanupTaskWorktreeProcesses(task, configManager, 'before_finalize_repair_gate');
+
+      const runValidationCommand = () => spawnSync('/bin/sh', ['-lc', command], {
+        cwd: task.worktree,
+        env: sandbox.env,
+        encoding: 'utf-8',
+        timeout: timeoutMs,
+        killSignal: 'SIGKILL',
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+
+      let result = runValidationCommand();
+      let timedOut = (result.error as NodeJS.ErrnoException | undefined)?.code === 'ETIMEDOUT';
+      let output = tailForRepairMessage([
+        result.stdout?.trim(),
+        result.stderr?.trim(),
+        result.error?.message,
+      ].filter(Boolean).join('\n'));
+
+      if ((timedOut || result.error || result.status !== 0) && isNextBuildLockFailureOutput(output)) {
+        const cleanupResult = await cleanupTaskWorktreeProcesses(
+          task,
+          configManager,
+          'after_finalize_repair_gate_next_lock_failure',
+        );
+        if (cleanupResult.killed.length > 0) {
+          appendTaskEvent(task, {
+            type: 'finalize_repair_gate_retried_after_lock_cleanup',
+            status: task.status,
+            message: `Retrying exact finalize repair gate after cleaning stale Next build lock: "${command}"`,
+            data: {
+              command,
+              killed: cleanupResult.killed.map((entry) => ({
+                pid: entry.pid,
+                pgid: entry.pgid,
+                signalPid: entry.signalPid,
+                signalScope: entry.signalScope,
+                cwd: entry.cwd,
+                command: entry.command,
+                lockPath: entry.lockPath,
+              })),
+            },
+          });
+          result = runValidationCommand();
+          timedOut = (result.error as NodeJS.ErrnoException | undefined)?.code === 'ETIMEDOUT';
+          output = tailForRepairMessage([
+            result.stdout?.trim(),
+            result.stderr?.trim(),
+            result.error?.message,
+          ].filter(Boolean).join('\n'));
+        }
+      }
+
+      if (timedOut || result.error || result.status !== 0) {
+        const statusText = timedOut
+          ? `timed out after ${Math.round(timeoutMs / 1000)}s`
+          : result.error
+            ? `failed to start: ${result.error.message}`
+            : `exited ${result.status}`;
+        return {
+          ok: false,
+          message: `Exact finalize repair gate still fails before Ralph finalizer: "${command}" ${statusText}.${output ? `\n${output}` : ''}`,
+          command,
+          exitCode: result.status,
+          timedOut,
+        };
+      }
+    }
+
+    return {
+      ok: true,
+      message: `Exact finalize repair gate passed: ${validationCommands.join(' && ')}`,
+    };
+  } finally {
+    sandbox.cleanup();
+  }
+}
+
 async function verifyMergeRepairReadiness(
   task: Task,
   configManager: Pick<ConfigManager, 'get'>,
@@ -1027,6 +1515,8 @@ async function verifyMergeRepairReadiness(
   ok: boolean;
   message: string;
   probeResult?: Awaited<ReturnType<typeof probeTaskWorktreeMergeability>>;
+  retryableTransient?: boolean;
+  errorClassification?: ErrorClassification;
 }> {
   const integrationPolicy = resolveIntegrationPolicy(configManager);
 
@@ -1060,17 +1550,38 @@ async function verifyMergeRepairReadiness(
       ? ` Conflict files: ${probeResult.conflictFiles.join(', ')}.`
       : '';
 
+    const message = `Exact mergeability probe still fails against ${probeResult.integrationBranch}.${conflictSuffix} ${probeResult.message}`.trim();
+    const errorClassification = classifyRetryableProbeFailure(message);
+
     return {
       ok: false,
-      message: `Exact mergeability probe still fails against ${probeResult.integrationBranch}.${conflictSuffix} ${probeResult.message}`.trim(),
+      message,
       probeResult,
+      retryableTransient: Boolean(errorClassification),
+      errorClassification,
     };
   } catch (error) {
+    const rawMessage = error instanceof Error ? error.message : String(error);
+    const message = `Exact mergeability probe failed: ${rawMessage}`;
+    const errorClassification = classifyRetryableProbeFailure(rawMessage);
+
     return {
       ok: false,
-      message: `Exact mergeability probe failed: ${error instanceof Error ? error.message : String(error)}`,
+      message,
+      retryableTransient: Boolean(errorClassification),
+      errorClassification,
     };
   }
+}
+
+function classifyRetryableProbeFailure(message: string): ErrorClassification | undefined {
+  const classification = classifyAgentFailureOutput(message);
+
+  if (!classification.explicit || !classification.retryable) {
+    return undefined;
+  }
+
+  return classification;
 }
 
 export {
@@ -1084,6 +1595,7 @@ export {
 
 export {
   verifyMergeRepairReadiness,
+  verifyFinalizeRepairReadiness,
   resolveStoryCompletionDecision,
   evaluateTaskStoryCompletion,
   formatStoryCompletionInvariantMessage,

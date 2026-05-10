@@ -8,6 +8,7 @@ import {
   getManagerStatus,
   ManagerStateWriter,
 } from '../core/manager-state';
+import { assertNoDuplicateRepoManagers } from '../core/repo-manager-registry';
 
 export async function managerCommand(options: WatchCommandOptions): Promise<void> {
   const lockDir = getManagerLockDir();
@@ -33,6 +34,10 @@ export async function managerCommand(options: WatchCommandOptions): Promise<void
       allowMixedHome: options.allowMixedHome,
       operation: 'start the Ralph manager',
     });
+    assertNoDuplicateRepoManagers({
+      repoPath: options.repo,
+      operation: 'start the Ralph manager',
+    });
 
     await withDirectoryLock(lockDir, async () => {
       watcher = new DependencyWatcher(options, {
@@ -54,6 +59,7 @@ export async function managerCommand(options: WatchCommandOptions): Promise<void
       stateWriter = new ManagerStateWriter({
         pollIntervalMs: watcher.getPollIntervalMs(),
         autoIngestEnabled: watcher.isAutoIngestEnabled(),
+        autoIngestExistingOnStartup: watcher.isAutoIngestExistingOnStartupEnabled(),
         repo: options.repo ? path.resolve(options.repo) : undefined,
         agent: options.agent,
         backend: options.backend,

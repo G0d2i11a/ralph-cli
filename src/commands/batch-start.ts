@@ -1,6 +1,7 @@
 import { resolve } from 'path';
 import { enqueueTaskFromPrd } from '../core/task-intake';
 import { DEFAULT_AGENT, resolveAgentType } from '../core/agent';
+import { assertNoDuplicateRepoManagers } from '../core/repo-manager-registry';
 
 interface BatchStartOptions {
   repo?: string;
@@ -12,6 +13,10 @@ interface BatchStartOptions {
 export async function batchStartCommand(prdPaths: string[], options: BatchStartOptions) {
   const repo = options.repo ? resolve(options.repo) : process.cwd();
   const agent = resolveAgentType(options.agent || DEFAULT_AGENT);
+  assertNoDuplicateRepoManagers({
+    repoPath: repo,
+    operation: 'batch-start Ralph tasks',
+  });
 
   const results: Array<{
     prdPath: string;

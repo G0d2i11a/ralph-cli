@@ -1,6 +1,7 @@
 import { ConfigManager } from '../config/manager';
 import { buildAutoRecoveryState, buildDeliveryState, buildTransientRetryState } from '../core/task-delivery';
 import { buildCoordinationState } from '../core/task-coordination';
+import { buildFailureObservationFromTask } from '../core/failure-observation';
 import { StateManager } from '../core/state';
 import { isProcessRunning, formatDuration, loadTaskPRD, STAGNATION_THRESHOLDS } from '../utils/helpers';
 
@@ -50,6 +51,7 @@ export async function statusCommand(taskId?: string, options?: StatusOptions): P
     const coordination = buildCoordinationState(task);
     const transientRetry = buildTransientRetryState(task);
     const autoRecovery = buildAutoRecoveryState(task);
+    const latestFailure = task.latestFailure ?? buildFailureObservationFromTask(task);
 
     const basicStatus = {
       id: task.id,
@@ -100,6 +102,11 @@ export async function statusCommand(taskId?: string, options?: StatusOptions): P
       lastErrorRetryable: task.lastErrorRetryable,
       lastErrorObservedAt: task.lastErrorObservedAt ? new Date(task.lastErrorObservedAt).toISOString() : undefined,
       finalizerFailure: task.finalizerFailure,
+      latestFailure,
+      failureHistory: task.failureHistory,
+      baselineQualityGate: task.baselineQualityGate,
+      baselineQualityGateHistory: task.baselineQualityGateHistory,
+      baselineQualityGateHistoryCount: task.baselineQualityGateHistory?.length ?? 0,
       repairContext: task.repairContext,
       transientRetryCount: task.transientRetryCount,
       transientRetryBudget: task.transientRetryBudget,

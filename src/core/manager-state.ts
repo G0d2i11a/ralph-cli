@@ -18,6 +18,7 @@ export interface ManagerRuntimeState {
   stoppedAt?: number;
   pollIntervalMs: number;
   autoIngestEnabled: boolean;
+  autoIngestExistingOnStartup?: boolean;
   repo?: string;
   agent?: string;
   backend?: string;
@@ -262,6 +263,7 @@ export function removeManagerState(options: ManagerStatePaths = {}): void {
 export interface ManagerStateWriterOptions extends ManagerStatePaths {
   pollIntervalMs: number;
   autoIngestEnabled: boolean;
+  autoIngestExistingOnStartup?: boolean;
   repo?: string;
   agent?: string;
   backend?: string;
@@ -287,6 +289,7 @@ export class ManagerStateWriter {
       lastHeartbeatAt: timestamp,
       pollIntervalMs: this.options.pollIntervalMs,
       autoIngestEnabled: this.options.autoIngestEnabled,
+      autoIngestExistingOnStartup: this.options.autoIngestExistingOnStartup,
       repo: this.options.repo,
       agent: this.options.agent,
       backend: this.options.backend,

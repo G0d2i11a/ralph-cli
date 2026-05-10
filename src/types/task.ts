@@ -3,17 +3,44 @@ export type TaskMergeStrategy = 'manual' | 'ours' | 'theirs';
 export type StoryStatus = 'pending' | 'in_progress' | 'needs_repair' | 'passed' | 'failed';
 export type FinalizeRepairFailureKind = 'merge_conflict' | 'quality_gate' | 'finalizer_error';
 export type TaskRepairMode = 'finalize' | 'merge';
-export type TaskAutoRecoveryKind = 'transient' | 'merge_repair' | 'finalize_repair' | 'stagnant' | 'story_repair';
+export type TaskAutoRecoveryKind = 'transient' | 'agent_context' | 'merge_repair' | 'finalize_repair' | 'stagnant' | 'story_repair' | 'baseline_repair';
+export type TaskAutonomyRepairKind =
+  | 'baseline_exhaustion'
+  | 'baseline_supersession_migration'
+  | 'failed_coordination_blocker'
+  | 'generic_failed_worker'
+  | 'stopped_merge_repair'
+  | 'task_specific_finalize_repair'
+  | 'deadlock_unblock';
+export type TaskOperationalStatus =
+  | 'queued'
+  | 'running'
+  | 'ready_to_finalize'
+  | 'finalizing'
+  | 'retrying_finalize'
+  | 'repairing'
+  | 'waiting_for_baseline_repair'
+  | 'waiting_for_environment_repair'
+  | 'needs_human_decision'
+  | 'completed'
+  | 'integrated';
 export type FinalizeFailureClass =
   | 'quality_gate_timeout'
   | 'quality_gate_start_failure'
+  | 'module_resolution'
+  | 'dependency_bootstrap_environment'
+  | 'toolchain_panic'
   | 'generated_type_drift'
   | 'enum_drift'
   | 'domain_type_mismatch'
   | 'typescript_diagnostics'
+  | 'turbo_nested_quality_gate'
+  | 'test_module_provider_drift'
+  | 'deterministic_fixture_drift'
+  | 'generated_artifact_missing'
   | 'quality_gate_failure'
   | 'unknown';
-export type TaskErrorClass = 'transient_backend' | 'transport' | 'browser_automation' | 'semantic' | 'quality_gate' | 'merge_conflict' | 'stagnation' | 'orphaned_worker' | 'unknown';
+export type TaskErrorClass = 'transient_backend' | 'transport' | 'browser_automation' | 'agent_session' | 'semantic' | 'story_validation' | 'quality_gate' | 'merge_conflict' | 'stagnation' | 'orphaned_worker' | 'unknown';
 export type TaskIntegrationStatus = 'not_started' | 'integrated' | 'blocked_conflict' | 'failed';
 export type TaskTargetSyncStatus = 'not_requested' | 'synced' | 'deferred_dirty_checkout' | 'disabled' | 'failed';
 export type TaskCoordinationStatus = 'clear' | 'blocked_predicted_overlap' | 'blocked_observed_overlap';
@@ -76,6 +103,10 @@ export interface FinalizerFailureDetails {
   packageLabel: string;
   cwd: string;
   command: string;
+  preparationCommands?: string[];
+  validationCommands?: string[];
+  parentCommand?: string;
+  parentCwd?: string;
   exitCode?: number;
   timedOut?: boolean;
   startFailed?: boolean;
@@ -84,8 +115,42 @@ export interface FinalizerFailureDetails {
   failedFiles?: string[];
   failedCodes?: string[];
   failedSymbols?: string[];
+  failedTests?: string[];
   diagnostics?: FinalizeFailureDiagnostic[];
+  nestedFailures?: PackageGateFailure[];
   rawMessage: string;
+}
+
+export interface PackageGateFailure {
+  packageLabel: string;
+  packageName?: string;
+  gate: string;
+  cwd: string;
+  command: string;
+  exitCode?: number;
+  source: 'direct_package_script' | 'turbo_nested_failure' | 'root_script';
+  rawMessage: string;
+}
+
+export interface FailureObservation {
+  id: string;
+  observedAt: number;
+  kind: 'quality_gate' | 'merge_conflict' | 'finalizer_error';
+  class?: FinalizeFailureClass;
+  gate?: string;
+  requestedGate?: string;
+  packageLabel?: string;
+  cwd?: string;
+  command?: string;
+  parentCommand?: string;
+  parentCwd?: string;
+  signature: string;
+  rawMessage: string;
+  nestedFailures?: PackageGateFailure[];
+  failedFiles?: string[];
+  failedTests?: string[];
+  failedSymbols?: string[];
+  diagnosticSignature?: string;
 }
 
 export interface TaskRepairContext {
@@ -93,6 +158,117 @@ export interface TaskRepairContext {
   storyId: string;
   createdAt: number;
   reason: string;
+}
+
+export type BaselineQualityGateRootCause =
+  | 'task_induced'
+  | 'shared_baseline_code_debt'
+  | 'generated_artifact_drift'
+  | 'dependency_bootstrap_worktree_environment'
+  | 'toolchain_flake'
+  | 'unsafe_ambiguous';
+
+export type BaselineRecoveryPhase =
+  | 'classified'
+  | 'task_env_self_heal'
+  | 'task_env_repaired'
+  | 'baseline_repair_enqueued'
+  | 'waiting_for_baseline_repair'
+  | 'baseline_repair_integrated'
+  | 'stopped';
+
+export interface BaselineQualityGateEnvironmentRepairState {
+  attemptedAt: number;
+  attempts: number;
+  repaired: boolean;
+  message: string;
+  removedPaths?: string[];
+  installRoot?: string;
+  packageManager?: string;
+}
+
+export interface ToolchainEnvFingerprint {
+  corepackHome?: string;
+  pnpmHome?: string;
+  xdgCacheHome?: string;
+  prismaEnginesCacheDir?: string;
+  packageManagerSpec?: string;
+}
+
+export interface BaselineQualityGateState {
+  kind: 'baseline_quality_gate_failure' | 'task_quality_gate_failure' | 'baseline_probe_failed';
+  failureObservationId?: string;
+  observedAt: number;
+  lastUpdatedAt?: number;
+  targetBranch: string;
+  gate: string;
+  packageLabel: string;
+  signature: string;
+  latestFailureSignature?: string;
+  taskFailureSignature?: string;
+  baselineFailureSignature?: string;
+  repairKey?: string;
+  repairGroupKey?: string;
+  repairComponentKey?: string;
+  message: string;
+  rootCause?: BaselineQualityGateRootCause;
+  taskRootCause?: BaselineQualityGateRootCause;
+  phase?: BaselineRecoveryPhase;
+  confidence?: number;
+  repairTaskId?: string;
+  demandTaskIds?: string[];
+  cycleId?: string;
+  cycleTaskIds?: string[];
+  supersededByRepairTaskId?: string;
+  environmentFingerprint?: ToolchainEnvFingerprint;
+  baselineFailure?: FinalizerFailureDetails;
+  taskEnvRepair?: BaselineQualityGateEnvironmentRepairState;
+  baselineEnvRepair?: BaselineQualityGateEnvironmentRepairState;
+  stoppedAt?: number;
+  stopReason?: string;
+}
+
+export interface BaselineRepairLinkState {
+  repairKey: string;
+  repairGroupKey?: string;
+  repairComponentKey?: string;
+  repairKeyAliases?: string[];
+  coalescedFromRepairTaskIds?: string[];
+  supersededByRepairTaskId?: string;
+  supersededAt?: number;
+  supersessionReason?: string;
+  cycleId?: string;
+  cycleTaskIds?: string[];
+  discoveryCount?: number;
+  lastDiscoveredFailureSignature?: string;
+  lastDiscoveredGate?: string;
+  generation?: number;
+  generationStartedAt?: number;
+  generationDeadlineAt?: number;
+  generationTotalRequeues?: number;
+  appliedRepairCommitShas?: string[];
+  followupRepairTaskIds?: string[];
+  lastPostRepairFailureSignature?: string;
+  lastPostRepairClassification?: 'same_baseline' | 'new_baseline' | 'task_specific' | 'probe_ambiguous';
+  dedicatedRepairTask?: boolean;
+  rootCause?: BaselineQualityGateRootCause;
+  targetBranch: string;
+  gate: string;
+  packageLabel: string;
+  demandTaskIds: string[];
+  repairTaskId?: string;
+  repairPrdId?: string;
+  startedAt: number;
+  updatedAt: number;
+  deadlineAt?: number;
+  status?: 'pending' | 'waiting' | 'integrated' | 'failed' | 'superseded' | 'coalescing' | 'needs_more_repair';
+  message?: string;
+  appliedRepairCommitSha?: string;
+  appliedRepairFiles?: string[];
+  appliedToWorktreeAt?: number;
+  applySkippedReason?: string;
+  applyConflictFiles?: string[];
+  applyReconcileAttempts?: number;
 }
 
 export interface TaskMergeRepairProof {
@@ -128,6 +304,10 @@ export interface Task {
   completedUS: string[];
   storyProgress?: StoryProgress[];
   worktree: string;
+  worktreeReclaimedAt?: number;
+  worktreeReclaimedBy?: 'manager' | 'watchdog' | 'manual';
+  worktreeReclaimReason?: string;
+  worktreeReclaimReportPath?: string;
   logPath: string;
   eventLogPath?: string;
   pid?: number;
@@ -165,6 +345,25 @@ export interface Task {
   autoRecoveryStoppedAt?: number;
   autoRecoveryStopReason?: string;
   autoRecoveryLastReason?: string;
+  followupPrdIds?: string[];
+  followupTaskIds?: string[];
+  followupGeneratedAt?: number;
+  followupReason?: string;
+  followupGenerationLastSignature?: string;
+  followupGenerationTotal?: number;
+  followupGenerationHardCap?: number;
+  autonomyRepairKind?: TaskAutonomyRepairKind;
+  autonomyRepairStartedAt?: number;
+  autonomyRepairDeadlineAt?: number;
+  autonomyRepairTotalRequeues?: number;
+  autonomyRepairConsecutiveNoProgress?: number;
+  autonomyRepairLastSignature?: string;
+  autonomyRepairLastProgressReason?: string;
+  autonomyRepairLastRequeuedAt?: number;
+  autonomyRepairNextEligibleAt?: number;
+  autonomyRepairStoppedAt?: number;
+  autonomyRepairStopReason?: string;
+  autonomyRepairLastReason?: string;
   failedBlockerRecoveryStartedAt?: number;
   failedBlockerRecoveryDeadlineAt?: number;
   failedBlockerRecoveryTotalRequeues?: number;
@@ -172,6 +371,14 @@ export interface Task {
   failedBlockerRecoveryStoppedAt?: number;
   failedBlockerRecoveryStopReason?: string;
   failedBlockerRecoveryDemandTaskIds?: string[];
+  storyRepairRecoveryStartedAt?: number;
+  storyRepairRecoveryDeadlineAt?: number;
+  storyRepairRecoveryTotalRequeues?: number;
+  storyRepairRecoveryLastSignature?: string;
+  storyRepairRecoveryConsecutiveSameSignature?: number;
+  storyRepairRecoveryStoppedAt?: number;
+  storyRepairRecoveryStopReason?: string;
+  storyRepairRecoveryDemandTaskIds?: string[];
   transientRecoveryStartedAt?: number;
   transientRecoveryDeadlineAt?: number;
   transientRecoveryTotalRequeues?: number;
@@ -179,17 +386,33 @@ export interface Task {
   transientRecoveryLastFailureKind?: string;
   transientRecoveryLastFailureClass?: TaskErrorClass;
   transientRecoveryLastFailureSignature?: string;
+  transientRecoveryLastFailureObservedAt?: number;
+  transientRecoveryLastFailureStoryId?: string;
+  transientRecoveryLastProgressReason?: string;
   transientRecoveryLastDelayMs?: number;
   transientRecoveryNextEligibleAt?: number;
   transientRecoveryStoppedAt?: number;
   transientRecoveryStopReason?: string;
   transientRecoveryLastRequeuedStoryId?: string;
   transientRecoveryLastHadObjectiveProgress?: boolean;
+  agentContextRecoveryStartedAt?: number;
+  agentContextRecoveryDeadlineAt?: number;
+  agentContextRecoveryTotalRequeues?: number;
+  agentContextRecoveryLastSignature?: string;
+  agentContextRecoveryLastRequeuedStoryId?: string;
+  agentContextRecoveryStoppedAt?: number;
+  agentContextRecoveryStopReason?: string;
   finalizerCommitMessage?: string;
   finalizerCommitSha?: string;
   finalizerCommittedAt?: number;
   finalizerAttempts?: number;
   finalizerFailure?: FinalizerFailureDetails;
+  latestFailure?: FailureObservation;
+  failureHistory?: FailureObservation[];
+  baselineQualityGate?: BaselineQualityGateState;
+  baselineQualityGateHistory?: BaselineQualityGateState[];
+  baselineRepair?: BaselineRepairLinkState;
+  baselineRepairRole?: 'demand_task' | 'dedicated_repair_task';
   repairContext?: TaskRepairContext;
   finalizeRepairStartedAt?: number;
   finalizeRepairDeadlineAt?: number;

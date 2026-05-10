@@ -18,6 +18,7 @@ import {
   classifyQualityGateFailure,
   QualityGateFailure,
 } from './finalize-failure-classifier';
+import { buildRalphToolchainEnv } from './toolchain-env';
 import { resolveWorkspacePackageDirs } from './workspaces';
 import { parsePRD } from '../utils/helpers';
 
@@ -32,6 +33,10 @@ export interface FinalizeResult {
 interface PackageManifest {
   scripts?: Record<string, string>;
   workspaces?: string[] | { packages?: string[] };
+  dependencies?: Record<string, string>;
+  devDependencies?: Record<string, string>;
+  optionalDependencies?: Record<string, string>;
+  peerDependencies?: Record<string, string>;
 }
 
 const QUALITY_GATE_SCRIPTS = ['typecheck', 'lint', 'test', 'build'] as const;
@@ -76,7 +81,7 @@ function sanitizeTempName(value: string): string {
   return value.replace(/[^a-zA-Z0-9_.-]+/g, '-').slice(0, 80) || 'task';
 }
 
-function createQualityGateSandbox(task: Task): QualityGateSandbox {
+function createQualityGateSandbox(task: Task, installRoot?: string): QualityGateSandbox {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), `ralph-quality-gate-${sanitizeTempName(task.id)}-`));
   const home = path.join(root, 'home');
   const ralphHome = path.join(root, 'ralph-home');
@@ -84,8 +89,8 @@ function createQualityGateSandbox(task: Task): QualityGateSandbox {
   fs.mkdirSync(home, { recursive: true });
   fs.mkdirSync(ralphHome, { recursive: true });
 
-  return {
-    env: {
+  const { env, fingerprint } = buildRalphToolchainEnv({
+    baseEnv: {
       ...process.env,
       HOME: home,
       USERPROFILE: home,
@@ -94,6 +99,14 @@ function createQualityGateSandbox(task: Task): QualityGateSandbox {
       XDG_CACHE_HOME: path.join(home, '.cache'),
       RALPH_QUALITY_GATE_HOME: ralphHome,
     },
+    installRoot,
+    ralphHome: process.env.RALPH_HOME,
+    sandboxHome: home,
+  });
+  appendFinalizeLog(task, `Quality gate toolchain env: ${JSON.stringify(fingerprint)}`);
+
+  return {
+    env,
     cleanup: () => fs.rmSync(root, { recursive: true, force: true }),
   };
 }
@@ -563,6 +576,8 @@ function resolvePrismaPreparationExecutions(
   installRoot: string,
   manifest: PackageManifest | null,
   changedFiles: string[],
+  requestedScripts: QualityGateScript[],
+  targets: QualityGateTarget[],
 ): ResolvedPreparationExecution[] {
   const normalizedChangedFiles = normalizeChangedFileSet(changedFiles);
   const candidateDirs = [
@@ -570,6 +585,10 @@ function resolvePrismaPreparationExecutions(
     ...resolveWorkspacePackageDirs(installRoot, manifest),
   ];
   const resolved = new Map<string, ResolvedPreparationExecution>();
+  const willRunTypecheck = targets.some((target) => (
+    resolveScriptExecutions(target, requestedScripts)
+      .some((script) => script.requestedScript === 'typecheck' || script.actualScript === 'typecheck')
+  ));
 
   for (const candidateDir of candidateDirs) {
     const relativeDir = path.relative(installRoot, candidateDir).replace(/\\/g, '/');
@@ -580,9 +599,11 @@ function resolvePrismaPreparationExecutions(
     const prefix = relativeDir ? `${relativeDir}/` : '';
     const schemaPath = `${prefix}prisma/schema.prisma`;
     const migrationPrefix = `${prefix}prisma/migrations/`;
-    const needsGenerate = [...normalizedChangedFiles].some((file) => (
+    const hasPrismaSchema = fs.existsSync(path.join(candidateDir, 'prisma', 'schema.prisma'));
+    const changedPrismaArtifact = [...normalizedChangedFiles].some((file) => (
       file === schemaPath || file.startsWith(migrationPrefix)
     ));
+    const needsGenerate = changedPrismaArtifact || (willRunTypecheck && hasPrismaSchema);
 
     if (!needsGenerate) {
       continue;
@@ -607,7 +628,75 @@ function resolvePrismaPreparationExecutions(
         label,
         cwd: candidateDir,
         actualScript,
-        reason: 'Prisma schema or migration changed',
+        reason: changedPrismaArtifact
+          ? 'Prisma schema or migration changed'
+          : 'Root typecheck may consume generated Prisma client types',
+      });
+    }
+  }
+
+  return [...resolved.values()];
+}
+
+function manifestHasDependency(manifest: PackageManifest | null, packageName: string): boolean {
+  const dependencyGroups = [
+    manifest?.dependencies,
+    manifest?.devDependencies,
+    manifest?.optionalDependencies,
+    manifest?.peerDependencies,
+  ];
+
+  return dependencyGroups.some((dependencies) => (
+    dependencies
+    && typeof dependencies === 'object'
+    && typeof dependencies[packageName] === 'string'
+  ));
+}
+
+function resolveWorkspaceBuildPreparationExecutions(
+  installRoot: string,
+  manifest: PackageManifest | null,
+  changedFiles: string[],
+): ResolvedPreparationExecution[] {
+  const workspaceDirs = resolveWorkspacePackageDirs(installRoot, manifest);
+  if (workspaceDirs.length === 0) {
+    return [];
+  }
+
+  const normalizedChangedFiles = normalizeChangedFileSet(changedFiles);
+  const resolved = new Map<string, ResolvedPreparationExecution>();
+
+  for (const workspaceDir of workspaceDirs) {
+    const relativeDir = path.relative(installRoot, workspaceDir).replace(/\\/g, '/');
+    if (!relativeDir || relativeDir.startsWith('..')) {
+      continue;
+    }
+
+    const changedInWorkspace = [...normalizedChangedFiles].some((file) => (
+      file === relativeDir || file.startsWith(`${relativeDir}/`)
+    ));
+    if (!changedInWorkspace) {
+      continue;
+    }
+
+    const workspaceManifest = readPackageManifest(workspaceDir);
+    if (typeof workspaceManifest?.scripts?.build !== 'string') {
+      continue;
+    }
+
+    // App builds are already first-class quality gates. Library package builds
+    // prepare ignored dist artifacts needed by downstream workspace tests.
+    if (manifestHasDependency(workspaceManifest, 'next')) {
+      continue;
+    }
+
+    const key = `${workspaceDir}:build`;
+    if (!resolved.has(key)) {
+      resolved.set(key, {
+        label: relativeDir,
+        cwd: workspaceDir,
+        actualScript: 'build',
+        reason: 'Changed workspace package may be consumed by downstream quality gates',
       });
     }
   }
@@ -779,6 +868,25 @@ function formatTimeoutSeconds(timeoutMs: number): string {
     : timeoutSeconds.toFixed(2).replace(/0+$/, '').replace(/\.$/, '');
 }
 
+function shellQuote(value: string): string {
+  return `'${value.replace(/'/g, `'\\''`)}'`;
+}
+
+function formatQualityGateValidationCommand(
+  worktreePath: string,
+  cwd: string,
+  packageManager: string,
+  script: string,
+): string {
+  const relativeCwd = path.relative(worktreePath, cwd).replace(/\\/g, '/');
+  const command = `${packageManager} run ${script}`;
+  if (!relativeCwd || relativeCwd === '.') {
+    return command;
+  }
+
+  return `cd ${shellQuote(relativeCwd)} && ${command}`;
+}
+
 function resolveConfiguredQualityGates(config: Pick<ConfigManager, 'get'>): QualityGateScript[] {
   const configuredGates = config.get('finalizer.qualityGates');
 
@@ -826,15 +934,31 @@ function runQualityGates(task: Task, timeoutMs: number, configuredScripts: Quali
   const executedScripts: string[] = [];
   const changedFileSet = normalizeChangedFileSet(changedFiles);
   const changedLineMap = buildChangedLineMap(task.worktree, task.baseCommitSha);
-  const preparations = resolvePrismaPreparationExecutions(
-    installRoot,
-    manifest,
-    changedFiles,
-  );
-  const sandbox = createQualityGateSandbox(task);
+  const preparations = [
+    ...resolvePrismaPreparationExecutions(
+      installRoot,
+      manifest,
+      changedFiles,
+      requestedScripts,
+      targets,
+    ),
+    ...resolveWorkspaceBuildPreparationExecutions(
+      installRoot,
+      manifest,
+      changedFiles,
+    ),
+  ];
+  const sandbox = createQualityGateSandbox(task, installRoot);
+  const completedPreparationCommands: string[] = [];
 
   try {
     for (const preparation of preparations) {
+      const preparationCommand = formatQualityGateValidationCommand(
+        task.worktree,
+        preparation.cwd,
+        packageManager,
+        preparation.actualScript,
+      );
       appendFinalizeLog(
         task,
         `Running quality gate preparation: ${packageManager} run ${preparation.actualScript} (reason: ${preparation.reason}, cwd: ${preparation.cwd})`
@@ -854,18 +978,22 @@ function runQualityGates(task: Task, timeoutMs: number, configuredScripts: Quali
       }
 
       if (result.timedOut) {
-          throw new QualityGateFailure(classifyQualityGateFailure({
-            requestedScript: 'typecheck',
-            actualScript: preparation.actualScript,
-            cwd: preparation.cwd,
-            packageLabel: preparation.label,
-            command,
-            rawMessage: `Quality gate preparation "${preparation.actualScript}" timed out after ${formatTimeoutSeconds(timeoutMs)}s`,
-            stdout: result.stdout,
-            stderr: result.stderr,
-            exitCode: result.status,
-            timedOut: true,
-          }));
+        throw new QualityGateFailure(classifyQualityGateFailure({
+          requestedScript: 'typecheck',
+          actualScript: preparation.actualScript,
+          cwd: preparation.cwd,
+          packageLabel: preparation.label,
+          command,
+          validationCommands: [...completedPreparationCommands, preparationCommand],
+          rawMessage: `Quality gate preparation "${preparation.actualScript}" timed out after ${formatTimeoutSeconds(timeoutMs)}s`,
+          stdout: result.stdout,
+          stderr: result.stderr,
+          exitCode: result.status,
+          timedOut: true,
+          taskId: task.id,
+          taskWorktree: task.worktree,
+          repoPath: task.repoPath,
+        }));
       }
 
       if (result.error) {
@@ -875,11 +1003,15 @@ function runQualityGates(task: Task, timeoutMs: number, configuredScripts: Quali
           cwd: preparation.cwd,
           packageLabel: preparation.label,
           command,
+          validationCommands: [...completedPreparationCommands, preparationCommand],
           rawMessage: `Quality gate preparation "${preparation.actualScript}" failed to start: ${result.error.message}`,
           stdout: result.stdout,
           stderr: result.stderr,
           exitCode: result.status,
           startFailed: true,
+          taskId: task.id,
+          taskWorktree: task.worktree,
+          repoPath: task.repoPath,
         }));
       }
 
@@ -891,13 +1023,18 @@ function runQualityGates(task: Task, timeoutMs: number, configuredScripts: Quali
           cwd: preparation.cwd,
           packageLabel: preparation.label,
           command,
+          validationCommands: [...completedPreparationCommands, preparationCommand],
           rawMessage: `Quality gate preparation "${preparation.actualScript}" failed: ${errorMessage}`,
           stdout: result.stdout,
           stderr: result.stderr,
           exitCode: result.status,
+          taskId: task.id,
+          taskWorktree: task.worktree,
+          repoPath: task.repoPath,
         }));
       }
 
+      completedPreparationCommands.push(preparationCommand);
       executedScripts.push(`${preparation.label}:${preparation.actualScript}[prepare]`);
     }
 
@@ -909,6 +1046,12 @@ function runQualityGates(task: Task, timeoutMs: number, configuredScripts: Quali
       }
 
       for (const scriptExecution of availableScripts) {
+        const validationCommand = formatQualityGateValidationCommand(
+          task.worktree,
+          target.cwd,
+          packageManager,
+          scriptExecution.actualScript,
+        );
         appendFinalizeLog(
           task,
           `Running quality gate: ${packageManager} run ${scriptExecution.actualScript} (requested: ${scriptExecution.requestedScript}, cwd: ${target.cwd})`
@@ -934,11 +1077,16 @@ function runQualityGates(task: Task, timeoutMs: number, configuredScripts: Quali
             cwd: target.cwd,
             packageLabel: target.label,
             command,
+            preparationCommands: completedPreparationCommands,
+            validationCommands: [...completedPreparationCommands, validationCommand],
             rawMessage: `Quality gate "${scriptExecution.actualScript}" timed out after ${formatTimeoutSeconds(timeoutMs)}s`,
             stdout: result.stdout,
             stderr: result.stderr,
             exitCode: result.status,
             timedOut: true,
+            taskId: task.id,
+            taskWorktree: task.worktree,
+            repoPath: task.repoPath,
           }));
         }
 
@@ -949,11 +1097,16 @@ function runQualityGates(task: Task, timeoutMs: number, configuredScripts: Quali
             cwd: target.cwd,
             packageLabel: target.label,
             command,
+            preparationCommands: completedPreparationCommands,
+            validationCommands: [...completedPreparationCommands, validationCommand],
             rawMessage: `Quality gate "${scriptExecution.actualScript}" failed to start: ${result.error.message}`,
             stdout: result.stdout,
             stderr: result.stderr,
             exitCode: result.status,
             startFailed: true,
+            taskId: task.id,
+            taskWorktree: task.worktree,
+            repoPath: task.repoPath,
           }));
         }
 
@@ -982,10 +1135,15 @@ function runQualityGates(task: Task, timeoutMs: number, configuredScripts: Quali
             cwd: target.cwd,
             packageLabel: target.label,
             command,
+            preparationCommands: completedPreparationCommands,
+            validationCommands: [...completedPreparationCommands, validationCommand],
             rawMessage: `Quality gate "${scriptExecution.actualScript}" failed: ${errorMessage}`,
             stdout: result.stdout,
             stderr: result.stderr,
             exitCode: result.status,
+            taskId: task.id,
+            taskWorktree: task.worktree,
+            repoPath: task.repoPath,
           }));
         }
 
@@ -1008,11 +1166,21 @@ function runQualityGates(task: Task, timeoutMs: number, configuredScripts: Quali
 export function finalizeTaskOutput(task: Task): FinalizeResult {
   assertFinalizerScope(task);
 
-  bootstrapWorktreeDeps(task.worktree, {
+  const bootstrapResult = bootstrapWorktreeDeps(task.worktree, {
     repoPath: task.repoPath,
     logPath: task.logPath,
     installIfNeeded: false,
   });
+  if (bootstrapResult.installReason === 'next_turbopack_requires_local_install') {
+    appendFinalizeLog(
+      task,
+      'Retrying dependency bootstrap with local install because Next/Turbopack cannot use repo-external node_modules symlinks',
+    );
+    bootstrapWorktreeDeps(task.worktree, {
+      repoPath: task.repoPath,
+      logPath: task.logPath,
+    });
+  }
 
   const configManager = new ConfigManager();
   const qualityGateTimeoutMs = resolveQualityGateTimeoutMs(configManager);

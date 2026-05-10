@@ -213,6 +213,14 @@ test('retry clears auto-recovery and repair residue for plain failed tasks', () 
       autoRecoveryStoppedAt: 26,
       autoRecoveryStopReason: 'transient_recovery_exhausted',
       autoRecoveryLastReason: 'Transient recovery budget exhausted',
+      storyRepairRecoveryStartedAt: 8,
+      storyRepairRecoveryDeadlineAt: 18,
+      storyRepairRecoveryTotalRequeues: 1,
+      storyRepairRecoveryLastSignature: 'US-002:no_objective_evidence',
+      storyRepairRecoveryConsecutiveSameSignature: 1,
+      storyRepairRecoveryStoppedAt: 26,
+      storyRepairRecoveryStopReason: 'story_repair_budget_exhausted',
+      storyRepairRecoveryDemandTaskIds: ['downstream-task'],
       mergeRepairRecoveryStartedAt: 10,
       mergeRepairRecoveryDeadlineAt: 20,
       mergeRepairRecoveryTotalRequeues: 2,
@@ -248,6 +256,14 @@ test('retry clears auto-recovery and repair residue for plain failed tasks', () 
     assert.equal(state.autoRecoveryTotalRequeues, 0);
     assert.equal(state.autoRecoveryStoppedAt, undefined);
     assert.equal(state.autoRecoveryStopReason, undefined);
+    assert.equal(state.storyRepairRecoveryStartedAt, undefined);
+    assert.equal(state.storyRepairRecoveryDeadlineAt, undefined);
+    assert.equal(state.storyRepairRecoveryTotalRequeues, 0);
+    assert.equal(state.storyRepairRecoveryLastSignature, undefined);
+    assert.equal(state.storyRepairRecoveryConsecutiveSameSignature, 0);
+    assert.equal(state.storyRepairRecoveryStoppedAt, undefined);
+    assert.equal(state.storyRepairRecoveryStopReason, undefined);
+    assert.equal(state.storyRepairRecoveryDemandTaskIds, undefined);
     assert.equal(state.mergeRepairRecoveryStartedAt, undefined);
     assert.equal(state.mergeRepairRecoveryDeadlineAt, undefined);
     assert.equal(state.mergeRepairRecoveryTotalRequeues, 0);

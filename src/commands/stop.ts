@@ -1,5 +1,6 @@
 import { StateManager } from '../core/state';
 import { finalizeTask } from '../core/scheduler';
+import { Task } from '../types/task';
 import { isProcessRunning } from '../utils/helpers';
 
 function signalTaskProcess(pid: number, signal: NodeJS.Signals): boolean {
@@ -26,6 +27,52 @@ function signalTaskProcess(pid: number, signal: NodeJS.Signals): boolean {
   }
 }
 
+function buildOperatorStopRecoveryUpdates(task: Task, stoppedAt: number): Partial<Task> {
+  const updates: Partial<Task> = {
+    autoRecoveryNextEligibleAt: undefined,
+    autoRecoveryStoppedAt: stoppedAt,
+    autoRecoveryStopReason: 'operator_stopped',
+    autoRecoveryLastReason: 'Task was explicitly stopped by operator',
+  };
+
+  switch (task.autoRecoveryKind) {
+    case 'transient':
+      updates.transientRecoveryNextEligibleAt = undefined;
+      updates.transientRecoveryStoppedAt = stoppedAt;
+      updates.transientRecoveryStopReason = 'operator_stopped';
+      break;
+    case 'agent_context':
+      updates.agentContextRecoveryStoppedAt = stoppedAt;
+      updates.agentContextRecoveryStopReason = 'operator_stopped';
+      break;
+    case 'story_repair':
+      updates.storyRepairRecoveryStoppedAt = stoppedAt;
+      updates.storyRepairRecoveryStopReason = 'operator_stopped';
+      break;
+    case 'merge_repair':
+      updates.mergeRepairRecoveryStoppedAt = stoppedAt;
+      updates.mergeRepairRecoveryStopReason = 'operator_stopped';
+      break;
+    case 'finalize_repair':
+      updates.finalizeRepairStoppedAt = stoppedAt;
+      updates.finalizeRepairStopReason = 'operator_stopped';
+      break;
+    case 'baseline_repair':
+      updates.baselineQualityGate = task.baselineQualityGate
+        ? {
+            ...task.baselineQualityGate,
+            stoppedAt,
+            stopReason: 'operator_stopped',
+            lastUpdatedAt: stoppedAt,
+            phase: 'stopped',
+          }
+        : task.baselineQualityGate;
+      break;
+  }
+
+  return updates;
+}
+
 export async function stopCommand(taskId: string): Promise<void> {
   try {
     const stateManager = new StateManager();
@@ -37,6 +84,17 @@ export async function stopCommand(taskId: string): Promise<void> {
     }
     
     if (!task.pid) {
+      if (task.status === 'failed' || task.status === 'stagnant' || task.autoRecoveryKind) {
+        const stoppedAt = Date.now();
+        const recoveryUpdates = buildOperatorStopRecoveryUpdates(task, stoppedAt);
+        await stateManager.updateTask(task.id, recoveryUpdates);
+        console.log(JSON.stringify({
+          message: 'Task recovery stopped',
+          taskId,
+        }));
+        return;
+      }
+
       console.error(JSON.stringify({ error: 'No PID found for task' }));
       process.exit(1);
     }
@@ -46,6 +104,10 @@ export async function stopCommand(taskId: string): Promise<void> {
         message: 'Process already stopped',
         taskId 
       }));
+      const stoppedAt = Date.now();
+      const recoveryUpdates = buildOperatorStopRecoveryUpdates(task, stoppedAt);
+      Object.assign(task, recoveryUpdates);
+      await stateManager.updateTask(task.id, recoveryUpdates);
       await finalizeTask(task, 'failed', { stateManager });
       return;
     }
@@ -61,7 +123,11 @@ export async function stopCommand(taskId: string): Promise<void> {
         // Force kill if still running
         signalTaskProcess(task.pid, 'SIGKILL');
       }
-      
+
+      const stoppedAt = Date.now();
+      const recoveryUpdates = buildOperatorStopRecoveryUpdates(task, stoppedAt);
+      Object.assign(task, recoveryUpdates);
+      await stateManager.updateTask(task.id, recoveryUpdates);
       await finalizeTask(task, 'failed', { stateManager });
       
       console.log(JSON.stringify({

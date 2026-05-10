@@ -6,6 +6,7 @@ import { PRD } from '../types/prd';
 import { Task, TaskStatus } from '../types/task';
 import { checkDependencies, DependencyBlocker, DependencyCheckResult, isProcessRunning, parsePRD } from '../utils/helpers';
 import { bootstrapWorktreeDeps } from './bootstrap';
+import { buildRalphToolchainEnv } from './toolchain-env';
 import { appendTaskEvent } from './events';
 import { evaluateAutoRecovery } from './auto-recovery-state';
 import {
@@ -18,6 +19,13 @@ import { StateManager } from './state';
 import { resolveTaskIntegrationStatus } from './task-delivery';
 import { WorktreeManager } from './worktree';
 import { getManagerStatus } from './manager-state';
+import {
+  cleanupWorktreeProcesses,
+  readWorktreeProcessInfo,
+  resolveConfiguredWorktreeCleanupLockGlobs,
+  WorktreeCleanupResult,
+  WorktreeProcessInfo,
+} from './worktree-process-cleanup';
 
 const DEFAULT_MAX_CONCURRENT = 3;
 const LOCK_RETRY_MS = 50;
@@ -37,10 +45,7 @@ type DependencyChecker = (
   options?: { repoPath?: string; task?: Task }
 ) => Promise<DependencyResult>;
 type ProcessChecker = (pid: number) => boolean;
-interface ProcessInfo {
-  ppid?: number;
-  command?: string;
-}
+interface ProcessInfo extends WorktreeProcessInfo {}
 
 export interface SchedulerDeps extends RalphHomeOptions {
   stateManager?: StateManager;
@@ -57,6 +62,7 @@ export interface SchedulerDeps extends RalphHomeOptions {
   isProcessRunning?: ProcessChecker;
   getProcessInfo?: (pid: number) => ProcessInfo | undefined;
   terminateProcess?: (pid: number, signal?: NodeJS.Signals | number) => void;
+  cleanupWorktreeProcesses?: typeof cleanupWorktreeProcesses;
   managerOwnedScheduling?: boolean;
   lockDir?: string;
   now?: () => number;
@@ -116,27 +122,17 @@ function toTimeoutMs(value: unknown, fallbackMs: number): number {
 }
 
 function readProcessInfo(pid: number): ProcessInfo | undefined {
-  if (process.platform === 'win32') {
+  return readWorktreeProcessInfo(pid);
+}
+
+function parseLeaseOwnerPid(leaseOwner: string | undefined, kind: string): number | undefined {
+  const match = new RegExp(`^${kind}:(\\d+)$`).exec(leaseOwner || '');
+  if (!match) {
     return undefined;
   }
 
-  try {
-    const output = execFileSync('ps', ['-p', String(pid), '-o', 'ppid=', '-o', 'command='], {
-      encoding: 'utf-8',
-      stdio: ['ignore', 'pipe', 'ignore'],
-    }).trim();
-    const match = output.match(/^(\d+)\s+([\s\S]*)$/);
-    if (!match) {
-      return undefined;
-    }
-
-    return {
-      ppid: Number(match[1]),
-      command: match[2],
-    };
-  } catch {
-    return undefined;
-  }
+  const pid = Number(match[1]);
+  return Number.isInteger(pid) && pid > 0 ? pid : undefined;
 }
 
 function resolveSchedulerRalphHome(deps: SchedulerDeps): string {
@@ -175,6 +171,7 @@ export class TaskScheduler {
   private readonly isProcessRunningFn: ProcessChecker;
   private readonly getProcessInfoFn: (pid: number) => ProcessInfo | undefined;
   private readonly terminateProcessFn: (pid: number, signal?: NodeJS.Signals | number) => void;
+  private readonly cleanupWorktreeProcessesFn: typeof cleanupWorktreeProcesses;
   private readonly now: () => number;
   private readonly sleep: (ms: number) => Promise<void>;
   private readonly lockDir: string;
@@ -194,6 +191,7 @@ export class TaskScheduler {
     this.isProcessRunningFn = deps.isProcessRunning ?? isProcessRunning;
     this.getProcessInfoFn = deps.getProcessInfo ?? readProcessInfo;
     this.terminateProcessFn = deps.terminateProcess ?? ((pid, signal) => process.kill(pid, signal));
+    this.cleanupWorktreeProcessesFn = deps.cleanupWorktreeProcesses ?? cleanupWorktreeProcesses;
     this.now = deps.now ?? (() => Date.now());
     this.sleep = deps.sleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
     this.lockDir = deps.lockDir ?? path.join(this.ralphHome, 'scheduler.lock');
@@ -257,6 +255,15 @@ export class TaskScheduler {
     return false;
   }
 
+  private resolveDeadLeaseOwnerPid(task: Task, kind: string): number | undefined {
+    const ownerPid = parseLeaseOwnerPid(task.leaseOwner, kind);
+    if (ownerPid === undefined) {
+      return undefined;
+    }
+
+    return this.isProcessRunningFn(ownerPid) ? undefined : ownerPid;
+  }
+
   private isOrphanedManagedWorker(task: Task): boolean {
     if (typeof task.pid !== 'number' || task.leaseOwner !== `worker:${task.pid}`) {
       return false;
@@ -280,6 +287,75 @@ export class TaskScheduler {
     return command.includes('worker.js') && command.includes(task.id);
   }
 
+  private signalWorkerProcess(pid: number, signal: NodeJS.Signals): void {
+    if (process.platform !== 'win32') {
+      try {
+        this.terminateProcessFn(-pid, signal);
+        return;
+      } catch (error) {
+        const code = (error as NodeJS.ErrnoException).code;
+        if (code !== 'ESRCH' && code !== 'EPERM' && code !== 'EINVAL') {
+          throw error;
+        }
+      }
+    }
+
+    this.terminateProcessFn(pid, signal);
+  }
+
+  private async cleanupTaskWorktreeProcesses(
+    task: Pick<Task, 'id' | 'worktree' | 'logPath' | 'eventLogPath' | 'status'>,
+    reason: string,
+    protectedPids: number[] = []
+  ): Promise<WorktreeCleanupResult> {
+    const result = await this.cleanupWorktreeProcessesFn({
+      taskId: task.id,
+      worktreePath: task.worktree,
+      reason,
+      protectedPids,
+      lockGlobs: this.getWorktreeCleanupLockGlobs(),
+    }, {
+      getProcessInfo: this.getProcessInfoFn,
+      isProcessRunning: this.isProcessRunningFn,
+      terminateProcess: this.terminateProcessFn,
+      now: this.now,
+      sleep: this.sleep,
+    });
+
+    if (result.killed.length > 0 || result.skipped.length > 0) {
+      const message = result.killed.length > 0
+        ? `Cleaned ${result.killed.length} worktree lock holder process(es): ${reason}`
+        : `Skipped ${result.skipped.length} worktree lock holder process(es): ${reason}`;
+      console.error(`Task ${task.id}: ${message}`);
+      appendTaskEvent(task, {
+        type: 'worktree_process_cleanup',
+        status: task.status,
+        message,
+        data: {
+          reason,
+          worktree: task.worktree,
+          lockPaths: result.lockPaths,
+          killed: result.killed.map((entry) => ({
+            pid: entry.pid,
+            pgid: entry.pgid,
+            signalPid: entry.signalPid,
+            signalScope: entry.signalScope,
+            cwd: entry.cwd,
+            command: entry.command,
+            lockPath: entry.lockPath,
+          })),
+          skipped: result.skipped,
+        },
+      });
+    }
+
+    return result;
+  }
+
+  private getWorktreeCleanupLockGlobs(): string[] | undefined {
+    return resolveConfiguredWorktreeCleanupLockGlobs(this.configManager);
+  }
+
   private async terminateWorkerForRecovery(task: Pick<Task, 'id' | 'pid'>, reason: string): Promise<boolean> {
     if (typeof task.pid !== 'number') {
       return true;
@@ -290,7 +366,7 @@ export class TaskScheduler {
     }
 
     try {
-      this.terminateProcessFn(task.pid, 'SIGTERM');
+      this.signalWorkerProcess(task.pid, 'SIGTERM');
     } catch (error) {
       console.error(`Failed to send SIGTERM to worker ${task.pid} for task ${task.id}: ${error instanceof Error ? error.message : String(error)}`);
     }
@@ -305,7 +381,7 @@ export class TaskScheduler {
     }
 
     try {
-      this.terminateProcessFn(task.pid, 'SIGKILL');
+      this.signalWorkerProcess(task.pid, 'SIGKILL');
     } catch (error) {
       console.error(`Failed to send SIGKILL to worker ${task.pid} for task ${task.id}: ${error instanceof Error ? error.message : String(error)}`);
     }
@@ -344,6 +420,7 @@ export class TaskScheduler {
 
         const lastError = 'Worker process PID is missing and the running lease is stale';
         console.error(`Recovering stale running task ${latestTask.id}: ${lastError}`);
+        await this.cleanupTaskWorktreeProcesses(latestTask, 'recover_stale_running_missing_pid');
         const updateResult = await this.stateManager.updateTaskIf(latestTask.id, (candidate) => (
           candidate.status === 'running'
           && candidate.pid === undefined
@@ -370,7 +447,13 @@ export class TaskScheduler {
       }
 
       if (this.isProcessRunningFn(latestTask.pid)) {
+        const hasFreshWorkerLease = this.isLeaseFresh(latestTask, leaseTimeoutMs);
         if (this.isOrphanedManagedWorker(latestTask)) {
+          if (hasFreshWorkerLease) {
+            activeTasks.push(latestTask);
+            continue;
+          }
+
           const lastError = `Worker process ${latestTask.pid} is orphaned from the current manager; task was returned to pending for a fresh worker`;
           console.error(`Recovering orphaned running task ${latestTask.id}: ${lastError}`);
           const terminated = await this.terminateWorkerForRecovery(latestTask, lastError);
@@ -382,6 +465,7 @@ export class TaskScheduler {
 
           const observedPid = latestTask.pid;
           const observedLeaseOwner = latestTask.leaseOwner;
+          await this.cleanupTaskWorktreeProcesses(latestTask, 'recover_orphaned_worker');
           const updateResult = await this.stateManager.updateTaskIf(latestTask.id, (candidate) => (
             candidate.status === 'running'
             && candidate.pid === observedPid
@@ -415,6 +499,7 @@ export class TaskScheduler {
           Number.isFinite(stagnationTimeoutMs)
           && typeof latestTask.lastProgressTime === 'number'
           && this.now() - latestTask.lastProgressTime >= Number(stagnationTimeoutMs)
+          && !hasFreshWorkerLease
         ) {
           const noProgressMs = this.now() - latestTask.lastProgressTime;
           const lastError = `Running worker made no progress for ${Math.floor(noProgressMs / 1000)}s; task was marked stagnant for retry`;
@@ -429,6 +514,7 @@ export class TaskScheduler {
           const observedPid = latestTask.pid;
           const observedLeaseOwner = latestTask.leaseOwner;
           const observedLastProgressTime = latestTask.lastProgressTime;
+          await this.cleanupTaskWorktreeProcesses(latestTask, 'recover_stagnant_running');
           const updateResult = await this.stateManager.updateTaskIf(latestTask.id, (candidate) => (
             candidate.status === 'running'
             && candidate.pid === observedPid
@@ -468,10 +554,18 @@ export class TaskScheduler {
       }
 
       const lastError = `Worker process ${latestTask.pid} is no longer running`;
+      const deadWorkerObservedAt = this.now();
+      const deadWorkerKind = latestTask.repairContext?.mode === 'merge'
+        ? 'merge_repair_worker_exited'
+        : 'worker_process_exited';
+      const deadWorkerMode = latestTask.repairContext?.mode ?? 'worker';
+      const deadWorkerStory = latestTask.repairContext?.storyId ?? latestTask.currentUS ?? 'unknown';
+      const deadWorkerCurrentUS = latestTask.currentUS ?? 'unknown';
 
       console.error(`Recovering stale running task ${latestTask.id}: ${lastError}`);
       const observedPid = latestTask.pid;
       const observedLeaseOwner = latestTask.leaseOwner;
+      await this.cleanupTaskWorktreeProcesses(latestTask, 'recover_dead_worker');
       const updateResult = await this.stateManager.updateTaskIf(latestTask.id, (candidate) => (
         candidate.status === 'running'
         && candidate.pid === observedPid
@@ -482,10 +576,15 @@ export class TaskScheduler {
         currentUS: undefined,
         pid: undefined,
         leaseOwner: undefined,
-        leaseHeartbeatAt: undefined,
-        leaseExpiresAt: undefined,
-        lastError,
-      });
+          leaseHeartbeatAt: undefined,
+          leaseExpiresAt: undefined,
+          lastError,
+          lastErrorKind: deadWorkerKind,
+          lastErrorClass: 'transient_backend',
+          lastErrorRetryable: true,
+          lastErrorObservedAt: deadWorkerObservedAt,
+          lastErrorSignature: `worker_exit:${deadWorkerMode}/${deadWorkerStory}:${deadWorkerCurrentUS}`,
+        });
       if (updateResult.updated) {
         appendTaskEvent(updateResult.task ?? latestTask, {
           type: 'task_recovered_stale_running',
@@ -510,12 +609,16 @@ export class TaskScheduler {
         continue;
       }
 
-      if (this.isLeaseFresh(latestTask, leaseTimeoutMs)) {
+      const deadOwnerPid = this.resolveDeadLeaseOwnerPid(latestTask, 'finalizer');
+      if (this.isLeaseFresh(latestTask, leaseTimeoutMs) && deadOwnerPid === undefined) {
         continue;
       }
 
-      const lastError = 'Finalizer lease is stale; task was returned to ready_to_finalize for retry';
+      const lastError = deadOwnerPid !== undefined
+        ? `Finalizer lease owner process ${deadOwnerPid} is not running; task was returned to ready_to_finalize for retry`
+        : 'Finalizer lease is stale; task was returned to ready_to_finalize for retry';
       console.error(`Recovering stale finalizing task ${latestTask.id}: ${lastError}`);
+      await this.cleanupTaskWorktreeProcesses(latestTask, 'recover_stale_finalizing');
       await this.stateManager.updateTask(latestTask.id, {
         status: 'ready_to_finalize',
         endTime: undefined,
@@ -530,6 +633,7 @@ export class TaskScheduler {
         type: 'task_recovered_stale_finalizing',
         status: 'ready_to_finalize',
         message: lastError,
+        data: deadOwnerPid !== undefined ? { deadOwnerPid } : undefined,
       });
     }
   }
@@ -768,8 +872,11 @@ export class TaskScheduler {
         }
       }
 
+      await this.cleanupTaskWorktreeProcesses(currentTask, 'before_worker_start');
+
       this.bootstrapWorktreeDepsFn(currentTask.worktree, {
         repoPath: currentTask.repoPath,
+        ralphHome: this.ralphHome,
         logPath: currentTask.logPath,
       });
 
@@ -806,13 +913,18 @@ export class TaskScheduler {
       };
 
       const workerPath = path.join(__dirname, '../worker.js');
-      const child = this.forkProcessFn(workerPath, [currentTask.id], {
-        detached: true,
-        stdio: 'ignore',
-        env: {
+      const { env } = buildRalphToolchainEnv({
+        baseEnv: {
           ...process.env,
           RALPH_HOME: this.ralphHome,
         },
+        installRoot: currentTask.worktree,
+        ralphHome: this.ralphHome,
+      });
+      const child = this.forkProcessFn(workerPath, [currentTask.id], {
+        detached: true,
+        stdio: 'ignore',
+        env,
       });
 
       child.disconnect?.();
