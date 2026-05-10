@@ -80,17 +80,17 @@ final class RalphMenuBarAppDelegate: NSObject, NSApplicationDelegate {
   private func updateStatusButton() {
     guard let button = statusItem.button else { return }
 
-    let attention = store.totalAttentionCount
-    let active = store.totalActiveCount
+    let actions = store.totalActionCount
+    let executing = store.totalExecutionCount
     let hasStaleManager = store.projectSnapshots.contains { $0.snapshot.managerIsStale }
     let title: String
 
     if hasStaleManager {
-      title = attention > 0 ? "\(attention)" : ""
-    } else if attention > 0 {
-      title = "\(attention)"
-    } else if active > 0 {
-      title = "\(active)"
+      title = actions > 0 ? "\(actions)" : ""
+    } else if actions > 0 {
+      title = "\(actions)"
+    } else if executing > 0 {
+      title = "\(executing)"
     } else {
       title = ""
     }
@@ -104,8 +104,14 @@ final class RalphMenuBarAppDelegate: NSObject, NSApplicationDelegate {
   private func tooltip() -> String {
     var lines = [
       "Ralph projects: \(store.projectSnapshots.count)",
-      "Active: \(store.totalActiveCount)",
-      "Attention: \(store.totalAttentionCount)"
+      "Executing: \(store.totalExecutionCount)",
+      "Repairing: \(store.totalRecoveringCount)",
+      "Planning: \(store.totalPlanningCount)",
+      "Waiting: \(store.totalWaitingRecoveryCount)",
+      "Queued: \(store.totalQueuedCount)",
+      "Approval/blocked: \(store.totalActionCount)",
+      "Recent completed: \(store.totalRecentCompletedCount)",
+      "Total completed: \(store.totalCompletedCount)"
     ]
 
     for projectSnapshot in store.projectSnapshots {
@@ -114,7 +120,7 @@ final class RalphMenuBarAppDelegate: NSObject, NSApplicationDelegate {
         .map { "\($0.status ?? "unknown") / \(shortRepoName($0.repo))" }
         ?? "missing"
 
-      lines.append("\(projectSnapshot.project.name): \(snapshot.activeCount) active, \(snapshot.attentionCount) attention, manager \(managerLabel)")
+      lines.append("\(projectSnapshot.project.name): \(snapshot.executionCount) executing, \(snapshot.recoveringCount) repairing, \(snapshot.planningCount) planning, \(snapshot.waitingRecoveryCount) waiting, \(snapshot.queuedCount) queued, \(snapshot.actionCount) approval/blocked, \(snapshot.recentCompletedCount) recent completed, \(snapshot.totalCompletedCount) total completed, manager \(managerLabel)")
     }
 
     return lines.joined(separator: "\n")
