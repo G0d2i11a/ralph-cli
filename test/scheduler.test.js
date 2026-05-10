@@ -182,6 +182,7 @@ function createScheduler(tasks, prds, options = {}) {
         worktreeCalls.push({ taskId, worktreePath, baseRef });
         return worktreePath;
       },
+      inspectWorktree: options.inspectWorktree,
     },
     bootstrapWorktreeDeps: () => {},
     parsePRD: createParsePrd(prds),
@@ -422,6 +423,53 @@ test('schedulePendingTasks respects maxConcurrent and starts oldest queued task 
   assert.equal(startedTask.worktree, '/worktrees/oldest-pending');
   assert.equal(startedTask.pid, 4000);
   assert.equal(queuedTask.status, 'pending');
+});
+
+test('schedulePendingTasks recreates a recorded worktree path that is not a git worktree', async () => {
+  const stalePending = createTask({
+    id: 'stale-worktree-task',
+    prdId: 'stale-worktree-task',
+    prdPath: '/stale-worktree-task.json',
+    worktree: '/worktrees/stale-worktree-task',
+    baseRef: 'main',
+    startTime: 100,
+  });
+
+  const inspections = [];
+  const { scheduler, stateManager, forkCalls, worktreeCalls } = createScheduler(
+    [stalePending],
+    {
+      '/stale-worktree-task.json': { id: 'stale-worktree-task', dependencies: [] },
+    },
+    {
+      maxConcurrent: 1,
+      inspectWorktree: async (repoPath, worktreePath) => {
+        inspections.push({ repoPath, worktreePath });
+        return {
+          path: worktreePath,
+          exists: true,
+          registered: false,
+          dirty: true,
+          pathInsideRalphWorktrees: true,
+          statusError: 'Path exists but is not registered as a git worktree',
+        };
+      },
+    }
+  );
+
+  await scheduler.schedulePendingTasks();
+
+  const startedTask = await stateManager.loadTask('stale-worktree-task');
+
+  assert.deepEqual(inspections, [{ repoPath: '/repo', worktreePath: '/worktrees/stale-worktree-task' }]);
+  assert.deepEqual(worktreeCalls, [{
+    taskId: 'stale-worktree-task',
+    worktreePath: '/worktrees/stale-worktree-task',
+    baseRef: 'main',
+  }]);
+  assert.equal(startedTask.status, 'running');
+  assert.equal(startedTask.worktree, '/worktrees/stale-worktree-task');
+  assert.deepEqual(forkCalls, ['stale-worktree-task']);
 });
 
 test('schedulePendingTasks resets runtime progress counters when restarting a pending task', async () => {

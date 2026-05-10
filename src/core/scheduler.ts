@@ -17,7 +17,7 @@ import {
 import { RalphHomeOptions, resolveRalphHome } from './paths';
 import { StateManager } from './state';
 import { resolveTaskIntegrationStatus } from './task-delivery';
-import { WorktreeManager } from './worktree';
+import { WorktreeInspection, WorktreeManager } from './worktree';
 import { getManagerStatus } from './manager-state';
 import {
   cleanupWorktreeProcesses,
@@ -46,10 +46,11 @@ type DependencyChecker = (
 ) => Promise<DependencyResult>;
 type ProcessChecker = (pid: number) => boolean;
 interface ProcessInfo extends WorktreeProcessInfo {}
+type SchedulerWorktreeManager = Pick<WorktreeManager, 'createWorktree'> & Partial<Pick<WorktreeManager, 'inspectWorktree'>>;
 
 export interface SchedulerDeps extends RalphHomeOptions {
   stateManager?: StateManager;
-  worktreeManager?: Pick<WorktreeManager, 'createWorktree'>;
+  worktreeManager?: SchedulerWorktreeManager;
   configManager?: Pick<ConfigManager, 'get'>;
   bootstrapWorktreeDeps?: typeof bootstrapWorktreeDeps;
   parsePRD?: typeof parsePRD;
@@ -158,7 +159,7 @@ function isFailedCoordinationBlocker(task: Task): boolean {
 
 export class TaskScheduler {
   private readonly stateManager: StateManager;
-  private readonly worktreeManager: Pick<WorktreeManager, 'createWorktree'>;
+  private readonly worktreeManager: SchedulerWorktreeManager;
   private readonly configManager: Pick<ConfigManager, 'get'>;
   private readonly bootstrapWorktreeDepsFn: typeof bootstrapWorktreeDeps;
   private readonly parsePRDFn: typeof parsePRD;
@@ -844,22 +845,70 @@ export class TaskScheduler {
     return manager.active && manager.state?.pid !== process.pid;
   }
 
+  private async inspectTaskWorktree(task: Task): Promise<WorktreeInspection | undefined> {
+    if (!task.worktree) {
+      return undefined;
+    }
+
+    if (this.worktreeManager.inspectWorktree) {
+      return this.worktreeManager.inspectWorktree(task.repoPath, task.worktree);
+    }
+
+    return {
+      path: task.worktree,
+      exists: fs.existsSync(task.worktree),
+      registered: fs.existsSync(task.worktree),
+      dirty: false,
+      pathInsideRalphWorktrees: true,
+    };
+  }
+
+  private async ensureTaskWorktree(task: Task): Promise<Task> {
+    let currentTask = task;
+    let shouldCreateWorktree = !currentTask.worktree;
+    let inspection: WorktreeInspection | undefined;
+
+    if (currentTask.worktree) {
+      inspection = await this.inspectTaskWorktree(currentTask);
+      shouldCreateWorktree = !inspection?.exists || !inspection?.registered;
+    }
+
+    if (!shouldCreateWorktree) {
+      return currentTask;
+    }
+
+    if (currentTask.worktree) {
+      appendTaskEvent(currentTask, {
+        type: 'worktree_recreate_required',
+        message: inspection?.exists
+          ? 'Recorded worktree path exists but is not a registered git worktree; recreating before worker start'
+          : 'Recorded worktree path is missing; recreating before worker start',
+        data: {
+          worktree: currentTask.worktree,
+          exists: inspection?.exists,
+          registered: inspection?.registered,
+          statusError: inspection?.statusError,
+        },
+      });
+    }
+
+    const worktreePath = await this.worktreeManager.createWorktree(
+      currentTask.repoPath,
+      currentTask.id,
+      currentTask.baseRef || currentTask.baseCommitSha
+    );
+    await this.stateManager.updateTask(currentTask.id, { worktree: worktreePath });
+    currentTask = {
+      ...currentTask,
+      worktree: worktreePath,
+    };
+
+    return currentTask;
+  }
+
   private async startTask(task: Task): Promise<Task | null> {
     try {
-      let currentTask = task;
-
-      if (!currentTask.worktree) {
-        const worktreePath = await this.worktreeManager.createWorktree(
-          currentTask.repoPath,
-          currentTask.id,
-          currentTask.baseRef || currentTask.baseCommitSha
-        );
-        await this.stateManager.updateTask(currentTask.id, { worktree: worktreePath });
-        currentTask = {
-          ...currentTask,
-          worktree: worktreePath,
-        };
-      }
+      let currentTask = await this.ensureTaskWorktree(task);
 
       if (!currentTask.baseCommitSha) {
         const baseCommitSha = resolveHeadCommit(currentTask.worktree);

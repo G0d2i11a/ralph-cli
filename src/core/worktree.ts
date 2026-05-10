@@ -76,6 +76,34 @@ function runGitString(cwd: string, args: string[]): string {
   });
 }
 
+function pathExists(worktreePath: string): boolean {
+  return fs.existsSync(worktreePath);
+}
+
+function branchExists(repoPath: string, branchName: string): boolean {
+  try {
+    execFileSync('git', ['show-ref', '--verify', '--quiet', `refs/heads/${branchName}`], {
+      cwd: repoPath,
+      stdio: ['ignore', 'ignore', 'ignore'],
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function uniqueStalePath(worktreePath: string): string {
+  const timestamp = new Date().toISOString().replace(/[-:.TZ]/g, '');
+  let candidate = `${worktreePath}.stale-${timestamp}`;
+  let suffix = 1;
+
+  while (fs.existsSync(candidate)) {
+    candidate = `${worktreePath}.stale-${timestamp}-${suffix++}`;
+  }
+
+  return candidate;
+}
+
 function summarizeStatusPorcelain(status: string): Pick<
   WorktreeInspection,
   | 'changedFileCount'
@@ -144,6 +172,23 @@ export class WorktreeManager {
       fs.mkdirSync(worktreesDir, { recursive: true });
     }
 
+    const registeredWorktree = this.getGitWorktreeInfo(repoPath, worktreePath);
+    if (registeredWorktree) {
+      return worktreePath;
+    }
+
+    if (pathExists(worktreePath)) {
+      const resolvedWorktreesDir = path.resolve(worktreesDir);
+      const resolvedWorktreePath = path.resolve(worktreePath);
+
+      if (!isPathInside(resolvedWorktreesDir, resolvedWorktreePath) || resolvedWorktreePath === resolvedWorktreesDir) {
+        throw new Error(`Refusing to move stale worktree path outside Ralph worktrees root: ${worktreePath}`);
+      }
+
+      const stalePath = uniqueStalePath(worktreePath);
+      fs.renameSync(worktreePath, stalePath);
+    }
+
     const resolvedBaseRef = baseRef || execFileSync('git', ['rev-parse', '--abbrev-ref', 'HEAD'], {
       cwd: repoPath,
       encoding: 'utf-8'
@@ -151,7 +196,11 @@ export class WorktreeManager {
 
     // Create worktree
     const branchName = `ralph/${taskId}`;
-    execFileSync('git', ['worktree', 'add', '-b', branchName, worktreePath, resolvedBaseRef], {
+    const args = branchExists(repoPath, branchName)
+      ? ['worktree', 'add', worktreePath, branchName]
+      : ['worktree', 'add', '-b', branchName, worktreePath, resolvedBaseRef];
+
+    execFileSync('git', args, {
       cwd: repoPath,
       stdio: 'inherit'
     });
@@ -216,6 +265,26 @@ export class WorktreeManager {
     const gitWorktree = this.getGitWorktreeInfo(resolvedRepoPath, resolvedWorktreePath);
     let dirty = false;
     let statusError: string | undefined;
+
+    if (exists && !gitWorktree) {
+      let changedFileCount = 0;
+      try {
+        changedFileCount = fs.readdirSync(resolvedWorktreePath).length;
+        dirty = changedFileCount > 0;
+      } catch (error) {
+        statusError = error instanceof Error ? error.message : String(error);
+      }
+
+      return {
+        path: resolvedWorktreePath,
+        exists,
+        registered: false,
+        dirty,
+        changedFileCount,
+        statusError: statusError || 'Path exists but is not registered as a git worktree',
+        pathInsideRalphWorktrees,
+      };
+    }
 
     if (exists) {
       try {
