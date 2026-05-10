@@ -244,7 +244,7 @@ ralph queue
 ralph queue --watch
 ```
 
-The queue view now acts as the main aggregated runtime snapshot for one Ralph home. It reports manager heartbeat/code-drift status, pending reasons, dependency blockers, coordination blockers, integration lanes, slot usage, lease owner/expiry, story progress, attention candidates, and the next expected action for each active task. A task can remain `pending` with reason `coordination` when an earlier same-repo task declared an overlapping write surface or conflict domain.
+The queue view now acts as the main aggregated runtime snapshot for one Ralph home. Default output is schema v2 and describes each task with `queueState`, plus top-level `actions` and `systemBlocks`. Ralph does not expose a generic operator-needed state: tasks are `queued`, `running`, `finalizing`, `recovering`, `blocked`, `awaiting_approval`, `blocked_by_policy`, `diagnostics`, or `completed`. A task can remain `pending` with reason `coordination` when an earlier same-repo task declared an overlapping write surface or conflict domain.
 
 Use `ralph queue --watch` to keep one long-lived process open and emit fresh JSON snapshots on an interval instead of repeatedly spawning separate `queue`, `manager-status`, and `list` calls.
 
@@ -262,9 +262,12 @@ ralph doctor --repo ~/Code/my-project
 ```bash
 ralph cleanup --dry-run
 ralph cleanup --older-than-hours 168
+ralph cleanup --include-orphans --repo ~/Code/my-project --dry-run
 ```
 
-`cleanup` removes terminal task worktrees after the retention window. Use `--dry-run` first to inspect candidates.
+`cleanup` runs the same policy-driven reclamation path as the manager and removes only terminal task worktrees after the retention window. Use `--dry-run` first to inspect candidates. Add `--include-orphans` with `--repo` to inspect clean unreferenced `.ralph-worktrees` entries.
+
+The always-on manager also runs automatic worktree reclamation after startup and periodically after that. It skips active leases/PIDs, paths outside `.ralph-worktrees`, dirty orphan worktrees, dirty failed/stagnant/finalize worktrees by default, and recently completed worktrees retained by policy. Reclamation writes audit state under `<RALPH_HOME>/reclamation/last-run.json` and JSONL logs under `<RALPH_HOME>/logs/reclamation.jsonl`.
 
 ### Check task status
 
@@ -554,6 +557,8 @@ Ralph CLI stores configuration in `~/.ralph/config.json`:
     "agentRunnersPath": "/absolute/path/to/agent-runners/dist/cli.js",
     "sdkRunnerPath": "",
     "timeout": 600,
+    "extendIdleTimeoutForLongRunningCommands": true,
+    "longRunningCommandPatterns": ["next build", "pnpm run build", "npm run build", "yarn build", "turbo build", "tsc"],
     "model": "claude-opus-4-6-thinking-xchai",
     "codexConversationScope": "story"
   },
@@ -584,11 +589,30 @@ Ralph CLI stores configuration in `~/.ralph/config.json`:
       "pattern": "ez4ielts-*.json",
       "settleMs": 2000
     }
+  },
+  "reclamation": {
+    "enabled": true,
+    "intervalSeconds": 900,
+    "startupDelaySeconds": 30,
+    "maxRunSeconds": 30,
+    "worktrees": {
+      "enabled": true,
+      "completedRetentionHours": 24,
+      "failedRetentionHours": 168,
+      "failedFinalizeRetentionHours": 168,
+      "stagnantRetentionHours": 168,
+      "targetSyncDeferredRetentionHours": 72,
+      "orphanRetentionHours": 24,
+      "cleanupOrphans": true,
+      "keepNewestPerRepo": 5,
+      "maxRemovalsPerRun": 25,
+      "removeDirtyFailedWorktrees": false
+    }
   }
 }
 ```
 
-`agent.backend` defaults to `cli` in new configs. New tasks also default to Codex unless `--agent claude` is passed. `agent.agentRunnersPath` (or `RALPH_AGENT_RUNNERS_CLI`) points at the unified agent-runners CLI when you choose the `agent-runners` backend, `agent.timeout` is measured in seconds, `agent.codexConversationScope` accepts `attempt`, `story`, or `task` and controls whether agent-runners may pass `--resume-thread` for Codex, `runner.leaseTimeout` and `finalizer.leaseTimeout` are measured in seconds unless you pass a value >= 1000 (treated as milliseconds), `runner.maxStoryAttempts` controls bounded repair attempts per story, `runner.maxTransientRetriesPerStory` plus the transient retry delay settings control automatic backoff for transient provider/runtime failures, `finalizer.qualityGates` controls which package scripts run before final commit, `finalizer.repairPolicy=progress` keeps retrying while a repair round still makes measurable progress, `finalizer.maxRepairAttempts` bounds failed-finalize repair recycling, `finalizer.maxNoProgressRepairRounds` limits stagnant repair loops, `finalizer.repairDeadlineSeconds` applies a wall-clock cutoff, `finalizer.repairHardCap` is the absolute repair ceiling, `finalizer.qualityGateTimeout` follows the same unit rule, and `agent.model` is only used for Claude runs. `agent.path` is kept for Codex CLI path compatibility.
+`agent.backend` defaults to `cli` in new configs. New tasks also default to Codex unless `--agent claude` is passed. `agent.agentRunnersPath` (or `RALPH_AGENT_RUNNERS_CLI`) points at the unified agent-runners CLI when you choose the `agent-runners` backend, `agent.timeout` is an idle timeout measured in seconds and is refreshed whenever the agent emits stdout or stderr, `agent.extendIdleTimeoutForLongRunningCommands` makes Ralph extend the idle wait instead of killing Codex when a configured long-running build command is still active inside the task worktree, `agent.codexConversationScope` accepts `attempt`, `story`, or `task` and controls whether agent-runners may pass `--resume-thread` for Codex, `runner.leaseTimeout` and `finalizer.leaseTimeout` are measured in seconds unless you pass a value >= 1000 (treated as milliseconds), `runner.maxStoryAttempts` controls bounded repair attempts per story, `runner.maxTransientRetriesPerStory` plus the transient retry delay settings control automatic backoff for transient provider/runtime failures, `finalizer.qualityGates` controls which package scripts run before final commit, `finalizer.repairPolicy=progress` keeps retrying while a repair round still makes measurable progress, `finalizer.maxRepairAttempts` bounds failed-finalize repair recycling, `finalizer.maxNoProgressRepairRounds` limits stagnant repair loops, `finalizer.repairDeadlineSeconds` applies a wall-clock cutoff, `finalizer.repairHardCap` is the absolute repair ceiling, `finalizer.qualityGateTimeout` follows the same unit rule, and `agent.model` is only used for Claude runs. `agent.path` is kept for Codex CLI path compatibility.
 
 Legacy `agent.sdkRunnerPath` and `RALPH_SDK_RUNNER_CLI` are still accepted for compatibility.
 
@@ -596,7 +620,7 @@ If you already have an older config that points at `agent.sdkRunnerPath` (or exp
 
 Built-in notification delivery is not wired up yet, so the generated config intentionally omits any `notification` block.
 
-Set concurrency to `2` by changing `runner.maxConcurrent`. `runner.pollInterval` is read from config in seconds when `ralph watch` is launched without `--interval`, `runner.stagnationTimeout` is used in seconds to mark long-stalled workers as stagnant, and `runner.leaseTimeout` controls how long a `running` task without a fresh worker heartbeat is trusted:
+Set concurrency to `2` by changing `runner.maxConcurrent`. `runner.pollInterval` is read from config in seconds when `ralph watch` is launched without `--interval`, `runner.stagnationTimeout` is used in seconds to mark long-stalled workers as stagnant only after their worker lease is no longer fresh, and `runner.leaseTimeout` controls how long a `running` task without a fresh worker heartbeat is trusted:
 
 ```json
 {
