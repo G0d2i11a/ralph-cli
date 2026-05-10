@@ -4,6 +4,11 @@ interface CleanupOptions {
   olderThanHours?: string;
   dryRun?: boolean;
   includeOrphans?: boolean;
+  includeDirtyFailed?: boolean;
+  includeDirtyOrphans?: boolean;
+  archiveDirty?: boolean;
+  reclaimArchivedDirty?: boolean;
+  abandonRetryable?: boolean;
   repo?: string;
   maxRemovals?: string;
 }
@@ -30,6 +35,11 @@ function toCleanupCandidate(candidate: ReclamationCandidateReport): {
   removed: boolean;
   kind: ReclamationCandidateReport['kind'];
   reason?: string;
+  attentionState?: ReclamationCandidateReport['attentionState'];
+  decisionAction?: ReclamationCandidateReport['decisionAction'];
+  evidencePath?: string;
+  evidenceManifestPath?: string;
+  evidenceComplete?: boolean;
 } {
   return {
     taskId: candidate.taskId,
@@ -39,6 +49,11 @@ function toCleanupCandidate(candidate: ReclamationCandidateReport): {
     removed: candidate.removed,
     kind: candidate.kind,
     reason: candidate.reason,
+    attentionState: candidate.attentionState,
+    decisionAction: candidate.decisionAction,
+    evidencePath: candidate.evidencePath,
+    evidenceManifestPath: candidate.evidenceManifestPath,
+    evidenceComplete: candidate.evidenceComplete,
   };
 }
 
@@ -52,6 +67,16 @@ export async function cleanupCommand(options: CleanupOptions = {}): Promise<void
     repoPath: options.repo,
     includeOrphanWorktrees: Boolean(options.includeOrphans),
     maxRemovals: parsePositiveInteger(options.maxRemovals),
+    dirtyTerminalModeOverride: options.includeDirtyFailed || options.reclaimArchivedDirty
+      ? 'archive_then_reclaim'
+      : options.archiveDirty
+        ? 'archive_only'
+        : undefined,
+    dirtyOrphanModeOverride: options.includeDirtyOrphans
+      ? (options.reclaimArchivedDirty ? 'archive_then_reclaim' : 'archive_only')
+      : undefined,
+    includeDirtyOrphanWorktrees: Boolean(options.includeDirtyOrphans),
+    abandonRetryable: Boolean(options.abandonRetryable),
   });
 
   console.log(JSON.stringify({

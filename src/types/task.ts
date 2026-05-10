@@ -308,6 +308,10 @@ export interface Task {
   worktreeReclaimedBy?: 'manager' | 'watchdog' | 'manual';
   worktreeReclaimReason?: string;
   worktreeReclaimReportPath?: string;
+  worktreeReclaimEvidencePath?: string;
+  worktreeReclaimEvidenceManifestPath?: string;
+  worktreeReclaimEvidenceCreatedAt?: number;
+  worktreeReclaimDecision?: string;
   logPath: string;
   eventLogPath?: string;
   pid?: number;

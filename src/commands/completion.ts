@@ -59,7 +59,7 @@ _ralph_completion() {
 
   case "\${cur}" in
     -*)
-      local opts="--repo --agent --backend --status --auto --strategy --target --format --all --interval --profile --auto-ingest-ez4ielts --ingest-existing-ez4ielts --ez4ielts-dir --story-id --passes --notes --detailed --home-path --homes --log --once --dry-run --load --no-restart-code-drift --no-restart-stale --help"
+      local opts="--repo --agent --backend --status --auto --strategy --target --format --all --interval --profile --auto-ingest-ez4ielts --ingest-existing-ez4ielts --ez4ielts-dir --story-id --passes --notes --detailed --home-path --homes --log --once --dry-run --load --older-than-hours --include-orphans --archive-dirty --include-dirty-failed --include-dirty-orphans --reclaim-archived-dirty --abandon-retryable --max-removals --no-restart-code-drift --no-restart-stale --help"
       COMPREPLY=( $(compgen -W "\${opts}" -- \${cur}) )
       return 0
       ;;
@@ -188,6 +188,19 @@ _ralph() {
             '--label[launchd label]:label:' \\
             '--plist[Path to launchd plist]:file:_files' \\
             '--dry-run[Print removal plan only]'
+          ;;
+        cleanup)
+          _arguments \\
+            '--older-than-hours[Only clean terminal tasks older than this many hours]:hours:' \\
+            '--include-orphans[Also reclaim unreferenced clean Ralph worktrees]' \\
+            '--archive-dirty[Archive dirty worktree evidence without removing]' \\
+            '--include-dirty-failed[Archive then reclaim eligible dirty failed worktrees]' \\
+            '--include-dirty-orphans[Archive eligible dirty orphan worktrees]' \\
+            '--reclaim-archived-dirty[Allow archive-then-reclaim behavior for dirty candidates]' \\
+            '--abandon-retryable[Allow explicit cleanup for retry-attention failures]' \\
+            '--repo[Repository path to scan for orphan worktrees]:directory:_directories' \\
+            '--max-removals[Maximum number of worktrees to remove]:count:' \\
+            '--dry-run[Show cleanup candidates without removing]'
           ;;
         completion)
           _arguments \\

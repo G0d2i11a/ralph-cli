@@ -3,6 +3,7 @@ import * as path from 'path';
 import { getRalphPaths, RalphHomeOptions } from '../core/paths';
 
 export type RalphMergeStrategy = 'manual' | 'ours' | 'theirs';
+export type DirtyWorktreeReclamationMode = 'retain' | 'archive_only' | 'archive_then_reclaim';
 
 export interface RalphConfig {
   agent: {
@@ -75,6 +76,26 @@ export interface RalphConfig {
       targetFreeBytes: number;
       emergencyFreeBytes: number;
     };
+    evidence: {
+      enabled: boolean;
+      dir: string;
+      requireForDirtyReclaim: boolean;
+      includeTaskSnapshot: boolean;
+      includeTaskEventLogTail: boolean;
+      includeAgentLogTail: boolean;
+      logTailBytes: number;
+      includePatches: boolean;
+      includeStatus: boolean;
+      includeFileList: boolean;
+      includeUntrackedFiles: boolean;
+      maxBytesPerCandidate: number;
+      maxUntrackedFiles: number;
+      maxUntrackedBytes: number;
+      maxSingleUntrackedFileBytes: number;
+      skipUnmerged: boolean;
+      skipStatusErrors: boolean;
+      skipSubmoduleChanges: boolean;
+    };
     worktrees: {
       enabled: boolean;
       completedRetentionHours: number;
@@ -87,7 +108,18 @@ export interface RalphConfig {
       keepNewestPerRepo: number;
       maxRemovalsPerRun: number;
       removeDirtyFailedWorktrees: boolean;
+      dirtyTerminalMode: DirtyWorktreeReclamationMode;
+      dirtyOrphanMode: DirtyWorktreeReclamationMode;
       dirtyFailedRetentionHours: number;
+      dirtyFailedFinalizeRetentionHours: number;
+      dirtyStagnantRetentionHours: number;
+      dirtyOrphanRetentionHours: number;
+      skipDirtyIfRetryableFailure: boolean;
+      skipDirtyIfTargetSyncAttention: boolean;
+      skipDirtyIfIntegrationBlocked: boolean;
+      skipDirtyIfBranchUnexpected: boolean;
+      maxDirtyRemovalsPerRun: number;
+      maxDirtyArchivesPerRun: number;
       pruneBranches: boolean;
       pruneGitWorktreeMetadata: boolean;
     };
@@ -217,6 +249,26 @@ const DEFAULT_CONFIG: RalphConfig = {
       targetFreeBytes: 30 * 1024 * 1024 * 1024,
       emergencyFreeBytes: 5 * 1024 * 1024 * 1024,
     },
+    evidence: {
+      enabled: true,
+      dir: '',
+      requireForDirtyReclaim: true,
+      includeTaskSnapshot: true,
+      includeTaskEventLogTail: true,
+      includeAgentLogTail: true,
+      logTailBytes: 256 * 1024,
+      includePatches: true,
+      includeStatus: true,
+      includeFileList: true,
+      includeUntrackedFiles: true,
+      maxBytesPerCandidate: 100 * 1024 * 1024,
+      maxUntrackedFiles: 500,
+      maxUntrackedBytes: 50 * 1024 * 1024,
+      maxSingleUntrackedFileBytes: 10 * 1024 * 1024,
+      skipUnmerged: true,
+      skipStatusErrors: true,
+      skipSubmoduleChanges: true,
+    },
     worktrees: {
       enabled: true,
       completedRetentionHours: 24,
@@ -229,7 +281,18 @@ const DEFAULT_CONFIG: RalphConfig = {
       keepNewestPerRepo: 5,
       maxRemovalsPerRun: 25,
       removeDirtyFailedWorktrees: false,
+      dirtyTerminalMode: 'archive_only',
+      dirtyOrphanMode: 'retain',
       dirtyFailedRetentionHours: 336,
+      dirtyFailedFinalizeRetentionHours: 336,
+      dirtyStagnantRetentionHours: 336,
+      dirtyOrphanRetentionHours: 720,
+      skipDirtyIfRetryableFailure: true,
+      skipDirtyIfTargetSyncAttention: true,
+      skipDirtyIfIntegrationBlocked: true,
+      skipDirtyIfBranchUnexpected: true,
+      maxDirtyRemovalsPerRun: 5,
+      maxDirtyArchivesPerRun: 10,
       pruneBranches: false,
       pruneGitWorktreeMetadata: true,
     },

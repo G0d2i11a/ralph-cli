@@ -1,10 +1,17 @@
 import * as fs from 'fs';
 import * as path from 'path';
-import { ConfigManager } from '../config/manager';
-import { Task, TaskStatus } from '../types/task';
+import { ConfigManager, DirtyWorktreeReclamationMode } from '../config/manager';
+import { Task, TaskErrorClass, TaskStatus } from '../types/task';
 import { appendTaskEvent } from './events';
 import { withDirectoryLock } from './locks';
 import { getRalphPaths, RalphHomeOptions, resolveRalphHome } from './paths';
+import { EvidenceArchiveResult, WorktreeEvidenceArchiver } from './reclamation-evidence';
+import {
+  ReclamationAttentionState,
+  ReclamationDecision,
+  ReclamationDecisionAction,
+  ReclamationSafetyGate,
+} from './reclamation-policy';
 import { StateManager } from './state';
 import { resolveTaskIntegrationStatus, resolveTaskTargetSyncStatus } from './task-delivery';
 import { WorktreeInspection, WorktreeManager } from './worktree';
@@ -26,12 +33,17 @@ export interface ReclamationRunOptions {
   olderThanHours?: number;
   maxRemovals?: number;
   lockTimeoutMs?: number;
+  dirtyTerminalModeOverride?: DirtyWorktreeReclamationMode;
+  dirtyOrphanModeOverride?: DirtyWorktreeReclamationMode;
+  includeDirtyOrphanWorktrees?: boolean;
+  abandonRetryable?: boolean;
 }
 
 export interface ReclamationSectionReport {
   scanned: number;
   candidates: number;
   removed: number;
+  archived: number;
   skipped: number;
 }
 
@@ -49,6 +61,22 @@ export interface ReclamationCandidateReport {
   tier: string;
   reason?: string;
   dirty?: boolean;
+  attentionState?: ReclamationAttentionState;
+  decisionAction?: ReclamationDecisionAction;
+  evidencePath?: string;
+  evidenceManifestPath?: string;
+  evidenceComplete?: boolean;
+  evidenceBytes?: number;
+  dirtySummary?: {
+    changedFileCount?: number;
+    untrackedFileCount?: number;
+    hasStagedChanges?: boolean;
+    hasUnstagedChanges?: boolean;
+    hasUntrackedFiles?: boolean;
+    hasUnmergedPaths?: boolean;
+    hasSubmoduleChanges?: boolean;
+  };
+  safetyGates?: ReclamationSafetyGate[];
   registeredGitWorktree?: boolean;
   pathInsideRalphWorktrees?: boolean;
 }
@@ -79,6 +107,7 @@ interface ReclamationServiceDeps extends RalphHomeOptions {
   stateManager?: StateManager;
   configManager?: Pick<ConfigManager, 'get'>;
   worktreeManager?: WorktreeManager;
+  evidenceArchiver?: WorktreeEvidenceArchiver;
   now?: () => number;
 }
 
@@ -97,6 +126,7 @@ interface WorktreeCandidate {
   reclaimable: boolean;
   existed: boolean;
   inspection?: WorktreeInspection;
+  evidence?: EvidenceArchiveResult;
 }
 
 const TERMINAL_STATUSES = new Set<TaskStatus>([
@@ -104,6 +134,15 @@ const TERMINAL_STATUSES = new Set<TaskStatus>([
   'failed',
   'failed_finalize',
   'stagnant',
+]);
+
+const RETRY_ATTENTION_ERROR_CLASSES = new Set<TaskErrorClass>([
+  'transport',
+  'transient_backend',
+  'agent_session',
+  'browser_automation',
+  'orphaned_worker',
+  'stagnation',
 ]);
 
 function getNumber(value: unknown, fallback: number): number {
@@ -161,6 +200,7 @@ export class ReclamationService {
   private readonly stateManager: StateManager;
   private readonly configManager: Pick<ConfigManager, 'get'>;
   private readonly worktreeManager: WorktreeManager;
+  private readonly evidenceArchiver: WorktreeEvidenceArchiver;
   private readonly now: () => number;
 
   constructor(deps: ReclamationServiceDeps = {}) {
@@ -169,6 +209,12 @@ export class ReclamationService {
     this.configManager = deps.configManager ?? new ConfigManager({ ralphHome: this.ralphHome });
     this.worktreeManager = deps.worktreeManager ?? new WorktreeManager();
     this.now = deps.now ?? (() => Date.now());
+    this.evidenceArchiver = deps.evidenceArchiver ?? new WorktreeEvidenceArchiver({
+      ralphHome: this.ralphHome,
+      configManager: this.configManager,
+      worktreeManager: this.worktreeManager,
+      now: this.now,
+    });
   }
 
   isAutomaticReclamationEnabled(): boolean {
@@ -200,8 +246,8 @@ export class ReclamationService {
       startedAt: new Date(startedAtMs).toISOString(),
       olderThanHours: options.olderThanHours,
       removed: 0,
-      worktrees: { scanned: 0, candidates: 0, removed: 0, skipped: 0 },
-      tempDirs: { scanned: 0, candidates: 0, removed: 0, skipped: 0 },
+      worktrees: { scanned: 0, candidates: 0, removed: 0, archived: 0, skipped: 0 },
+      tempDirs: { scanned: 0, candidates: 0, removed: 0, archived: 0, skipped: 0 },
       candidates: [],
       skipped: [],
       errors: [],
@@ -368,7 +414,8 @@ export class ReclamationService {
     }
 
     const candidates: WorktreeCandidate[] = [];
-    const retentionHours = options.olderThanHours ?? getNumber(this.configManager.get('reclamation.worktrees.orphanRetentionHours'), 24);
+    const cleanRetentionHours = options.olderThanHours ?? getNumber(this.configManager.get('reclamation.worktrees.orphanRetentionHours'), 24);
+    const dirtyRetentionHours = options.olderThanHours ?? getNumber(this.configManager.get('reclamation.worktrees.dirtyOrphanRetentionHours'), 720);
 
     for (const repoPath of repoPaths) {
       if (!fs.existsSync(path.join(repoPath, '.git'))) {
@@ -386,6 +433,7 @@ export class ReclamationService {
         const inspection = await this.worktreeManager.inspectWorktree(repoPath, worktree);
         const statMs = inspection.exists ? fs.statSync(worktree).mtimeMs : now;
         const ageHours = Math.max(0, (now - statMs) / (60 * 60 * 1000));
+        const retentionHours = inspection.dirty ? dirtyRetentionHours : cleanRetentionHours;
         candidates.push({
           kind: 'orphan_worktree',
           status: 'orphan',
@@ -394,8 +442,8 @@ export class ReclamationService {
           finishedAt: statMs,
           ageHours,
           retentionHours,
-          tier: 'orphan_clean_worktree',
-          reclaimable: ageHours >= retentionHours && !inspection.dirty,
+          tier: inspection.dirty ? 'orphan_dirty_worktree' : 'orphan_clean_worktree',
+          reclaimable: ageHours >= retentionHours,
           existed: inspection.exists,
           inspection,
           reason: inspection.dirty ? 'dirty_orphan_retained' : undefined,
@@ -414,12 +462,73 @@ export class ReclamationService {
     const result = this.toReportCandidate(candidate);
     report.worktrees.candidates++;
 
-    const skipReason = this.getSkipReason(candidate, options);
-    if (skipReason) {
-      result.reason = skipReason;
+    const decision = this.decideWorktreeReclamation(candidate, options);
+    result.attentionState = decision.attentionState;
+    result.decisionAction = decision.action;
+    result.reason = decision.reason;
+    result.safetyGates = decision.safetyGates;
+
+    if (decision.action === 'skip' || decision.action === 'retain') {
       report.skipped.push(result);
       report.worktrees.skipped++;
       return;
+    }
+
+    if (decision.action === 'archive_only' || decision.action === 'archive_then_reclaim') {
+      const archiveLimit = Math.max(0, getNumber(this.configManager.get('reclamation.worktrees.maxDirtyArchivesPerRun'), 10));
+      if (!options.dryRun && this.countDirtyArchived(report) >= archiveLimit) {
+        result.reason = 'dirty_archive_limit_reached';
+        report.skipped.push(result);
+        report.worktrees.skipped++;
+        return;
+      }
+
+      if (options.dryRun) {
+        if (decision.action === 'archive_only') {
+          result.reason = 'dirty_worktree_would_archive';
+          report.skipped.push(result);
+          report.worktrees.skipped++;
+          return;
+        }
+      } else {
+        const evidence = await this.evidenceArchiver.archive(candidate, decision, { mode: options.mode });
+        candidate.evidence = evidence;
+        result.evidencePath = evidence.dir;
+        result.evidenceManifestPath = evidence.manifestPath;
+        result.evidenceComplete = evidence.complete;
+        result.evidenceBytes = evidence.bytes;
+
+        if (!evidence.ok || !evidence.complete) {
+          result.reason = evidence.error || 'evidence_archive_incomplete';
+          report.skipped.push(result);
+          report.worktrees.skipped++;
+          report.errors.push({
+            kind: 'worktree_evidence_archive_failed',
+            path: candidate.worktree,
+            taskId: candidate.taskId,
+            message: result.reason,
+          });
+          return;
+        }
+
+        report.worktrees.archived++;
+
+        if (decision.action === 'archive_only') {
+          result.reason = this.getArchiveOnlyReason(decision);
+          report.skipped.push(result);
+          report.worktrees.skipped++;
+          await this.recordTaskWorktreeArchived(candidate, evidence, report, decision);
+          return;
+        }
+      }
+
+      const dirtyRemovalLimit = Math.max(0, getNumber(this.configManager.get('reclamation.worktrees.maxDirtyRemovalsPerRun'), 5));
+      if (!options.dryRun && this.countDirtyRemoved(report) >= dirtyRemovalLimit) {
+        result.reason = 'dirty_removal_limit_reached';
+        report.skipped.push(result);
+        report.worktrees.skipped++;
+        return;
+      }
     }
 
     result.wouldRemove = true;
@@ -445,6 +554,69 @@ export class ReclamationService {
     report.removed++;
     report.worktrees.removed++;
     await this.recordTaskWorktreeReclaimed(candidate, report);
+  }
+
+  private decideWorktreeReclamation(
+    candidate: WorktreeCandidate,
+    options: ReclamationRunOptions,
+  ): ReclamationDecision {
+    const skipReason = this.getSkipReason(candidate, options);
+    if (skipReason) {
+      return {
+        attentionState: skipReason.includes('retry') ? 'retry' : 'retained',
+        action: 'skip',
+        reason: skipReason,
+        safetyGates: [],
+      };
+    }
+
+    if (!candidate.inspection?.dirty) {
+      return {
+        attentionState: 'reclamation',
+        action: 'remove_clean',
+        reason: candidate.tier,
+        safetyGates: [],
+      };
+    }
+
+    const mode = this.getDirtyReclamationMode(candidate, options);
+    const attentionState = this.classifyWorktreeAttention(candidate, options);
+    const safetyGates = this.getDirtySafetyGates(candidate, attentionState, options);
+
+    if (mode === 'retain') {
+      return {
+        attentionState,
+        action: 'retain',
+        reason: candidate.kind === 'orphan_worktree' ? 'dirty_orphan_retained' : 'dirty_terminal_worktree_retained',
+        safetyGates,
+      };
+    }
+
+    if (mode === 'archive_only') {
+      return {
+        attentionState,
+        action: 'archive_only',
+        reason: 'dirty_worktree_archive_only',
+        safetyGates,
+      };
+    }
+
+    const failedGate = safetyGates.find((gate) => !gate.passed);
+    if (failedGate) {
+      return {
+        attentionState,
+        action: 'archive_only',
+        reason: failedGate.reason || `${failedGate.name}_failed`,
+        safetyGates,
+      };
+    }
+
+    return {
+      attentionState,
+      action: 'archive_then_reclaim',
+      reason: 'dirty_worktree_archive_then_reclaim',
+      safetyGates,
+    };
   }
 
   private getSkipReason(candidate: WorktreeCandidate, options: ReclamationRunOptions): string | undefined {
@@ -473,15 +645,18 @@ export class ReclamationService {
       return 'task_lease_fresh';
     }
 
-    if (candidate.kind === 'orphan_worktree' && candidate.inspection?.dirty) {
+    if (
+      candidate.kind === 'orphan_worktree'
+      && candidate.inspection?.dirty
+      && this.getDirtyReclamationMode(candidate, options) === 'retain'
+    ) {
       return 'dirty_orphan_retained';
     }
 
     if (
       candidate.task
-      && candidate.task.status !== 'completed'
       && candidate.inspection?.dirty
-      && !getBoolean(this.configManager.get('reclamation.worktrees.removeDirtyFailedWorktrees'), false)
+      && this.getDirtyReclamationMode(candidate, options) === 'retain'
     ) {
       return 'dirty_terminal_worktree_retained';
     }
@@ -494,6 +669,241 @@ export class ReclamationService {
     }
 
     return undefined;
+  }
+
+  private getDirtyReclamationMode(
+    candidate: WorktreeCandidate,
+    options: ReclamationRunOptions,
+  ): DirtyWorktreeReclamationMode {
+    if (candidate.kind === 'orphan_worktree') {
+      if (options.dirtyOrphanModeOverride) {
+        return options.dirtyOrphanModeOverride;
+      }
+
+      if (options.mode === 'manual' && !options.includeDirtyOrphanWorktrees) {
+        return 'retain';
+      }
+
+      return this.readDirtyMode('reclamation.worktrees.dirtyOrphanMode', 'retain');
+    }
+
+    if (options.dirtyTerminalModeOverride) {
+      return options.dirtyTerminalModeOverride;
+    }
+
+    if (options.mode === 'manual') {
+      return 'retain';
+    }
+
+    const configured = this.configManager.get('reclamation.worktrees.dirtyTerminalMode');
+    if (configured === 'retain' || configured === 'archive_only' || configured === 'archive_then_reclaim') {
+      return configured;
+    }
+
+    return getBoolean(this.configManager.get('reclamation.worktrees.removeDirtyFailedWorktrees'), false)
+      ? 'archive_then_reclaim'
+      : 'retain';
+  }
+
+  private readDirtyMode(key: string, fallback: DirtyWorktreeReclamationMode): DirtyWorktreeReclamationMode {
+    const value = this.configManager.get(key);
+    return value === 'retain' || value === 'archive_only' || value === 'archive_then_reclaim'
+      ? value
+      : fallback;
+  }
+
+  private classifyWorktreeAttention(
+    candidate: WorktreeCandidate,
+    options: ReclamationRunOptions,
+  ): ReclamationAttentionState {
+    if (!candidate.task) {
+      return candidate.kind === 'orphan_worktree' ? 'manual_review' : 'reclamation';
+    }
+
+    if (this.isTargetSyncAttention(candidate.task)) {
+      return 'target_sync';
+    }
+
+    if (!options.abandonRetryable && this.isRetryAttention(candidate.task)) {
+      return 'retry';
+    }
+
+    if (this.isManualReviewAttention(candidate.task, candidate.inspection)) {
+      return 'manual_review';
+    }
+
+    return 'reclamation';
+  }
+
+  private isRetryAttention(task: Task): boolean {
+    if (task.lastErrorRetryable === true) {
+      return true;
+    }
+
+    if (task.lastErrorClass && RETRY_ATTENTION_ERROR_CLASSES.has(task.lastErrorClass)) {
+      return true;
+    }
+
+    if (
+      task.autoRecoveryStoppedAt
+      || task.transientRecoveryStoppedAt
+      || task.agentContextRecoveryStoppedAt
+      || task.failedBlockerRecoveryStoppedAt
+      || task.storyRepairRecoveryStoppedAt
+      || task.finalizeRepairStoppedAt
+    ) {
+      return true;
+    }
+
+    return false;
+  }
+
+  private isTargetSyncAttention(task: Task): boolean {
+    if (task.status !== 'completed') {
+      return false;
+    }
+
+    const targetSyncStatus = resolveTaskTargetSyncStatus(task);
+    return targetSyncStatus === 'deferred_dirty_checkout' || targetSyncStatus === 'failed';
+  }
+
+  private isManualReviewAttention(task: Task, inspection?: WorktreeInspection): boolean {
+    const integrationStatus = resolveTaskIntegrationStatus(task);
+    return integrationStatus === 'failed'
+      || integrationStatus === 'blocked_conflict'
+      || Boolean(task.mergeConflictFiles?.length)
+      || task.mergeRepairDisplayStatus === 'unresolved'
+      || task.mergeRepairDisplayStatus === 'resolved_pending_finalize'
+      || task.mergeRepairDisplayStatus === 'probe_mergeable'
+      || task.mergeRepairProof?.worktreeMergeKind === 'unresolved'
+      || task.postFinalizeMergeProbeRequired === true
+      || inspection?.hasUnmergedPaths === true
+      || Boolean(inspection?.statusError);
+  }
+
+  private getDirtySafetyGates(
+    candidate: WorktreeCandidate,
+    attentionState: ReclamationAttentionState,
+    options: ReclamationRunOptions,
+  ): ReclamationSafetyGate[] {
+    const gates: ReclamationSafetyGate[] = [];
+    const addGate = (name: string, passed: boolean, reason?: string) => {
+      gates.push({ name, passed, reason: passed ? undefined : reason });
+    };
+    const inspection = candidate.inspection;
+
+    addGate('terminal_status_allowed', candidate.kind === 'orphan_worktree' || Boolean(candidate.task && TERMINAL_STATUSES.has(candidate.task.status)), 'status_not_terminal');
+    addGate('task_not_active', !candidate.task || (!isPidRunning(candidate.task.pid) && !(candidate.task.leaseExpiresAt && candidate.task.leaseExpiresAt > this.now())), 'task_active_or_leased');
+    addGate('path_confined', Boolean(inspection?.pathInsideRalphWorktrees), 'path_outside_ralph_worktrees');
+
+    if (
+      candidate.task
+      && getBoolean(this.configManager.get('reclamation.worktrees.skipDirtyIfBranchUnexpected'), true)
+      && inspection?.branch
+    ) {
+      const expectedBranch = `refs/heads/ralph/${candidate.task.id}`;
+      const expectedShortBranch = `ralph/${candidate.task.id}`;
+      addGate(
+        'expected_branch',
+        inspection.branch === expectedBranch || inspection.branch === expectedShortBranch,
+        'unexpected_dirty_worktree_branch',
+      );
+    }
+
+    if (getBoolean(this.configManager.get('reclamation.evidence.skipStatusErrors'), true)) {
+      addGate('status_readable', !inspection?.statusError, 'dirty_status_unreadable');
+    }
+
+    if (getBoolean(this.configManager.get('reclamation.evidence.skipUnmerged'), true)) {
+      addGate('no_unmerged_paths', inspection?.hasUnmergedPaths !== true, 'dirty_unmerged_paths');
+    }
+
+    if (getBoolean(this.configManager.get('reclamation.evidence.skipSubmoduleChanges'), true)) {
+      addGate('no_submodule_changes', inspection?.hasSubmoduleChanges !== true, 'dirty_submodule_changes');
+    }
+
+    if (getBoolean(this.configManager.get('reclamation.worktrees.skipDirtyIfRetryableFailure'), true)) {
+      addGate('no_retry_attention', attentionState !== 'retry' || Boolean(options.abandonRetryable), 'dirty_retry_attention');
+    }
+
+    if (getBoolean(this.configManager.get('reclamation.worktrees.skipDirtyIfTargetSyncAttention'), true)) {
+      addGate('no_target_sync_attention', attentionState !== 'target_sync', 'dirty_target_sync_attention');
+    }
+
+    if (getBoolean(this.configManager.get('reclamation.worktrees.skipDirtyIfIntegrationBlocked'), true)) {
+      addGate('not_manual_review_attention', attentionState !== 'manual_review', 'dirty_manual_review_attention');
+    }
+
+    addGate('evidence_required', getBoolean(this.configManager.get('reclamation.evidence.requireForDirtyReclaim'), true), 'dirty_evidence_not_required_by_config');
+
+    return gates;
+  }
+
+  private getArchiveOnlyReason(decision: ReclamationDecision): string {
+    if (decision.attentionState === 'retry') {
+      return 'dirty_worktree_archived_retry_attention';
+    }
+
+    if (decision.attentionState === 'target_sync') {
+      return 'dirty_worktree_archived_target_sync_attention';
+    }
+
+    if (decision.attentionState === 'manual_review') {
+      return 'dirty_worktree_archived_manual_review';
+    }
+
+    return 'dirty_worktree_archived_retained';
+  }
+
+  private countDirtyArchived(report: ReclamationReport): number {
+    return report.skipped.filter((candidate) => candidate.dirty && candidate.evidenceComplete).length
+      + report.candidates.filter((candidate) => candidate.dirty && candidate.evidenceComplete).length;
+  }
+
+  private countDirtyRemoved(report: ReclamationReport): number {
+    return report.candidates.filter((candidate) => candidate.dirty && candidate.removed).length;
+  }
+
+  private async recordTaskWorktreeArchived(
+    candidate: WorktreeCandidate,
+    evidence: EvidenceArchiveResult,
+    report: ReclamationReport,
+    decision: ReclamationDecision,
+  ): Promise<void> {
+    if (!candidate.task) {
+      return;
+    }
+
+    const archivedAt = this.now();
+
+    try {
+      await this.stateManager.updateTask(candidate.task.id, {
+        worktreeReclaimEvidencePath: evidence.dir,
+        worktreeReclaimEvidenceManifestPath: evidence.manifestPath,
+        worktreeReclaimEvidenceCreatedAt: archivedAt,
+        worktreeReclaimDecision: decision.action,
+      });
+    } catch {
+      // Evidence is already on disk; state annotation is best effort.
+    }
+
+    if (getBoolean(this.configManager.get('reclamation.reporting.emitTaskEvents'), true)) {
+      appendTaskEvent(candidate.task, {
+        type: 'worktree_reclamation_evidence_archived',
+        status: candidate.task.status,
+        message: `Archived dirty ${candidate.task.status} task worktree evidence`,
+        data: {
+          path: candidate.worktree,
+          mode: report.mode,
+          tier: candidate.tier,
+          attentionState: decision.attentionState,
+          action: decision.action,
+          evidencePath: evidence.dir,
+          manifestPath: evidence.manifestPath,
+          reportPath: report.reportPath,
+        },
+      });
+    }
   }
 
   private async recordTaskWorktreeReclaimed(candidate: WorktreeCandidate, report: ReclamationReport): Promise<void> {
@@ -516,6 +926,10 @@ export class ReclamationService {
         worktreeReclaimedBy: reclaimedBy,
         worktreeReclaimReason: reason,
         worktreeReclaimReportPath: reportPath,
+        worktreeReclaimEvidencePath: candidate.evidence?.dir,
+        worktreeReclaimEvidenceManifestPath: candidate.evidence?.manifestPath,
+        worktreeReclaimEvidenceCreatedAt: candidate.evidence ? reclaimedAt : undefined,
+        worktreeReclaimDecision: candidate.evidence ? 'archive_then_reclaim' : 'remove_clean',
       });
     } catch {
       // The worktree has already been removed; state annotation is best effort.
@@ -532,6 +946,8 @@ export class ReclamationService {
           tier: candidate.tier,
           ageHours: candidate.ageHours,
           reportPath,
+          evidencePath: candidate.evidence?.dir,
+          evidenceManifestPath: candidate.evidence?.manifestPath,
         },
       });
     }
@@ -552,6 +968,17 @@ export class ReclamationService {
       tier: candidate.tier,
       reason: candidate.reason,
       dirty: candidate.inspection?.dirty,
+      dirtySummary: candidate.inspection
+        ? {
+            changedFileCount: candidate.inspection.changedFileCount,
+            untrackedFileCount: candidate.inspection.untrackedFileCount,
+            hasStagedChanges: candidate.inspection.hasStagedChanges,
+            hasUnstagedChanges: candidate.inspection.hasUnstagedChanges,
+            hasUntrackedFiles: candidate.inspection.hasUntrackedFiles,
+            hasUnmergedPaths: candidate.inspection.hasUnmergedPaths,
+            hasSubmoduleChanges: candidate.inspection.hasSubmoduleChanges,
+          }
+        : undefined,
       registeredGitWorktree: candidate.inspection?.registered,
       pathInsideRalphWorktrees: candidate.inspection?.pathInsideRalphWorktrees,
     };
@@ -576,17 +1003,28 @@ export class ReclamationService {
     }
 
     if (task.status === 'failed_finalize') {
+      if (inspection?.dirty) {
+        return getNumber(
+          this.configManager.get('reclamation.worktrees.dirtyFailedFinalizeRetentionHours'),
+          getNumber(this.configManager.get('reclamation.worktrees.dirtyFailedRetentionHours'), 336),
+        );
+      }
+
       return getNumber(this.configManager.get('reclamation.worktrees.failedFinalizeRetentionHours'), 168);
     }
 
     if (task.status === 'stagnant') {
+      if (inspection?.dirty) {
+        return getNumber(
+          this.configManager.get('reclamation.worktrees.dirtyStagnantRetentionHours'),
+          getNumber(this.configManager.get('reclamation.worktrees.dirtyFailedRetentionHours'), 336),
+        );
+      }
+
       return getNumber(this.configManager.get('reclamation.worktrees.stagnantRetentionHours'), 168);
     }
 
-    if (
-      inspection?.dirty
-      && getBoolean(this.configManager.get('reclamation.worktrees.removeDirtyFailedWorktrees'), false)
-    ) {
+    if (inspection?.dirty) {
       return getNumber(this.configManager.get('reclamation.worktrees.dirtyFailedRetentionHours'), 336);
     }
 

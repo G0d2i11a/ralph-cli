@@ -9,6 +9,15 @@ export interface WorktreeInspection {
   branch?: string;
   head?: string;
   dirty: boolean;
+  statusPorcelain?: string;
+  statusPorcelainV2?: string;
+  changedFileCount?: number;
+  untrackedFileCount?: number;
+  hasStagedChanges?: boolean;
+  hasUnstagedChanges?: boolean;
+  hasUntrackedFiles?: boolean;
+  hasUnmergedPaths?: boolean;
+  hasSubmoduleChanges?: boolean;
   statusError?: string;
   pathInsideRalphWorktrees: boolean;
 }
@@ -56,6 +65,73 @@ function parseGitWorktreeList(output: string): ParsedGitWorktree[] {
 function isPathInside(parentPath: string, candidatePath: string): boolean {
   const relative = path.relative(parentPath, candidatePath);
   return relative === '' || (!relative.startsWith('..') && !path.isAbsolute(relative));
+}
+
+function runGitString(cwd: string, args: string[]): string {
+  return execFileSync('git', args, {
+    cwd,
+    encoding: 'utf-8',
+    stdio: ['ignore', 'pipe', 'pipe'],
+    maxBuffer: 100 * 1024 * 1024,
+  });
+}
+
+function summarizeStatusPorcelain(status: string): Pick<
+  WorktreeInspection,
+  | 'changedFileCount'
+  | 'untrackedFileCount'
+  | 'hasStagedChanges'
+  | 'hasUnstagedChanges'
+  | 'hasUntrackedFiles'
+  | 'hasUnmergedPaths'
+  | 'hasSubmoduleChanges'
+> {
+  const lines = status.split('\n').filter((line) => line.length > 0);
+  let changedFileCount = 0;
+  let untrackedFileCount = 0;
+  let hasStagedChanges = false;
+  let hasUnstagedChanges = false;
+  let hasUntrackedFiles = false;
+  let hasUnmergedPaths = false;
+  let hasSubmoduleChanges = false;
+
+  for (const line of lines) {
+    if (line.startsWith('??')) {
+      untrackedFileCount += 1;
+      hasUntrackedFiles = true;
+      continue;
+    }
+
+    changedFileCount += 1;
+    const indexStatus = line[0] || ' ';
+    const worktreeStatus = line[1] || ' ';
+
+    if (indexStatus !== ' ' && indexStatus !== '?') {
+      hasStagedChanges = true;
+    }
+
+    if (worktreeStatus !== ' ' && worktreeStatus !== '?') {
+      hasUnstagedChanges = true;
+    }
+
+    if (indexStatus === 'U' || worktreeStatus === 'U' || (indexStatus === 'A' && worktreeStatus === 'A') || (indexStatus === 'D' && worktreeStatus === 'D')) {
+      hasUnmergedPaths = true;
+    }
+
+    if (line.includes(' S') || line.includes(' m') || line.includes(' ?')) {
+      hasSubmoduleChanges = true;
+    }
+  }
+
+  return {
+    changedFileCount,
+    untrackedFileCount,
+    hasStagedChanges,
+    hasUnstagedChanges,
+    hasUntrackedFiles,
+    hasUnmergedPaths,
+    hasSubmoduleChanges,
+  };
 }
 
 export class WorktreeManager {
@@ -143,12 +219,20 @@ export class WorktreeManager {
 
     if (exists) {
       try {
-        const status = execFileSync('git', ['status', '--porcelain'], {
-          cwd: resolvedWorktreePath,
-          encoding: 'utf-8',
-          stdio: ['ignore', 'pipe', 'pipe'],
-        });
+        const status = runGitString(resolvedWorktreePath, ['status', '--porcelain']);
         dirty = status.trim().length > 0;
+        const summary = summarizeStatusPorcelain(status);
+        return {
+          path: resolvedWorktreePath,
+          exists,
+          registered: Boolean(gitWorktree),
+          branch: gitWorktree?.branch,
+          head: gitWorktree?.head,
+          dirty,
+          statusPorcelain: status,
+          ...summary,
+          pathInsideRalphWorktrees,
+        };
       } catch (error) {
         statusError = error instanceof Error ? error.message : String(error);
       }
@@ -164,6 +248,36 @@ export class WorktreeManager {
       statusError,
       pathInsideRalphWorktrees,
     };
+  }
+
+  async getWorktreeStatusPorcelainV2(worktreePath: string): Promise<string> {
+    return runGitString(worktreePath, ['status', '--porcelain=v2', '--branch']);
+  }
+
+  async getWorktreeStatusShort(worktreePath: string): Promise<string> {
+    return runGitString(worktreePath, ['status', '--short', '--branch']);
+  }
+
+  async getWorktreeDiffPatch(worktreePath: string): Promise<string> {
+    return runGitString(worktreePath, ['diff', '--binary', '--full-index']);
+  }
+
+  async getWorktreeCachedDiffPatch(worktreePath: string): Promise<string> {
+    return runGitString(worktreePath, ['diff', '--cached', '--binary', '--full-index']);
+  }
+
+  async listUntrackedFiles(worktreePath: string): Promise<string[]> {
+    const output = runGitString(worktreePath, ['ls-files', '--others', '--exclude-standard']);
+    return output.split('\n').map((line) => line.trim()).filter(Boolean);
+  }
+
+  async listTrackedAndOtherFiles(worktreePath: string): Promise<string[]> {
+    const output = runGitString(worktreePath, ['ls-files', '-co', '--exclude-standard']);
+    return output.split('\n').map((line) => line.trim()).filter(Boolean);
+  }
+
+  async getWorktreeListPorcelain(repoPath: string): Promise<string> {
+    return runGitString(repoPath, ['worktree', 'list', '--porcelain']);
   }
 
   async pruneWorktreeMetadata(repoPath: string): Promise<void> {

@@ -397,6 +397,11 @@ program
   .description('Remove old terminal task worktrees according to a retention window')
   .option('--older-than-hours <hours>', 'Only clean terminal tasks older than this many hours', '24')
   .option('--include-orphans', 'Also reclaim unreferenced clean Ralph worktrees')
+  .option('--archive-dirty', 'Archive evidence for eligible dirty terminal worktrees without removing them')
+  .option('--include-dirty-failed', 'Archive then reclaim eligible dirty failed/finalize/stagnant worktrees')
+  .option('--include-dirty-orphans', 'Archive eligible dirty orphan worktrees when --include-orphans is also used')
+  .option('--reclaim-archived-dirty', 'Allow explicit archive-then-reclaim behavior for dirty cleanup candidates')
+  .option('--abandon-retryable', 'Allow explicit dirty cleanup for retry-attention failures')
   .option('--repo <path>', 'Repository path to scan for orphan worktrees')
   .option('--max-removals <count>', 'Maximum number of worktrees to remove in this run')
   .option('--dry-run', 'Show cleanup candidates without removing worktrees')
@@ -404,6 +409,8 @@ program
 Examples:
   $ ralph cleanup --dry-run
   $ ralph cleanup --older-than-hours 168
+  $ ralph cleanup --archive-dirty --older-than-hours 336
+  $ ralph cleanup --include-dirty-failed --older-than-hours 336
   $ ralph cleanup --include-orphans --repo ~/Project/myproject --dry-run`)
   .action(cleanupCommand);
 
