@@ -170,6 +170,7 @@ interface SystemBlockItem {
   repoPath?: string;
   blockers?: string[];
   nextAction: string;
+  aggregate?: boolean;
   policy?: QueuePolicyState;
   approval?: QueueApprovalState;
 }
@@ -1517,6 +1518,74 @@ function isWaitingForRecoveryQueueTask(task: Record<string, any>): boolean {
     );
 }
 
+function stableQueueId(input: string): string {
+  let hash = 5381;
+  for (let index = 0; index < input.length; index += 1) {
+    hash = ((hash << 5) + hash) ^ input.charCodeAt(index);
+  }
+  return (hash >>> 0).toString(36);
+}
+
+function isGroupedTargetSyncEnvironmentTask(task: Record<string, any>): boolean {
+  return task.queueState?.phase === 'blocked'
+    && task.queueState?.detail === 'blocked_by_environment'
+    && (
+      task.queueState?.reason === 'target_sync_deferred_dirty_checkout'
+      || task.queueState?.reason === 'target_sync_failed'
+    );
+}
+
+function groupTargetSyncEnvironmentBlocks(tasks: Record<string, any>[]): {
+  blocks: SystemBlockItem[];
+  groupedTaskIds: Set<string>;
+} {
+  const groups = new Map<string, Record<string, any>[]>();
+
+  for (const task of tasks) {
+    if (!isGroupedTargetSyncEnvironmentTask(task)) {
+      continue;
+    }
+
+    const key = [
+      task.repoPath ?? 'unknown-repo',
+      task.queueState.reason,
+    ].join('|');
+    groups.set(key, [...(groups.get(key) ?? []), task]);
+  }
+
+  const blocks: SystemBlockItem[] = [];
+  const groupedTaskIds = new Set<string>();
+
+  for (const [key, group] of groups) {
+    if (group.length < 2) {
+      continue;
+    }
+
+    const first = group[0];
+    const reason = first.queueState.reason as string;
+    const taskIds = group.map((task) => task.id).filter(Boolean);
+    for (const taskId of taskIds) {
+      groupedTaskIds.add(taskId);
+    }
+
+    blocks.push({
+      id: `target-sync-environment-${stableQueueId(key)}`,
+      scope: 'system',
+      phase: 'blocked',
+      detail: 'blocked_by_environment',
+      reason,
+      repoPath: first.repoPath,
+      blockers: taskIds,
+      aggregate: true,
+      nextAction: reason === 'target_sync_deferred_dirty_checkout'
+        ? `clean the checked-out target branch; Ralph will retry target sync for ${group.length} completed task(s)`
+        : `inspect target sync failure; ${group.length} completed task(s) are waiting for local target branch sync`,
+    });
+  }
+
+  return { blocks, groupedTaskIds };
+}
+
 function isRecoveryPlanningQueueTask(task: Record<string, any>): boolean {
   return task.queueState?.phase === 'recovering'
     && (
@@ -1974,8 +2043,10 @@ export async function buildQueueSnapshot(
       queueStateContext,
     ));
   const totalCompletedCount = tasks.filter(isIntegratedCompletion).length;
+  const targetSyncEnvironmentGroups = groupTargetSyncEnvironmentBlocks(output);
   const actions = output
     .filter((task) => task.queueState && isActionItem(task.queueState))
+    .filter((task) => !targetSyncEnvironmentGroups.groupedTaskIds.has(task.id))
     .map((task) => ({
       id: task.id,
       status: task.status,
@@ -2057,6 +2128,7 @@ export async function buildQueueSnapshot(
     tasks: output,
     capacity,
   });
+  systemBlocks.unshift(...targetSyncEnvironmentGroups.blocks);
   const actionability = resolveActionability({
     tasks: output,
     actions,
@@ -2076,15 +2148,16 @@ export async function buildQueueSnapshot(
     Boolean(task.autonomyRepairKind) && evaluateAutoRecovery(task).active
   )).length;
 
+  const countedSystemBlocks = systemBlocks.filter((item) => !item.aggregate);
   const summary = {
     totalActive: output.length,
     running: output.filter((task) => task.queueState?.phase === 'running' || task.queueState?.phase === 'finalizing').length,
     recovering: recoveringCount,
     waitingRecovery: waitingRecoveryCount,
-    awaitingApproval: phaseCount('awaiting_approval') + systemBlocks.filter((item) => item.phase === 'awaiting_approval').length,
-    blocked: phaseCount('blocked') + systemBlocks.filter((item) => item.phase === 'blocked').length,
-    blockedByPolicy: phaseCount('blocked_by_policy') + systemBlocks.filter((item) => item.phase === 'blocked_by_policy').length,
-    diagnostics: phaseCount('diagnostics') + systemBlocks.filter((item) => item.phase === 'diagnostics').length,
+    awaitingApproval: phaseCount('awaiting_approval') + countedSystemBlocks.filter((item) => item.phase === 'awaiting_approval').length,
+    blocked: phaseCount('blocked') + countedSystemBlocks.filter((item) => item.phase === 'blocked').length,
+    blockedByPolicy: phaseCount('blocked_by_policy') + countedSystemBlocks.filter((item) => item.phase === 'blocked_by_policy').length,
+    diagnostics: phaseCount('diagnostics') + countedSystemBlocks.filter((item) => item.phase === 'diagnostics').length,
     queued: phaseCount('queued'),
     planning: planningCount,
     recentCompletedCount: recentCompleted.length,

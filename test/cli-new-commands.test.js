@@ -458,6 +458,63 @@ test('queue command reports completed integrated tasks with deferred target sync
   }
 });
 
+test('queue command aggregates repeated deferred target sync environment blocks', () => {
+  const homeDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-queue-deferred-target-sync-aggregate-home-'));
+
+  try {
+    for (const taskId of ['completed-deferred-sync-a', 'completed-deferred-sync-b']) {
+      const taskDir = path.join(homeDir, '.ralph', 'tasks', taskId);
+      fs.mkdirSync(taskDir, { recursive: true });
+      fs.writeFileSync(path.join(taskDir, 'state.json'), JSON.stringify({
+        id: taskId,
+        prdPath: `/tmp/${taskId}.json`,
+        prdId: `${taskId}-prd`,
+        prdDependencies: [],
+        status: 'completed',
+        startTime: Date.now(),
+        completedUS: ['US-001'],
+        worktree: `/tmp/${taskId}`,
+        logPath: path.join(taskDir, 'agent.log'),
+        agent: 'codex',
+        repoPath: '/tmp/repo',
+        integrationStatus: 'integrated',
+        integratedAt: Date.now(),
+        integrationCommitSha: 'abc123',
+        targetSyncStatus: 'deferred_dirty_checkout',
+        targetSyncDeferredReason: 'sync deferred because main has local edits',
+        loopCount: 0,
+        consecutiveNoProgress: 0,
+        consecutiveErrors: 0,
+        lastProgressTime: Date.now(),
+        lastFilesChanged: 0,
+      }, null, 2));
+    }
+
+    const result = runCli(['queue'], { HOME: homeDir });
+    const output = JSON.parse(result.stdout);
+
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(output.tasks.length, 2);
+    assert.equal(output.tasks[0].queueState.phase, 'blocked');
+    assert.equal(output.tasks[0].queueState.detail, 'blocked_by_environment');
+    assert.deepEqual(output.actions, []);
+    assert.equal(output.systemBlocks.length, 1);
+    assert.equal(output.systemBlocks[0].detail, 'blocked_by_environment');
+    assert.equal(output.systemBlocks[0].reason, 'target_sync_deferred_dirty_checkout');
+    assert.equal(output.systemBlocks[0].aggregate, true);
+    assert.deepEqual(
+      output.systemBlocks[0].blockers.sort(),
+      ['completed-deferred-sync-a', 'completed-deferred-sync-b'],
+    );
+    assert.equal(output.summary.delivery.completedPendingTargetSync, 2);
+    assert.equal(output.summary.blocked, 2);
+    assert.equal(output.actionability.status, 'blocked');
+    assert.equal(output.actionability.reason, 'target_sync_deferred_dirty_checkout');
+  } finally {
+    fs.rmSync(homeDir, { recursive: true, force: true });
+  }
+});
+
 test('queue command marks target sync failures as environment blocks', () => {
   const homeDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-queue-failed-target-sync-home-'));
 
