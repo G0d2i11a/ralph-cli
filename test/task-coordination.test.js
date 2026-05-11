@@ -122,6 +122,56 @@ test('findCoordinationBlockers keeps failed merge-conflict owners blocking later
   assert.equal(result.phase, 'start');
 });
 
+test('findCoordinationBlockers lets dependency predecessors start before earlier pending downstream overlaps', () => {
+  const downstreamTask = createTask({
+    id: 'downstream-task',
+    prdId: 'downstream-prd',
+    status: 'pending',
+    prdDependencies: ['upstream-prd'],
+    declaredConflictDomains: ['runtime-registry'],
+    startTime: 100,
+    enqueuedAt: 100,
+  });
+  const upstreamTask = createTask({
+    id: 'upstream-task',
+    prdId: 'upstream-prd',
+    status: 'pending',
+    declaredConflictDomains: ['runtime-registry'],
+    startTime: 200,
+    enqueuedAt: 200,
+  });
+
+  const result = findCoordinationBlockers(upstreamTask, [downstreamTask, upstreamTask], 'start', { targetBranch: 'main' });
+
+  assert.equal(result.blocked, false);
+  assert.deepEqual(result.blockers, []);
+});
+
+test('findCoordinationBlockers keeps active downstream overlaps blocking despite dependency order', () => {
+  const downstreamTask = createTask({
+    id: 'downstream-task',
+    prdId: 'downstream-prd',
+    status: 'running',
+    prdDependencies: ['upstream-prd'],
+    declaredConflictDomains: ['runtime-registry'],
+    startTime: 100,
+    enqueuedAt: 100,
+  });
+  const upstreamTask = createTask({
+    id: 'upstream-task',
+    prdId: 'upstream-prd',
+    status: 'pending',
+    declaredConflictDomains: ['runtime-registry'],
+    startTime: 200,
+    enqueuedAt: 200,
+  });
+
+  const result = findCoordinationBlockers(upstreamTask, [downstreamTask, upstreamTask], 'start', { targetBranch: 'main' });
+
+  assert.equal(result.blocked, true);
+  assert.deepEqual(result.blockers, ['downstream-task']);
+});
+
 test('findCoordinationBlockers ignores already integrated finalize-state product tasks', () => {
   const earlierTask = createTask({
     id: 'integrated-finalize-owner',

@@ -210,6 +210,81 @@ function shouldBypassCandidateForGeneratedFollowup(task: Task, candidate: Task):
   );
 }
 
+function normalizePrdId(value?: string): string | undefined {
+  if (typeof value !== 'string') {
+    return undefined;
+  }
+
+  const normalized = value.trim();
+  return normalized ? normalized : undefined;
+}
+
+function normalizePrdDependencyList(values?: string[]): string[] {
+  if (!Array.isArray(values)) {
+    return [];
+  }
+
+  return [...new Set(values
+    .map((value) => normalizePrdId(value))
+    .filter((value): value is string => Boolean(value)))];
+}
+
+function taskDependsOnPrd(
+  task: Task,
+  targetPrdId: string,
+  candidates: Task[],
+): boolean {
+  const byPrdId = new Map<string, Task>();
+  for (const candidate of candidates) {
+    const candidatePrdId = normalizePrdId(candidate.prdId);
+    if (candidatePrdId && sameRepoPath(candidate.repoPath, task.repoPath)) {
+      byPrdId.set(candidatePrdId, candidate);
+    }
+  }
+
+  const visitedTaskIds = new Set<string>();
+  const pending = [task];
+
+  while (pending.length > 0) {
+    const current = pending.shift();
+    if (!current || visitedTaskIds.has(current.id)) {
+      continue;
+    }
+    visitedTaskIds.add(current.id);
+
+    for (const dependencyPrdId of normalizePrdDependencyList(current.prdDependencies)) {
+      if (dependencyPrdId === targetPrdId) {
+        return true;
+      }
+
+      const dependencyTask = byPrdId.get(dependencyPrdId);
+      if (dependencyTask && !visitedTaskIds.has(dependencyTask.id)) {
+        pending.push(dependencyTask);
+      }
+    }
+  }
+
+  return false;
+}
+
+function shouldBypassCandidateForDependencyOrder(
+  task: Task,
+  candidate: Task,
+  phase: TaskCoordinationPhase,
+  candidates: Task[],
+): boolean {
+  if (phase !== 'start' || candidate.status !== 'pending') {
+    return false;
+  }
+
+  const taskPrdId = normalizePrdId(task.prdId);
+  if (!taskPrdId) {
+    return false;
+  }
+
+  return taskDependsOnPrd(candidate, taskPrdId, candidates);
+}
+
 function shouldBypassCandidateForBaselineRepair(
   task: Task,
   candidate: Task,
@@ -595,6 +670,10 @@ export function findCoordinationBlockers(
     }
 
     if (shouldBypassCandidateForGeneratedFollowup(task, candidate)) {
+      continue;
+    }
+
+    if (shouldBypassCandidateForDependencyOrder(task, candidate, phase, candidates)) {
       continue;
     }
 

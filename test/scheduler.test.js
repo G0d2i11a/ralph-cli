@@ -584,6 +584,46 @@ test('schedulePendingTasks blocks later same-repo tasks that overlap on declared
   assert.deepEqual(persistedSecondTask.coordinationBlockers, ['first-task']);
 });
 
+test('schedulePendingTasks starts dependency predecessors before earlier pending downstream overlaps', async () => {
+  const downstreamTask = createTask({
+    id: 'downstream-task',
+    prdId: 'downstream-prd',
+    prdPath: '/downstream-task.json',
+    prdDependencies: ['upstream-prd'],
+    declaredConflictDomains: ['runtime-registry'],
+    startTime: 100,
+    enqueuedAt: 100,
+  });
+  const upstreamTask = createTask({
+    id: 'upstream-task',
+    prdId: 'upstream-prd',
+    prdPath: '/upstream-task.json',
+    declaredConflictDomains: ['runtime-registry'],
+    startTime: 200,
+    enqueuedAt: 200,
+  });
+
+  const { scheduler, stateManager, forkCalls } = createScheduler(
+    [downstreamTask, upstreamTask],
+    {
+      '/downstream-task.json': { id: 'downstream-prd', dependencies: [] },
+      '/upstream-task.json': { id: 'upstream-prd', dependencies: [] },
+    },
+    { maxConcurrent: 1 }
+  );
+
+  const startedTasks = await scheduler.schedulePendingTasks();
+  const persistedDownstreamTask = await stateManager.loadTask('downstream-task');
+  const persistedUpstreamTask = await stateManager.loadTask('upstream-task');
+
+  assert.equal(startedTasks.length, 1);
+  assert.equal(startedTasks[0].id, 'upstream-task');
+  assert.equal(persistedDownstreamTask.status, 'pending');
+  assert.equal(persistedDownstreamTask.coordinationStatus, undefined);
+  assert.equal(persistedUpstreamTask.status, 'running');
+  assert.deepEqual(forkCalls, ['upstream-task']);
+});
+
 test('schedulePendingTasks keeps later overlap pending while an earlier failed merge repair still owns the conflict surface', async () => {
   const failedOwner = createTask({
     id: 'failed-owner',
