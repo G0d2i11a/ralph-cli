@@ -87,6 +87,37 @@ test('bootstrapWorktreeDeps installs pnpm from the worktree root', (t) => {
   ]);
 });
 
+test('bootstrapWorktreeDeps runs npm installs in prefer-offline no-audit mode', (t) => {
+  const worktreePath = makeTempDir(t);
+  const calls = [];
+
+  writeJson(path.join(worktreePath, 'package.json'), {
+    dependencies: {
+      react: '^19.0.0',
+    },
+  });
+  writeFile(path.join(worktreePath, 'package-lock.json'));
+
+  const result = bootstrapWorktreeDeps(worktreePath, {
+    logger: () => {},
+    commandRunner: (command, args, cwd) => {
+      calls.push({ command, args, cwd });
+      fs.mkdirSync(path.join(worktreePath, 'node_modules', '.bin'), { recursive: true });
+      return { status: 0, stdout: '', stderr: '' };
+    },
+  });
+
+  assert.equal(result.bootstrapped, true);
+  assert.equal(result.packageManager, 'npm');
+  assert.deepEqual(calls, [
+    {
+      command: 'npm',
+      args: ['ci', '--prefer-offline', '--no-audit'],
+      cwd: worktreePath,
+    },
+  ]);
+});
+
 test('bootstrapWorktreeDeps skips repositories without package.json', (t) => {
   const worktreePath = makeTempDir(t);
   let commandRan = false;

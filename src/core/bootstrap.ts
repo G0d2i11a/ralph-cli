@@ -74,7 +74,10 @@ const INSTALL_ATTEMPTS: Record<PackageManager, string[][]> = {
   pnpm: [['install', '--frozen-lockfile'], ['install']],
   yarn: [['install', '--immutable'], ['install', '--frozen-lockfile'], ['install']],
   bun: [['install', '--frozen-lockfile'], ['install']],
-  npm: [['ci'], ['install']],
+  npm: [
+    ['ci', '--prefer-offline', '--no-audit'],
+    ['install', '--prefer-offline', '--no-audit'],
+  ],
 };
 
 function normalizeOptions(
