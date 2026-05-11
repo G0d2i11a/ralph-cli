@@ -8,6 +8,7 @@ export type AgentErrorKind =
   | 'browser_automation_failure'
   | 'agent_context_window_exhausted'
   | 'auth_or_config_error'
+  | 'dependency_bootstrap_transient'
   | 'agent_no_objective_evidence'
   | 'quality_gate_failure'
   | 'merge_conflict'
@@ -75,6 +76,20 @@ export function classifyAgentFailureOutput(output: string): ErrorClassification 
       explicit: true,
       signature: 'transport_timeout',
       message: 'Transport or backend timed out',
+    };
+  }
+
+  if (
+    /exit handler never called/i.test(normalized)
+    && /(?:npm|dependency bootstrap|package install|package manager)/i.test(normalized)
+  ) {
+    return {
+      kind: 'dependency_bootstrap_transient',
+      class: 'transport',
+      retryable: true,
+      explicit: true,
+      signature: 'dependency_bootstrap_transient:npm_exit_handler_never_called',
+      message: 'Dependency bootstrap hit a retryable npm internal failure',
     };
   }
 

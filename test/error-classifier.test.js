@@ -30,6 +30,20 @@ test('classifyAgentFailureOutput marks reconnecting transport failures as retrya
   assert.equal(result.explicit, true);
 });
 
+test('classifyAgentFailureOutput marks npm bootstrap internal failures as retryable transport errors', () => {
+  const result = classifyAgentFailureOutput([
+    'npm install failed: npm warn deprecated prebuild-install@7.1.3',
+    'npm error Exit handler never called!',
+    'npm error This is an error with npm itself.',
+  ].join('\n'));
+
+  assert.equal(result.kind, 'dependency_bootstrap_transient');
+  assert.equal(result.class, 'transport');
+  assert.equal(result.retryable, true);
+  assert.equal(result.explicit, true);
+  assert.equal(result.signature, 'dependency_bootstrap_transient:npm_exit_handler_never_called');
+});
+
 test('classifyAgentFailureOutput marks Codex context-window exhaustion as retryable agent-session errors', () => {
   const result = classifyAgentFailureOutput(
     'ERROR: Codex ran out of room in the model context window. Start a new thread or clear earlier history before retrying.',
