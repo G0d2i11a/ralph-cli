@@ -12,6 +12,15 @@ test('classifyAgentFailureOutput marks backend high-demand failures as retryable
   assert.equal(result.explicit, true);
 });
 
+test('classifyAgentFailureOutput marks model-capacity failures as retryable transient backend errors', () => {
+  const result = classifyAgentFailureOutput('ERROR: Selected model is at capacity. Please try a different model.');
+
+  assert.equal(result.kind, 'backend_high_demand');
+  assert.equal(result.class, 'transient_backend');
+  assert.equal(result.retryable, true);
+  assert.equal(result.explicit, true);
+});
+
 test('classifyAgentFailureOutput marks reconnecting transport failures as retryable transport errors', () => {
   const result = classifyAgentFailureOutput('Connection lost while streaming output, reconnecting now.');
 

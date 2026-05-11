@@ -29,7 +29,12 @@ function normalizeOutput(output: string): string {
 export function classifyAgentFailureOutput(output: string): ErrorClassification {
   const normalized = normalizeOutput(output);
 
-  if (/high demand|overloaded|temporarily errors/i.test(normalized)) {
+  if (
+    /high demand|overloaded|temporarily errors/i.test(normalized)
+    || /selected model is at capacity/i.test(normalized)
+    || /model is at capacity/i.test(normalized)
+    || /please try a different model/i.test(normalized)
+  ) {
     return {
       kind: 'backend_high_demand',
       class: 'transient_backend',
