@@ -270,10 +270,9 @@ function taskDependsOnPrd(
 function shouldBypassCandidateForDependencyOrder(
   task: Task,
   candidate: Task,
-  phase: TaskCoordinationPhase,
   candidates: Task[],
 ): boolean {
-  if (phase !== 'start' || candidate.status !== 'pending') {
+  if (candidate.status !== 'pending') {
     return false;
   }
 
@@ -673,7 +672,7 @@ export function findCoordinationBlockers(
       continue;
     }
 
-    if (shouldBypassCandidateForDependencyOrder(task, candidate, phase, candidates)) {
+    if (shouldBypassCandidateForDependencyOrder(task, candidate, candidates)) {
       continue;
     }
 

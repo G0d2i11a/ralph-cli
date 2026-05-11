@@ -147,6 +147,58 @@ test('findCoordinationBlockers lets dependency predecessors start before earlier
   assert.deepEqual(result.blockers, []);
 });
 
+test('findCoordinationBlockers lets dependency predecessors finalize before earlier pending downstream overlaps', () => {
+  const downstreamTask = createTask({
+    id: 'downstream-task',
+    prdId: 'downstream-prd',
+    status: 'pending',
+    prdDependencies: ['upstream-prd'],
+    declaredConflictDomains: ['runtime-registry'],
+    startTime: 100,
+    enqueuedAt: 100,
+  });
+  const upstreamTask = createTask({
+    id: 'upstream-task',
+    prdId: 'upstream-prd',
+    status: 'ready_to_finalize',
+    declaredConflictDomains: ['runtime-registry'],
+    observedWriteSurface: ['packages/control-plane/src/runtime-registry.ts'],
+    startTime: 200,
+    enqueuedAt: 200,
+  });
+
+  const result = findCoordinationBlockers(upstreamTask, [downstreamTask, upstreamTask], 'finalize', { targetBranch: 'main' });
+
+  assert.equal(result.blocked, false);
+  assert.deepEqual(result.blockers, []);
+});
+
+test('findCoordinationBlockers lets dependency predecessors merge before earlier pending downstream overlaps', () => {
+  const downstreamTask = createTask({
+    id: 'downstream-task',
+    prdId: 'downstream-prd',
+    status: 'pending',
+    prdDependencies: ['upstream-prd'],
+    declaredConflictDomains: ['runtime-registry'],
+    startTime: 100,
+    enqueuedAt: 100,
+  });
+  const upstreamTask = createTask({
+    id: 'upstream-task',
+    prdId: 'upstream-prd',
+    status: 'completed',
+    declaredConflictDomains: ['runtime-registry'],
+    observedWriteSurface: ['packages/control-plane/src/runtime-registry.ts'],
+    startTime: 200,
+    enqueuedAt: 200,
+  });
+
+  const result = findCoordinationBlockers(upstreamTask, [downstreamTask, upstreamTask], 'merge', { targetBranch: 'main' });
+
+  assert.equal(result.blocked, false);
+  assert.deepEqual(result.blockers, []);
+});
+
 test('findCoordinationBlockers keeps active downstream overlaps blocking despite dependency order', () => {
   const downstreamTask = createTask({
     id: 'downstream-task',
