@@ -42,6 +42,27 @@ function createTask(overrides = {}) {
   };
 }
 
+function createDependencyRepairTask(overrides = {}) {
+  const { repairedPrdId = 'upstream-prd', ...taskOverrides } = overrides;
+
+  return createTask({
+    id: 'dependency-repair-task',
+    prdId: `followup:${repairedPrdId}:repair`,
+    priorityClass: 'dependency_repair',
+    repairOf: {
+      prdId: repairedPrdId,
+      taskId: `failed-${repairedPrdId}-task`,
+      reason: 'story_repair_hard_cap_reached',
+    },
+    releasesDependenciesFor: [repairedPrdId],
+    effectiveDependencyPrdId: repairedPrdId,
+    status: 'pending',
+    startTime: 200,
+    enqueuedAt: 200,
+    ...taskOverrides,
+  });
+}
+
 test('findCoordinationBlockers blocks merge when earlier same-repo task overlaps on observed write surface', () => {
   const earlierTask = createTask({
     id: 'earlier-task',
@@ -142,6 +163,286 @@ test('findCoordinationBlockers lets dependency predecessors start before earlier
   });
 
   const result = findCoordinationBlockers(upstreamTask, [downstreamTask, upstreamTask], 'start', { targetBranch: 'main' });
+
+  assert.equal(result.blocked, false);
+  assert.deepEqual(result.blockers, []);
+});
+
+test('findCoordinationBlockers treats dependency repair effective identity as predecessor', () => {
+  const downstreamTask = createTask({
+    id: 'downstream-task',
+    prdId: 'downstream-prd',
+    status: 'pending',
+    prdDependencies: ['upstream-prd'],
+    declaredConflictDomains: ['runtime-registry'],
+    startTime: 100,
+    enqueuedAt: 100,
+  });
+  const repairTask = createDependencyRepairTask({
+    id: 'repair-followup-task',
+    repairedPrdId: 'upstream-prd',
+    declaredConflictDomains: ['runtime-registry'],
+    startTime: 200,
+    enqueuedAt: 200,
+  });
+
+  const result = findCoordinationBlockers(repairTask, [downstreamTask, repairTask], 'start', { targetBranch: 'main' });
+
+  assert.equal(result.blocked, false);
+  assert.deepEqual(result.blockers, []);
+});
+
+test('findCoordinationBlockers lets dependency_repair bypass pending downstream overlap', () => {
+  const downstreamTask = createTask({
+    id: 'pending-downstream-overlap',
+    prdId: 'downstream-prd',
+    status: 'pending',
+    prdDependencies: ['failed-dependency'],
+    declaredWriteSurface: ['packages/contracts/src/index.ts'],
+    startTime: 100,
+    enqueuedAt: 100,
+  });
+  const repairTask = createDependencyRepairTask({
+    id: 'dependency-repair-overlap',
+    repairedPrdId: 'failed-dependency',
+    declaredWriteSurface: ['packages/contracts/src/index.ts'],
+    startTime: 200,
+    enqueuedAt: 200,
+  });
+
+  const result = findCoordinationBlockers(
+    repairTask,
+    [downstreamTask, repairTask],
+    'start',
+    { targetBranch: 'main' },
+  );
+
+  assert.equal(result.blocked, false);
+  assert.deepEqual(result.blockers, []);
+});
+
+test('findCoordinationBlockers lets dependency_repair bypass pending ordinary same-cohort overlap', () => {
+  const cohortTask = createTask({
+    id: 'pending-same-cohort-overlap',
+    prdId: 'same-cohort-prd',
+    status: 'pending',
+    declaredConflictDomains: ['contracts-index'],
+    startTime: 100,
+    enqueuedAt: 100,
+  });
+  const repairTask = createDependencyRepairTask({
+    id: 'dependency-repair-same-cohort',
+    repairedPrdId: 'failed-dependency',
+    declaredConflictDomains: ['contracts-index'],
+    startTime: 200,
+    enqueuedAt: 200,
+  });
+
+  const result = findCoordinationBlockers(
+    repairTask,
+    [cohortTask, repairTask],
+    'start',
+    { targetBranch: 'main' },
+  );
+
+  assert.equal(result.blocked, false);
+  assert.deepEqual(result.blockers, []);
+});
+
+test('findCoordinationBlockers keeps running overlap blocking dependency_repair', () => {
+  const runningTask = createTask({
+    id: 'running-overlap',
+    prdId: 'running-overlap',
+    status: 'running',
+    declaredConflictDomains: ['contracts-index'],
+    declaredWriteSurface: ['packages/contracts/src/index.ts'],
+    startTime: 100,
+    enqueuedAt: 100,
+  });
+  const repairTask = createDependencyRepairTask({
+    id: 'dependency-repair-with-running-overlap',
+    repairedPrdId: 'failed-dependency',
+    declaredConflictDomains: ['contracts-index'],
+    declaredWriteSurface: ['packages/contracts/src/index.ts'],
+    startTime: 200,
+    enqueuedAt: 200,
+  });
+
+  const result = findCoordinationBlockers(
+    repairTask,
+    [runningTask, repairTask],
+    'start',
+    { targetBranch: 'main' },
+  );
+
+  assert.equal(result.blocked, true);
+  assert.deepEqual(result.blockers, ['running-overlap']);
+});
+
+test('findCoordinationBlockers keeps finalizing overlap blocking dependency_repair', () => {
+  const finalizingTask = createTask({
+    id: 'finalizing-overlap',
+    prdId: 'finalizing-overlap',
+    status: 'finalizing',
+    declaredConflictDomains: ['contracts-index'],
+    declaredWriteSurface: ['packages/contracts/src/index.ts'],
+    observedWriteSurface: ['packages/contracts/src/index.ts'],
+    startTime: 100,
+    enqueuedAt: 100,
+  });
+  const repairTask = createDependencyRepairTask({
+    id: 'dependency-repair-with-finalizing-overlap',
+    repairedPrdId: 'failed-dependency',
+    declaredConflictDomains: ['contracts-index'],
+    declaredWriteSurface: ['packages/contracts/src/index.ts'],
+    startTime: 200,
+    enqueuedAt: 200,
+  });
+
+  const result = findCoordinationBlockers(
+    repairTask,
+    [finalizingTask, repairTask],
+    'start',
+    { targetBranch: 'main' },
+  );
+
+  assert.equal(result.blocked, true);
+  assert.deepEqual(result.blockers, ['finalizing-overlap']);
+});
+
+test('findCoordinationBlockers keeps ready and failed-finalize overlaps blocking dependency_repair', () => {
+  const readyTask = createTask({
+    id: 'ready-overlap',
+    prdId: 'ready-overlap',
+    status: 'ready_to_finalize',
+    declaredConflictDomains: ['contracts-index'],
+    declaredWriteSurface: ['packages/contracts/src/index.ts'],
+    observedWriteSurface: ['packages/contracts/src/index.ts'],
+    startTime: 100,
+    enqueuedAt: 100,
+  });
+  const failedFinalizeTask = createTask({
+    id: 'failed-finalize-overlap',
+    prdId: 'failed-finalize-overlap',
+    status: 'failed_finalize',
+    declaredConflictDomains: ['contracts-index'],
+    declaredWriteSurface: ['packages/contracts/src/index.ts'],
+    observedWriteSurface: ['packages/contracts/src/index.ts'],
+    startTime: 110,
+    enqueuedAt: 110,
+  });
+  const repairTask = createDependencyRepairTask({
+    id: 'dependency-repair-with-finalizer-overlaps',
+    repairedPrdId: 'failed-dependency',
+    declaredConflictDomains: ['contracts-index'],
+    declaredWriteSurface: ['packages/contracts/src/index.ts'],
+    startTime: 200,
+    enqueuedAt: 200,
+  });
+
+  const result = findCoordinationBlockers(
+    repairTask,
+    [readyTask, failedFinalizeTask, repairTask],
+    'start',
+    { targetBranch: 'main' },
+  );
+
+  assert.equal(result.blocked, true);
+  assert.deepEqual(result.blockers, ['ready-overlap', 'failed-finalize-overlap']);
+});
+
+test('findCoordinationBlockers keeps hot failed conflict reservation blocking dependency_repair', () => {
+  const failedSourceTask = createTask({
+    id: 'failed-dependency-task',
+    prdId: 'failed-dependency',
+    status: 'failed',
+    repairContext: {
+      mode: 'merge',
+      storyId: 'US-002',
+      createdAt: 123,
+      reason: 'Merge repair required by Ralph.',
+    },
+    followupTaskIds: ['dependency-repair-hot-source'],
+    mergeConflictFiles: ['packages/contracts/src/index.ts'],
+    observedWriteSurface: ['packages/contracts/src/index.ts'],
+    declaredWriteSurface: ['packages/contracts/src/index.ts'],
+    startTime: 100,
+    enqueuedAt: 100,
+  });
+  const repairTask = createDependencyRepairTask({
+    id: 'dependency-repair-hot-source',
+    repairedPrdId: 'failed-dependency',
+    declaredWriteSurface: ['packages/contracts/src/index.ts'],
+    startTime: 200,
+    enqueuedAt: 200,
+  });
+
+  const result = findCoordinationBlockers(
+    repairTask,
+    [failedSourceTask, repairTask],
+    'start',
+    { targetBranch: 'main' },
+  );
+
+  assert.equal(result.blocked, true);
+  assert.deepEqual(result.blockers, ['failed-dependency-task']);
+});
+
+test('findCoordinationBlockers ignores non-hot original failed source for dependency_repair', () => {
+  const failedSourceTask = createTask({
+    id: 'failed-dependency-task',
+    prdId: 'failed-dependency',
+    status: 'failed',
+    followupTaskIds: ['dependency-repair-cool-source'],
+    observedWriteSurface: ['packages/contracts/src/index.ts'],
+    declaredWriteSurface: ['packages/contracts/src/index.ts'],
+    startTime: 100,
+    enqueuedAt: 100,
+  });
+  const repairTask = createDependencyRepairTask({
+    id: 'dependency-repair-cool-source',
+    repairedPrdId: 'failed-dependency',
+    declaredWriteSurface: ['packages/contracts/src/index.ts'],
+    startTime: 200,
+    enqueuedAt: 200,
+  });
+
+  const result = findCoordinationBlockers(
+    repairTask,
+    [failedSourceTask, repairTask],
+    'start',
+    { targetBranch: 'main' },
+  );
+
+  assert.equal(result.blocked, false);
+  assert.deepEqual(result.blockers, []);
+});
+
+test('findCoordinationBlockers ignores unrelated earlier pending task outside dependency repair cohort', () => {
+  const unrelatedTask = createTask({
+    id: 'unrelated-pending-overlap',
+    prdId: 'unrelated-prd',
+    status: 'pending',
+    declaredWriteSurface: ['packages/unrelated/src/index.ts'],
+    declaredConflictDomains: ['unrelated-index'],
+    startTime: 100,
+    enqueuedAt: 100,
+  });
+  const repairTask = createDependencyRepairTask({
+    id: 'dependency-repair-unrelated-overlap',
+    repairedPrdId: 'failed-dependency',
+    declaredWriteSurface: ['packages/contracts/src/index.ts'],
+    declaredConflictDomains: ['contracts-index'],
+    startTime: 200,
+    enqueuedAt: 200,
+  });
+
+  const result = findCoordinationBlockers(
+    repairTask,
+    [unrelatedTask, repairTask],
+    'start',
+    { targetBranch: 'main' },
+  );
 
   assert.equal(result.blocked, false);
   assert.deepEqual(result.blockers, []);

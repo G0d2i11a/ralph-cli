@@ -59,6 +59,79 @@ const BLOCKING_COORDINATION_STATUSES = new Set([
   'completed',
 ]);
 
+export const DEPENDENCY_REPAIR_PRIORITY_CLASS = 'dependency_repair';
+
+function normalizeIdentity(value?: string): string | undefined {
+  if (typeof value !== 'string') {
+    return undefined;
+  }
+
+  const normalized = value.trim();
+  return normalized ? normalized : undefined;
+}
+
+export function isDependencyRepairPriority(value?: string): boolean {
+  return normalizeIdentity(value) === DEPENDENCY_REPAIR_PRIORITY_CLASS;
+}
+
+export function resolveEffectiveDependencyPrdIdFromPrd(
+  prd: Pick<PRD, 'id' | 'priorityClass' | 'repairOf' | 'releasesDependenciesFor'>,
+): string {
+  if (!isDependencyRepairPriority(prd.priorityClass)) {
+    return prd.id;
+  }
+
+  return normalizeIdentity(prd.repairOf?.prdId)
+    ?? normalizeIdentity(prd.releasesDependenciesFor?.[0])
+    ?? prd.id;
+}
+
+export function resolveEffectiveDependencyPrdIdFromTask(
+  task: Pick<Task, 'prdId' | 'priorityClass' | 'repairOf' | 'releasesDependenciesFor' | 'effectiveDependencyPrdId'>,
+): string | undefined {
+  if (!isDependencyRepairPriority(task.priorityClass)) {
+    return task.prdId;
+  }
+
+  return normalizeIdentity(task.effectiveDependencyPrdId)
+    ?? normalizeIdentity(task.repairOf?.prdId)
+    ?? normalizeIdentity(task.releasesDependenciesFor?.[0])
+    ?? task.prdId;
+}
+
+function pendingTaskScheduleRank(task: Task): number {
+  if (isDependencyRepairPriority(task.priorityClass)) {
+    return 0;
+  }
+
+  if (isBaselineRepairTask(task)) {
+    return 1;
+  }
+
+  const recoveryKind = resolveTaskRecoveryKind(task);
+  if (
+    recoveryKind === 'merge_repair'
+    || recoveryKind === 'stopped_merge_repair'
+    || recoveryKind === 'finalize_repair'
+    || recoveryKind === 'task_specific_finalize_repair'
+  ) {
+    return 2;
+  }
+
+  return 3;
+}
+
+export function comparePendingTaskScheduleOrder(left: Task, right: Task): number {
+  const leftRank = pendingTaskScheduleRank(left);
+  const rightRank = pendingTaskScheduleRank(right);
+
+  if (leftRank !== rightRank) {
+    return leftRank - rightRank;
+  }
+
+  return compareTaskOrder(left, right);
+}
+
 export function hasHotConflictReservation(task: Pick<
   Task,
   | 'repairContext'
@@ -236,7 +309,7 @@ function taskDependsOnPrd(
 ): boolean {
   const byPrdId = new Map<string, Task>();
   for (const candidate of candidates) {
-    const candidatePrdId = normalizePrdId(candidate.prdId);
+    const candidatePrdId = normalizePrdId(resolveEffectiveDependencyPrdIdFromTask(candidate));
     if (candidatePrdId && sameRepoPath(candidate.repoPath, task.repoPath)) {
       byPrdId.set(candidatePrdId, candidate);
     }
@@ -276,12 +349,90 @@ function shouldBypassCandidateForDependencyOrder(
     return false;
   }
 
-  const taskPrdId = normalizePrdId(task.prdId);
+  const taskPrdId = normalizePrdId(resolveEffectiveDependencyPrdIdFromTask(task));
   if (!taskPrdId) {
     return false;
   }
 
   return taskDependsOnPrd(candidate, taskPrdId, candidates);
+}
+
+function getGeneratedDependencyRepairPrdIds(task: Task): string[] {
+  if (!isDependencyRepairPriority(task.priorityClass)) {
+    return [];
+  }
+
+  const taskPrdId = normalizePrdId(task.prdId);
+  const effectivePrdId = normalizePrdId(resolveEffectiveDependencyPrdIdFromTask(task));
+  return [...new Set([
+    normalizePrdId(task.repairOf?.prdId),
+    ...normalizePrdDependencyList(task.releasesDependenciesFor),
+    effectivePrdId && effectivePrdId !== taskPrdId ? effectivePrdId : undefined,
+  ].filter((value): value is string => Boolean(value)))];
+}
+
+function isGeneratedDependencyRepairTask(task: Task): boolean {
+  return getGeneratedDependencyRepairPrdIds(task).length > 0;
+}
+
+function isOrdinaryPendingDependencyRepairBypassCandidate(candidate: Task): boolean {
+  if (candidate.status !== 'pending') {
+    return false;
+  }
+
+  if (hasHotConflictReservation(candidate)) {
+    return false;
+  }
+
+  return !isDependencyRepairPriority(candidate.priorityClass)
+    && !isBaselineRepairTask(candidate)
+    && !candidate.repairContext
+    && !resolveTaskRecoveryKind(candidate);
+}
+
+function sharesDependencyRepairConflictCohort(
+  taskConflictDomains: string[],
+  taskPathSurface: string[],
+  candidate: Task,
+  phase: TaskCoordinationPhase,
+): boolean {
+  const hydratedCandidate = hydrateTaskForPhase(candidate, phase);
+  const candidateConflictDomains = getEffectiveConflictDomains(hydratedCandidate, phase);
+  const candidatePathSurface = getEffectivePathSurface(hydratedCandidate, phase);
+
+  return taskConflictDomains.some((domain) => candidateConflictDomains.includes(domain))
+    || findPathOverlaps(taskPathSurface, candidatePathSurface).length > 0;
+}
+
+function shouldBypassCandidateForGeneratedDependencyRepair(
+  task: Task,
+  candidate: Task,
+  candidates: Task[],
+  phase: TaskCoordinationPhase,
+  taskConflictDomains: string[],
+  taskPathSurface: string[],
+): boolean {
+  const repairedPrdIds = getGeneratedDependencyRepairPrdIds(task);
+  if (repairedPrdIds.length === 0) {
+    return false;
+  }
+
+  if (!isOrdinaryPendingDependencyRepairBypassCandidate(candidate)) {
+    return false;
+  }
+
+  if (repairedPrdIds.some((repairedPrdId) => taskDependsOnPrd(candidate, repairedPrdId, candidates))) {
+    return true;
+  }
+
+  return sharesDependencyRepairConflictCohort(taskConflictDomains, taskPathSurface, candidate, phase);
+}
+
+function isActiveCoordinationConflict(task: Task): boolean {
+  return task.status === 'running'
+    || task.status === 'ready_to_finalize'
+    || task.status === 'finalizing'
+    || task.status === 'failed_finalize';
 }
 
 function shouldBypassCandidateForBaselineRepair(
@@ -649,6 +800,7 @@ export function findCoordinationBlockers(
   const taskPathSurface = getEffectivePathSurface(hydratedTask, phase);
   const taskHasKnownSurface = taskConflictDomains.length > 0 || taskPathSurface.length > 0;
   const lane = resolveTaskIntegrationLane(hydratedTask, options.targetBranch);
+  const currentTaskIsGeneratedDependencyRepair = isGeneratedDependencyRepairTask(hydratedTask);
   const matches: CoordinationOverlapMatch[] = [];
 
   for (const candidate of candidates) {
@@ -668,15 +820,31 @@ export function findCoordinationBlockers(
       continue;
     }
 
-    if (shouldBypassCandidateForGeneratedFollowup(task, candidate)) {
-      continue;
+    if (currentTaskIsGeneratedDependencyRepair) {
+      if (shouldBypassCandidateForGeneratedDependencyRepair(
+        hydratedTask,
+        candidate,
+        candidates,
+        phase,
+        taskConflictDomains,
+        taskPathSurface,
+      )) {
+        continue;
+      }
+    } else {
+      if (shouldBypassCandidateForGeneratedFollowup(task, candidate)) {
+        continue;
+      }
+
+      if (shouldBypassCandidateForDependencyOrder(task, candidate, candidates)) {
+        continue;
+      }
     }
 
-    if (shouldBypassCandidateForDependencyOrder(task, candidate, candidates)) {
-      continue;
-    }
-
-    if (compareTaskOrder(candidate, task) >= 0) {
+    if (
+      compareTaskOrder(candidate, task) >= 0
+      && !(currentTaskIsGeneratedDependencyRepair && isActiveCoordinationConflict(candidate))
+    ) {
       continue;
     }
 

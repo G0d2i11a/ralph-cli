@@ -128,6 +128,76 @@ test('queue state treats pending tasks waiting on recovery as autonomous recover
   assert.equal(isActionItem(queueState), false);
 });
 
+test('queue state surfaces principal repair task for dependency recovery', () => {
+  const task = createTask({
+    id: 'downstream-task',
+    status: 'pending',
+  });
+  const pendingState = {
+    reason: 'dependencies',
+    dependencies: ['failed-dependency'],
+    dependencyBlockers: [],
+    failedDependencies: [],
+    recoveringDependencies: ['failed-dependency'],
+    repairTaskIds: ['repair-task'],
+    principalRepairTask: 'repair-task',
+    repairBlockedBy: [],
+    blockers: [],
+    maxConcurrent: 3,
+    running: 0,
+  };
+  const queueState = assertQueueState(task, 'recovering', 'blocked_by_dependency', pendingState);
+
+  assert.equal(queueState.reason, 'waiting_for_dependency_recovery');
+  assert.equal(queueState.principalRepairTask, 'repair-task');
+  assert.deepEqual(queueState.repairTaskIds, ['repair-task']);
+  assert.equal(resolveNextAction(task, pendingState), 'scheduler should start dependency repair repair-task');
+});
+
+test('queue actionability reports dependency repair blockers', () => {
+  const task = createTask({
+    id: 'downstream-task',
+    status: 'pending',
+  });
+  const pendingState = {
+    reason: 'dependencies',
+    dependencies: ['failed-dependency'],
+    dependencyBlockers: [],
+    failedDependencies: [],
+    recoveringDependencies: ['failed-dependency'],
+    repairTaskIds: ['repair-task'],
+    principalRepairTask: 'repair-task',
+    repairBlockedBy: ['running-overlap'],
+    blockers: [],
+    maxConcurrent: 3,
+    running: 1,
+  };
+  const queueState = deriveQueueState(task, pendingState);
+  const actionability = resolveActionability({
+    tasks: [{
+      id: 'downstream-task',
+      status: 'pending',
+      queueState,
+      nextAction: resolveNextAction(task, pendingState),
+    }],
+    actions: [],
+    systemBlocks: [],
+    capacity: {
+      running: 0,
+      available: 1,
+      queuedRunnable: 0,
+    },
+  });
+
+  assert.equal(queueState.principalRepairTask, 'repair-task');
+  assert.deepEqual(queueState.repairBlockedBy, ['running-overlap']);
+  assert.equal(actionability.status, 'recovering');
+  assert.equal(actionability.principalBlocker, 'failed-dependency');
+  assert.equal(actionability.principalRepairTask, 'repair-task');
+  assert.deepEqual(actionability.repairBlockedBy, ['running-overlap']);
+  assert.match(actionability.nextAction, /running-overlap/);
+});
+
 test('queue state maps stopped agent context recovery to split/follow-up path', () => {
   const task = createTask({
     status: 'failed',
@@ -654,6 +724,122 @@ test('queue snapshot hides stopped source tasks after generated follow-up comple
     assert.equal(snapshot.summary.recovering, 0);
     assert.deepEqual(snapshot.tasks, []);
     assert.deepEqual(snapshot.actions, []);
+  } finally {
+    if (previousRalphHome === undefined) {
+      delete process.env.RALPH_HOME;
+    } else {
+      process.env.RALPH_HOME = previousRalphHome;
+    }
+    fs.rmSync(homeDir, { recursive: true, force: true });
+  }
+});
+
+test('queue snapshot reports failed dependency with active dependency repair as waiting recovery', async () => {
+  const homeDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-queue-dependency-repair-active-'));
+  const previousRalphHome = process.env.RALPH_HOME;
+
+  try {
+    process.env.RALPH_HOME = homeDir;
+    const stateManager = new StateManager({ ralphHome: homeDir });
+    await stateManager.saveTask(createTask({
+      id: 'failed-p0',
+      prdId: 'P0-003',
+      prdDependencies: [],
+      status: 'failed',
+      lastError: 'P0 failed',
+      followupTaskIds: ['repair-p0'],
+      startTime: 100,
+    }));
+    await stateManager.saveTask(createTask({
+      id: 'repair-p0',
+      prdId: 'followup:P0-003:repair',
+      prdDependencies: [],
+      priorityClass: 'dependency_repair',
+      repairOf: {
+        prdId: 'P0-003',
+        taskId: 'failed-p0',
+        reason: 'story_repair_hard_cap_reached',
+      },
+      releasesDependenciesFor: ['P0-003'],
+      effectiveDependencyPrdId: 'P0-003',
+      status: 'pending',
+      startTime: 200,
+    }));
+    await stateManager.saveTask(createTask({
+      id: 'p1',
+      prdId: 'P1',
+      prdDependencies: ['P0-003'],
+      status: 'pending',
+      startTime: 300,
+    }));
+
+    const snapshot = await buildQueueSnapshot(undefined, 7200, 5, true);
+    const p1 = snapshot.tasks.find((task) => task.id === 'p1');
+
+    assert.equal(p1.queueState.phase, 'recovering');
+    assert.equal(p1.queueState.reason, 'waiting_for_dependency_recovery');
+    assert.deepEqual(p1.recoveringDependencies, ['P0-003']);
+    assert.deepEqual(p1.failedDependencies, []);
+    assert.deepEqual(p1.repairTaskIds, ['repair-p0']);
+    assert.equal(p1.queueState.principalRepairTask, 'repair-p0');
+    assert.equal(p1.queueState.repairBlockedBy, undefined);
+  } finally {
+    if (previousRalphHome === undefined) {
+      delete process.env.RALPH_HOME;
+    } else {
+      process.env.RALPH_HOME = previousRalphHome;
+    }
+    fs.rmSync(homeDir, { recursive: true, force: true });
+  }
+});
+
+test('queue snapshot falls back to failed dependency after dependency repair fails', async () => {
+  const homeDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-queue-dependency-repair-failed-'));
+  const previousRalphHome = process.env.RALPH_HOME;
+
+  try {
+    process.env.RALPH_HOME = homeDir;
+    const stateManager = new StateManager({ ralphHome: homeDir });
+    await stateManager.saveTask(createTask({
+      id: 'failed-p0',
+      prdId: 'P0-003',
+      prdDependencies: [],
+      status: 'failed',
+      lastError: 'P0 failed',
+      followupTaskIds: ['repair-p0'],
+      startTime: 100,
+    }));
+    await stateManager.saveTask(createTask({
+      id: 'repair-p0',
+      prdId: 'followup:P0-003:repair',
+      prdDependencies: [],
+      priorityClass: 'dependency_repair',
+      repairOf: {
+        prdId: 'P0-003',
+        taskId: 'failed-p0',
+        reason: 'story_repair_hard_cap_reached',
+      },
+      releasesDependenciesFor: ['P0-003'],
+      effectiveDependencyPrdId: 'P0-003',
+      status: 'failed',
+      lastError: 'repair failed',
+      startTime: 200,
+    }));
+    await stateManager.saveTask(createTask({
+      id: 'p1',
+      prdId: 'P1',
+      prdDependencies: ['P0-003'],
+      status: 'pending',
+      startTime: 300,
+    }));
+
+    const snapshot = await buildQueueSnapshot(undefined, 7200, 5, true);
+    const p1 = snapshot.tasks.find((task) => task.id === 'p1');
+
+    assert.equal(p1.queueState.phase, 'blocked');
+    assert.equal(p1.queueState.reason, 'blocked_failed_dependency');
+    assert.deepEqual(p1.failedDependencies, ['P0-003']);
+    assert.equal(p1.queueState.principalRepairTask, undefined);
   } finally {
     if (previousRalphHome === undefined) {
       delete process.env.RALPH_HOME;

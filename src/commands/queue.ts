@@ -26,6 +26,9 @@ interface PendingSummary {
   dependencyBlockers?: unknown[];
   failedDependencies?: string[];
   recoveringDependencies?: string[];
+  repairTaskIds?: string[];
+  principalRepairTask?: string;
+  repairBlockedBy?: string[];
   missingDependencies?: string[];
   blockers: string[];
   failedBlockers?: string[];
@@ -145,6 +148,9 @@ export interface QueueState {
   nextAction: string;
   autonomous: boolean;
   blockers?: string[];
+  repairTaskIds?: string[];
+  principalRepairTask?: string;
+  repairBlockedBy?: string[];
   recovery?: QueueRecoveryState;
   approval?: QueueApprovalState;
   policy?: QueuePolicyState;
@@ -158,6 +164,8 @@ interface QueueActionItem {
   queueState: QueueState;
   reason?: string;
   blockers?: string[];
+  principalRepairTask?: string;
+  repairBlockedBy?: string[];
   nextAction: string;
 }
 
@@ -169,6 +177,8 @@ interface SystemBlockItem {
   reason: string;
   repoPath?: string;
   blockers?: string[];
+  principalRepairTask?: string;
+  repairBlockedBy?: string[];
   nextAction: string;
   aggregate?: boolean;
   policy?: QueuePolicyState;
@@ -179,6 +189,8 @@ interface QueueActionability {
   status: 'idle' | 'runnable' | 'running' | 'recovering' | 'awaiting_approval' | 'blocked' | 'blocked_by_policy' | 'diagnostics' | 'ingestion_backlog';
   reason?: string;
   principalBlocker?: string;
+  principalRepairTask?: string;
+  repairBlockedBy?: string[];
   nextAction?: string;
 }
 
@@ -690,6 +702,17 @@ function blockersForQueueState(task: Task, pendingState?: PendingSummary): strin
   return blockers?.length ? blockers : undefined;
 }
 
+function repairFieldsForQueueState(pendingState?: PendingSummary): Pick<
+  QueueState,
+  'repairTaskIds' | 'principalRepairTask' | 'repairBlockedBy'
+> {
+  return {
+    repairTaskIds: pendingState?.repairTaskIds?.length ? pendingState.repairTaskIds : undefined,
+    principalRepairTask: pendingState?.principalRepairTask ?? pendingState?.repairTaskIds?.[0],
+    repairBlockedBy: pendingState?.repairBlockedBy?.length ? pendingState.repairBlockedBy : undefined,
+  };
+}
+
 function queueStateFromBlockReason(input: {
   task: Task;
   pendingState?: PendingSummary;
@@ -713,6 +736,7 @@ function queueStateFromBlockReason(input: {
     nextAction,
     autonomous,
     blockers,
+    ...repairFieldsForQueueState(pendingState),
     recovery,
     ...extra,
   });
@@ -802,6 +826,7 @@ export function deriveQueueState(
     nextAction,
     autonomous,
     blockers,
+    ...repairFieldsForQueueState(pendingState),
     recovery,
     ...extra,
   });
@@ -1050,6 +1075,11 @@ function compactTaskSummary(taskSummary: Record<string, any>) {
     id: taskSummary.id,
     status: taskSummary.status,
     prdId: taskSummary.prdId,
+    effectiveDependencyPrdId: taskSummary.effectiveDependencyPrdId,
+    priorityClass: taskSummary.priorityClass,
+    repairOf: taskSummary.repairOf,
+    releasesDependenciesFor: taskSummary.releasesDependenciesFor,
+    schedulerHints: taskSummary.schedulerHints,
     prdTitle: taskSummary.prdTitle,
     prdPath: taskSummary.prdPath,
     repoPath: taskSummary.repoPath,
@@ -1068,6 +1098,9 @@ function compactTaskSummary(taskSummary: Record<string, any>) {
     blockers: taskSummary.blockers,
     failedDependencies: taskSummary.failedDependencies,
     recoveringDependencies: taskSummary.recoveringDependencies,
+    repairTaskIds: taskSummary.repairTaskIds,
+    principalRepairTask: taskSummary.principalRepairTask,
+    repairBlockedBy: taskSummary.repairBlockedBy,
     missingDependencies: taskSummary.missingDependencies,
     failedBlockers: taskSummary.failedBlockers,
     recoveringBlockers: taskSummary.recoveringBlockers,
@@ -1105,6 +1138,11 @@ function summarizeTask(
     id: task.id,
     status: task.status,
     prdId: task.prdId,
+    effectiveDependencyPrdId: task.effectiveDependencyPrdId,
+    priorityClass: task.priorityClass,
+    repairOf: task.repairOf,
+    releasesDependenciesFor: task.releasesDependenciesFor,
+    schedulerHints: task.schedulerHints,
     prdTitle: task.prdTitle,
     prdPath: task.prdPath,
     repoPath: task.repoPath,
@@ -1123,6 +1161,9 @@ function summarizeTask(
     dependencyBlockers: pendingState?.dependencyBlockers,
     failedDependencies: pendingState?.failedDependencies,
     recoveringDependencies: pendingState?.recoveringDependencies,
+    repairTaskIds: pendingState?.repairTaskIds,
+    principalRepairTask: pendingState?.principalRepairTask,
+    repairBlockedBy: pendingState?.repairBlockedBy,
     missingDependencies: pendingState?.missingDependencies,
     blockers: pendingState?.reason === 'dependencies'
       ? pendingState.dependencies
@@ -1214,6 +1255,13 @@ export function resolveNextAction(
       }
 
       if (pendingState.recoveringDependencies?.length) {
+        const repairTask = pendingState.principalRepairTask ?? pendingState.repairTaskIds?.[0];
+        if (repairTask && pendingState.repairBlockedBy?.length) {
+          return `wait for dependency repair ${repairTask} blocker(s) to clear: ${pendingState.repairBlockedBy.join(', ')}`;
+        }
+        if (repairTask) {
+          return `scheduler should start dependency repair ${repairTask}`;
+        }
         return `wait for dependency auto-recovery: ${pendingState.recoveringDependencies.join(', ')}`;
       }
 
@@ -1597,6 +1645,8 @@ function isRecoveryPlanningQueueTask(task: Record<string, any>): boolean {
 function resolveDeadlockReason(tasks: Record<string, any>[]): {
   reason: string;
   principalBlocker?: string;
+  principalRepairTask?: string;
+  repairBlockedBy?: string[];
   nextAction: string;
 } {
   const blockedBaselineRepair = tasks.find((task) => (
@@ -1640,6 +1690,8 @@ function resolveDeadlockReason(tasks: Record<string, any>[]): {
     return {
       reason: 'waiting_for_dependencies',
       principalBlocker: blockedTask.blockers?.[0],
+      principalRepairTask: blockedTask.principalRepairTask ?? blockedTask.queueState?.principalRepairTask,
+      repairBlockedBy: blockedTask.repairBlockedBy ?? blockedTask.queueState?.repairBlockedBy,
       nextAction: blockedTask.nextAction,
     };
   }
@@ -1809,6 +1861,8 @@ export function buildSystemBlocks(input: {
       reason: `blocked_deadlock:${deadlock.reason}`,
       repoPath: input.repoPath,
       blockers: deadlock.principalBlocker ? [deadlock.principalBlocker] : undefined,
+      principalRepairTask: deadlock.principalRepairTask,
+      repairBlockedBy: deadlock.repairBlockedBy,
       nextAction: deadlock.nextAction,
     });
   }
@@ -1879,10 +1933,15 @@ export function resolveActionability(input: {
     ...input.actions.filter((item) => item.queueState.phase === 'blocked'),
   ][0];
   if (blocked) {
+    const queueState = 'queueState' in blocked ? blocked.queueState : undefined;
+    const principalRepairTask = queueState?.principalRepairTask ?? blocked.principalRepairTask;
+    const repairBlockedBy = queueState?.repairBlockedBy ?? blocked.repairBlockedBy;
     return {
       status: 'blocked',
       reason: blocked.reason,
       principalBlocker: blocked.blockers?.[0] ?? ('id' in blocked ? blocked.id : undefined),
+      ...(principalRepairTask ? { principalRepairTask } : {}),
+      ...(repairBlockedBy?.length ? { repairBlockedBy } : {}),
       nextAction: blocked.nextAction,
     };
   }
@@ -1911,10 +1970,16 @@ export function resolveActionability(input: {
     || task.autoRecovery?.active === true
   ));
   if (recovering) {
+    const principalRepairTask = recovering.queueState?.principalRepairTask;
+    const repairBlockedBy = recovering.queueState?.repairBlockedBy;
     return {
       status: 'recovering',
       reason: recovering.queueState?.reason ?? recovering.queueState?.detail ?? recovering.autoRecovery?.kind,
-      principalBlocker: recovering.id,
+      principalBlocker: recovering.queueState?.reason === 'waiting_for_dependency_recovery'
+        ? recovering.queueState?.blockers?.[0]
+        : recovering.id,
+      ...(principalRepairTask ? { principalRepairTask } : {}),
+      ...(repairBlockedBy?.length ? { repairBlockedBy } : {}),
       nextAction: recovering.nextAction,
     };
   }
@@ -2055,6 +2120,8 @@ export async function buildQueueSnapshot(
       queueState: task.queueState,
       reason: task.queueState.reason,
       blockers: task.queueState.blockers,
+      principalRepairTask: task.queueState.principalRepairTask,
+      repairBlockedBy: task.queueState.repairBlockedBy,
       nextAction: task.queueState.nextAction,
     }));
   const byStatus = output.reduce<Record<string, number>>((counts, task) => {

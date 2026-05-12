@@ -57,6 +57,64 @@ test('buildFollowupPrdForTask creates deterministic repair PRD content', () => {
   assert.match(generated.prd.description, /failure-signature/);
 });
 
+test('buildFollowupPrdForTask marks hard-cap dependency repair follow-up metadata', () => {
+  const task = createTask({
+    declaredWriteSurface: ['apps/api'],
+    declaredConflictDomains: ['api-contracts'],
+    integrationLane: 'api-repairs',
+    failedBlockerRecoveryDemandTaskIds: ['blocked-child'],
+  });
+
+  const generated = buildFollowupPrdForTask({
+    task,
+    reason: 'story_repair_hard_cap_reached',
+    failure: {
+      id: 'failure:hard-cap',
+      observedAt: 1,
+      kind: 'quality_gate',
+      signature: 'hard-cap-signature',
+      rawMessage: 'test failed',
+      gate: 'test',
+      command: 'npm test',
+      packageLabel: 'apps/api',
+      failedFiles: ['apps/api/service.ts'],
+    },
+    recommendedStories: ['Repair the hard-cap blocker'],
+    scope: ['apps/api/routes.ts'],
+  });
+
+  assert.equal(generated.prd.id.startsWith('followup:source-prd:'), true);
+  assert.equal(generated.prd.priorityClass, 'dependency_repair');
+  assert.deepEqual(generated.prd.repairOf, {
+    prdId: 'source-prd',
+    taskId: 'source-task',
+    reason: 'story_repair_hard_cap_reached',
+  });
+  assert.deepEqual(generated.prd.releasesDependenciesFor, ['source-prd']);
+  assert.deepEqual(generated.prd.schedulerHints, {
+    priorityClass: 'dependency_repair',
+    effectiveDependencyPrdId: 'source-prd',
+    releasesDependenciesFor: ['source-prd'],
+    repairTaskId: 'source-task',
+    repairReason: 'story_repair_hard_cap_reached',
+    bypassPendingDownstreamOverlaps: true,
+    doNotBypassRunningOverlaps: true,
+    parkNonRepairPendingOverlaps: true,
+    emitRepairStarvationIfBlockedForMs: 600000,
+    demandTaskIds: ['blocked-child'],
+  });
+  assert.deepEqual(generated.prd.conflictDomains, ['api-contracts']);
+  assert.equal(generated.prd.integrationLane, 'api-repairs');
+  assert.deepEqual(generated.prd.writeSurface, ['apps/api/routes.ts', 'apps/api/service.ts']);
+  assert.match(generated.prd.description, /Original task: source-task/);
+  assert.match(generated.prd.description, /Original PRD: source-prd/);
+  assert.match(generated.prd.description, /Original status: failed/);
+  assert.match(generated.prd.description, /Gate: test/);
+  assert.match(generated.prd.description, /Package: apps\/api/);
+  assert.match(generated.prd.description, /Command: npm test/);
+  assert.match(generated.prd.description, /separate baseline repair PRD/);
+});
+
 test('enqueueFollowupPrd writes generated PRD, enqueues it, and records source linkage', async () => {
   const homeDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-followup-prd-'));
   const repoDir = path.join(homeDir, 'repo');

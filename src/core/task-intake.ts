@@ -2,13 +2,15 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { createHash } from 'crypto';
 import { execFileSync } from 'child_process';
+import matter from 'gray-matter';
 import { ConfigManager } from '../config/manager';
 import { resolveAgentBackend, resolveAgentType, resolveConfiguredBackend } from './agent';
 import { assertRalphHomeIsolation } from './home-isolation';
-import { extractDeclaredCoordination } from './task-coordination';
+import { extractDeclaredCoordination, resolveEffectiveDependencyPrdIdFromPrd } from './task-coordination';
 import { TaskScheduler, PendingTaskState } from './scheduler';
 import { StateManager } from './state';
 import { assertPrdHasExplicitTitle, generateTaskId, parsePRD, saveTaskPRD } from '../utils/helpers';
+import { PRDRepairOf, PRDSchedulerHints } from '../types/prd';
 import { Task, TaskStatus } from '../types/task';
 import { appendTaskEvent } from './events';
 import { getRalphPaths, RalphHomeOptions } from './paths';
@@ -76,6 +78,97 @@ function resolveIntendedMergeTarget(configManager: Pick<ConfigManager, 'get'>): 
     : 'main';
 }
 
+function normalizeString(value: unknown): string | undefined {
+  return typeof value === 'string' && value.trim() ? value.trim() : undefined;
+}
+
+function normalizeStringArray(value: unknown): string[] | undefined {
+  if (!Array.isArray(value)) {
+    return undefined;
+  }
+
+  const normalized = [...new Set(value
+    .filter((entry): entry is string => typeof entry === 'string')
+    .map((entry) => entry.trim())
+    .filter(Boolean))];
+  return normalized.length ? normalized : undefined;
+}
+
+function normalizeRepairOf(value: unknown): PRDRepairOf | undefined {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    return undefined;
+  }
+
+  const raw = value as Partial<PRDRepairOf>;
+  const prdId = normalizeString(raw.prdId);
+  if (!prdId) {
+    return undefined;
+  }
+
+  return {
+    prdId,
+    taskId: normalizeString(raw.taskId),
+    reason: normalizeString(raw.reason),
+  };
+}
+
+function normalizeSchedulerHints(value: unknown): PRDSchedulerHints | undefined {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    return undefined;
+  }
+
+  const raw = value as Record<string, unknown>;
+  const hints: PRDSchedulerHints = { ...raw };
+  const priorityClass = normalizeString(raw.priorityClass);
+  const effectiveDependencyPrdId = normalizeString(raw.effectiveDependencyPrdId);
+  const releasesDependenciesFor = normalizeStringArray(raw.releasesDependenciesFor);
+  const emitRepairStarvationIfBlockedForMs = Number(raw.emitRepairStarvationIfBlockedForMs);
+
+  if (priorityClass) {
+    hints.priorityClass = priorityClass;
+  }
+  if (effectiveDependencyPrdId) {
+    hints.effectiveDependencyPrdId = effectiveDependencyPrdId;
+  }
+  if (releasesDependenciesFor) {
+    hints.releasesDependenciesFor = releasesDependenciesFor;
+  }
+  if (Number.isFinite(emitRepairStarvationIfBlockedForMs) && emitRepairStarvationIfBlockedForMs > 0) {
+    hints.emitRepairStarvationIfBlockedForMs = emitRepairStarvationIfBlockedForMs;
+  }
+
+  return hints;
+}
+
+function readRawPrdMetadata(prdPath: string): Record<string, unknown> {
+  const content = fs.readFileSync(prdPath, 'utf-8');
+
+  if (path.extname(prdPath).toLowerCase() === '.json') {
+    const parsed = JSON.parse(content);
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+      ? parsed as Record<string, unknown>
+      : {};
+  }
+
+  const parsed = matter(content);
+  return parsed.data && typeof parsed.data === 'object' && !Array.isArray(parsed.data)
+    ? parsed.data as Record<string, unknown>
+    : {};
+}
+
+function readRepairMetadata(prdPath: string): Pick<
+  Task,
+  'priorityClass' | 'repairOf' | 'releasesDependenciesFor' | 'schedulerHints'
+> {
+  const raw = readRawPrdMetadata(prdPath);
+  return {
+    priorityClass: normalizeString(raw.priorityClass),
+    repairOf: normalizeRepairOf(raw.repairOf),
+    releasesDependenciesFor: normalizeStringArray(raw.releasesDependenciesFor),
+    schedulerHints: normalizeSchedulerHints(raw.schedulerHints),
+  };
+}
+
 async function findActiveDuplicateTask(input: {
   stateManager: TaskStateStore;
   repoPath: string;
@@ -136,7 +229,10 @@ export async function enqueueTaskFromPrd(
 
   assertPrdHasExplicitTitle(resolvedPrdPath);
   const prd = parsePRD(resolvedPrdPath);
+  const repairMetadata = readRepairMetadata(resolvedPrdPath);
+  Object.assign(prd, repairMetadata);
   const declaredCoordination = extractDeclaredCoordination(prd);
+  const effectiveDependencyPrdId = resolveEffectiveDependencyPrdIdFromPrd(prd);
   const sourceHash = hashFile(resolvedPrdPath);
   const base = resolveBaseRef(repoPath);
   const enqueuedAt = now();
@@ -182,6 +278,13 @@ export async function enqueueTaskFromPrd(
     declaredWriteSurface: declaredCoordination.declaredWriteSurface,
     declaredConflictDomains: declaredCoordination.declaredConflictDomains,
     integrationLane: declaredCoordination.integrationLane,
+    priorityClass: repairMetadata.priorityClass,
+    repairOf: repairMetadata.repairOf,
+    releasesDependenciesFor: repairMetadata.releasesDependenciesFor,
+    schedulerHints: repairMetadata.schedulerHints,
+    effectiveDependencyPrdId: effectiveDependencyPrdId !== prd.id
+      ? effectiveDependencyPrdId
+      : undefined,
     enqueuedAt,
     baseRef: base.baseRef,
     baseCommitSha: base.baseCommitSha,

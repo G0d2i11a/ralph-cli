@@ -10,9 +10,12 @@ import { buildRalphToolchainEnv } from './toolchain-env';
 import { appendTaskEvent } from './events';
 import { evaluateAutoRecovery } from './auto-recovery-state';
 import {
+  comparePendingTaskScheduleOrder,
   captureObservedTaskSurface,
   findCoordinationBlockers,
   hasHotConflictReservation,
+  isDependencyRepairPriority,
+  resolveEffectiveDependencyPrdIdFromTask,
 } from './task-coordination';
 import { RalphHomeOptions, resolveRalphHome } from './paths';
 import { StateManager } from './state';
@@ -39,6 +42,11 @@ const RECOVERY_TERMINATION_POLL_MS = 100;
 export type TerminalTaskStatus = Exclude<TaskStatus, 'pending' | 'running' | 'ready_to_finalize' | 'finalizing'>;
 
 type DependencyResult = DependencyCheckResult;
+type DependencyResultWithRepairs = DependencyResult & {
+  repairTaskIds?: string[];
+  principalRepairTask?: string;
+  repairBlockedBy?: string[];
+};
 type DependencyChecker = (
   prd: PRD,
   stateManager: StateManager,
@@ -76,6 +84,9 @@ export interface PendingTaskState {
   dependencyBlockers?: DependencyBlocker[];
   failedDependencies?: string[];
   recoveringDependencies?: string[];
+  repairTaskIds?: string[];
+  principalRepairTask?: string;
+  repairBlockedBy?: string[];
   missingDependencies?: string[];
   blockers: string[];
   failedBlockers?: string[];
@@ -155,6 +166,27 @@ function isFailedCoordinationBlocker(task: Task): boolean {
 
   const integrationStatus = resolveTaskIntegrationStatus(task);
   return integrationStatus === 'failed' || integrationStatus === 'blocked_conflict';
+}
+
+const ACTIVE_DEPENDENCY_REPAIR_STATUSES = new Set<TaskStatus>([
+  'pending',
+  'running',
+  'ready_to_finalize',
+  'finalizing',
+  'failed_finalize',
+]);
+
+function uniqueStrings(values: Array<string | undefined>): string[] {
+  return [...new Set(values.filter((value): value is string => Boolean(value)))];
+}
+
+function taskMatchesDependencyRepair(task: Task, prdId: string): boolean {
+  return isDependencyRepairPriority(task.priorityClass)
+    && (
+      task.repairOf?.prdId === prdId
+      || task.releasesDependenciesFor?.includes(prdId)
+      || resolveEffectiveDependencyPrdIdFromTask(task) === prdId
+    );
 }
 
 export class TaskScheduler {
@@ -653,14 +685,106 @@ export class TaskScheduler {
     return this.parsePRDFn(task.prdPath);
   }
 
+  private async findActiveDependencyRepairTasks(prdId: string, repoPath: string): Promise<Task[]> {
+    const resolvedRepoPath = path.resolve(repoPath);
+    const tasks = await this.stateManager.listTasks();
+
+    return tasks.filter((task) => (
+      path.resolve(task.repoPath) === resolvedRepoPath
+      && ACTIVE_DEPENDENCY_REPAIR_STATUSES.has(task.status)
+      && taskMatchesDependencyRepair(task, prdId)
+    ));
+  }
+
+  private async describeRepairBlockedBy(repairTask: Task, allTasks: Task[]): Promise<string[]> {
+    if (repairTask.status !== 'pending') {
+      return [];
+    }
+
+    const prd = this.getDependencyPRD(repairTask);
+    const dependencyState = await this.checkDependenciesFn(prd, this.stateManager, {
+      repoPath: repairTask.repoPath,
+      task: repairTask,
+    });
+    const coordinationState = findCoordinationBlockers(repairTask, allTasks, 'start');
+
+    return uniqueStrings([
+      ...(dependencyState.pending ?? []),
+      ...coordinationState.blockers,
+    ]);
+  }
+
+  private async resolveDependencyRepairState(
+    dependencyState: DependencyResult,
+    task: Task,
+  ): Promise<DependencyResultWithRepairs> {
+    const failed = new Set(dependencyState.failed ?? []);
+    const recovering = new Set(dependencyState.recovering ?? []);
+    const repairTaskIds = new Set<string>();
+    const repairBlockedBy = new Set<string>();
+    const blockers = [...(dependencyState.blockers ?? [])];
+
+    if (failed.size === 0 && !blockers.some((blocker) => blocker.actionRequired)) {
+      return {
+        ...dependencyState,
+        failed: [...failed],
+        recovering: [...recovering],
+        repairTaskIds: [],
+      };
+    }
+
+    const allTasks = await this.stateManager.listTasks();
+    const nextBlockers = await Promise.all(blockers.map(async (blocker) => {
+      if (!blocker.actionRequired && !failed.has(blocker.prdId)) {
+        return blocker;
+      }
+
+      const activeRepairTasks = (await this.findActiveDependencyRepairTasks(blocker.prdId, task.repoPath))
+        .sort(comparePendingTaskScheduleOrder);
+      if (activeRepairTasks.length === 0) {
+        return blocker;
+      }
+
+      for (const repairTask of activeRepairTasks) {
+        repairTaskIds.add(repairTask.id);
+        for (const blockerId of await this.describeRepairBlockedBy(repairTask, allTasks)) {
+          repairBlockedBy.add(blockerId);
+        }
+      }
+
+      failed.delete(blocker.prdId);
+      recovering.add(blocker.prdId);
+
+      return {
+        ...blocker,
+        reason: `dependency is waiting for active repair task ${activeRepairTasks.map((entry) => entry.id).join(', ')}`,
+        autoRecoveryActive: true,
+        dependencyRepairActive: true,
+        repairTaskIds: activeRepairTasks.map((entry) => entry.id),
+        actionRequired: false,
+      };
+    }));
+
+    return {
+      ...dependencyState,
+      blockers: nextBlockers,
+      failed: [...failed],
+      recovering: [...recovering],
+      repairTaskIds: [...repairTaskIds],
+      principalRepairTask: [...repairTaskIds][0],
+      repairBlockedBy: [...repairBlockedBy],
+    };
+  }
+
   async describePendingTask(task: Task, options: { readOnly?: boolean } = {}): Promise<PendingTaskState> {
     const maxConcurrent = this.getConcurrencyLimit();
     const running = await this.countRunningTasks({ reconcile: !options.readOnly });
     const prd = this.getDependencyPRD(task);
-    const dependencyState = await this.checkDependenciesFn(prd, this.stateManager, {
+    const rawDependencyState = await this.checkDependenciesFn(prd, this.stateManager, {
       repoPath: task.repoPath,
       task,
     });
+    const dependencyState = await this.resolveDependencyRepairState(rawDependencyState, task);
 
     if (!dependencyState.satisfied) {
       return {
@@ -669,6 +793,9 @@ export class TaskScheduler {
         dependencyBlockers: dependencyState.blockers,
         failedDependencies: dependencyState.failed,
         recoveringDependencies: dependencyState.recovering,
+        repairTaskIds: dependencyState.repairTaskIds,
+        principalRepairTask: dependencyState.principalRepairTask,
+        repairBlockedBy: dependencyState.repairBlockedBy,
         missingDependencies: dependencyState.missing,
         blockers: [],
         maxConcurrent,
@@ -770,7 +897,7 @@ export class TaskScheduler {
 
       const pendingTasks = (await this.stateManager.listTasks('pending'))
         .slice()
-        .sort((a, b) => a.startTime - b.startTime);
+        .sort(comparePendingTaskScheduleOrder);
 
       for (const task of pendingTasks) {
         if (runningCount >= maxConcurrent) {
