@@ -1,7 +1,7 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import matter from 'gray-matter';
-import type { PRD, UserStory } from '../types/prd';
+import type { PRD, PRDRepairOf, PRDSchedulerHints, UserStory } from '../types/prd';
 import type { Task } from '../types/task';
 import type { StateManager } from '../core/state';
 import { deriveTaskDeliveryStatus, resolveTaskIntegrationStatus } from '../core/task-delivery';
@@ -36,6 +36,50 @@ function normalizeStringArray(value: unknown): string[] {
 function normalizeOptionalStringArray(value: unknown): string[] | undefined {
   const normalized = normalizeStringArray(value);
   return normalized.length > 0 ? normalized : undefined;
+}
+
+function normalizeRepairOf(value: unknown): PRDRepairOf | undefined {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    return undefined;
+  }
+
+  const raw = value as Partial<PRDRepairOf>;
+  const prdId = normalizeString(raw.prdId);
+  if (!prdId) {
+    return undefined;
+  }
+
+  return {
+    prdId,
+    taskId: normalizeString(raw.taskId) || undefined,
+    reason: normalizeString(raw.reason) || undefined,
+  };
+}
+
+function normalizeSchedulerHints(value: unknown): PRDSchedulerHints | undefined {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    return undefined;
+  }
+
+  const raw = value as Record<string, unknown>;
+  const hints: PRDSchedulerHints = { ...raw };
+  const priorityClass = normalizeString(raw.priorityClass);
+  const effectiveDependencyPrdId = normalizeString(raw.effectiveDependencyPrdId);
+  const releasesDependenciesFor = normalizeOptionalStringArray(raw.releasesDependenciesFor);
+
+  if (priorityClass) {
+    hints.priorityClass = priorityClass;
+  }
+
+  if (effectiveDependencyPrdId) {
+    hints.effectiveDependencyPrdId = effectiveDependencyPrdId;
+  }
+
+  if (releasesDependenciesFor) {
+    hints.releasesDependenciesFor = releasesDependenciesFor;
+  }
+
+  return hints;
 }
 
 function resolvePrdTitle(prd: Partial<PRD> & Record<string, unknown>, fallbackId: string): string {
@@ -86,6 +130,10 @@ function normalizePrd(prd: Partial<PRD> & Record<string, unknown>, fallbackId: s
     writeSurface: normalizeOptionalStringArray(prd.writeSurface),
     conflictDomains: normalizeOptionalStringArray(prd.conflictDomains),
     integrationLane: normalizeString(prd.integrationLane) || undefined,
+    priorityClass: normalizeString(prd.priorityClass) || undefined,
+    repairOf: normalizeRepairOf(prd.repairOf),
+    releasesDependenciesFor: normalizeOptionalStringArray(prd.releasesDependenciesFor),
+    schedulerHints: normalizeSchedulerHints(prd.schedulerHints),
   };
 }
 
@@ -159,6 +207,10 @@ export function parsePRDContent(content: string, prdPath: string = 'prd.json'): 
     writeSurface: frontmatter.writeSurface,
     conflictDomains: frontmatter.conflictDomains,
     integrationLane: frontmatter.integrationLane,
+    priorityClass: frontmatter.priorityClass,
+    repairOf: frontmatter.repairOf,
+    releasesDependenciesFor: frontmatter.releasesDependenciesFor,
+    schedulerHints: frontmatter.schedulerHints,
   }, fallbackId);
 }
 
@@ -318,6 +370,8 @@ export interface DependencyBlocker {
   reason: string;
   retryable?: boolean;
   autoRecoveryActive?: boolean;
+  dependencyRepairActive?: boolean;
+  repairTaskIds?: string[];
   actionRequired: boolean;
 }
 
@@ -327,7 +381,47 @@ export interface DependencyCheckResult {
   blockers: DependencyBlocker[];
   failed: string[];
   recovering: string[];
+  repairTaskIds: string[];
   missing: string[];
+}
+
+const ACTIVE_DEPENDENCY_REPAIR_STATUSES = new Set<Task['status']>([
+  'pending',
+  'running',
+  'ready_to_finalize',
+  'finalizing',
+  'failed_finalize',
+]);
+
+function uniqueStrings(values: Array<string | undefined>): string[] {
+  return Array.from(new Set(values.filter((value): value is string => Boolean(value))));
+}
+
+function matchesRepoPath(task: Task, repoPath?: string): boolean {
+  return !repoPath || path.resolve(task.repoPath) === path.resolve(repoPath);
+}
+
+function isDependencyRepairTaskForPrd(task: Task, depId: string): boolean {
+  return task.repairOf?.prdId === depId
+    || normalizeStringArray(task.releasesDependenciesFor).includes(depId);
+}
+
+function isActiveDependencyRepairTaskForPrd(task: Task, depId: string): boolean {
+  return isDependencyRepairTaskForPrd(task, depId)
+    && ACTIVE_DEPENDENCY_REPAIR_STATUSES.has(task.status);
+}
+
+async function findActiveDependencyRepairTasks(
+  depId: string,
+  stateManager: StateManager,
+  options: { repoPath?: string },
+): Promise<Task[]> {
+  const tasks = await stateManager.listTasks();
+
+  return tasks.filter((task) => (
+    matchesRepoPath(task, options.repoPath)
+    && isActiveDependencyRepairTaskForPrd(task, depId)
+  ));
 }
 
 function classifyDependencyBlocker(depId: string, depTask: Task | null): DependencyBlocker | null {
@@ -349,7 +443,8 @@ function classifyDependencyBlocker(depId: string, depTask: Task | null): Depende
     return null;
   }
 
-  const autoRecoveryActive = evaluateAutoRecovery(depTask).active;
+  const dependencyRepairActive = isActiveDependencyRepairTaskForPrd(depTask, depId);
+  const autoRecoveryActive = evaluateAutoRecovery(depTask).active || dependencyRepairActive;
   const base = {
     prdId: depId,
     taskId: depTask.id,
@@ -357,6 +452,8 @@ function classifyDependencyBlocker(depId: string, depTask: Task | null): Depende
     integrationStatus,
     retryable: depTask.lastErrorRetryable,
     autoRecoveryActive,
+    dependencyRepairActive,
+    repairTaskIds: dependencyRepairActive ? [depTask.id] : undefined,
   };
 
   if (depTask.status === 'failed') {
@@ -473,6 +570,7 @@ export async function checkDependencies(
       blockers: [],
       failed: [],
       recovering: [],
+      repairTaskIds: [],
       missing: [],
     };
   }
@@ -486,6 +584,28 @@ export async function checkDependencies(
 
     const blocker = classifyDependencyBlocker(depId, depTask);
     if (blocker) {
+      if (blocker.actionRequired) {
+        const activeRepairTasks = await findActiveDependencyRepairTasks(depId, stateManager, {
+          repoPath: options.repoPath,
+        });
+        const repairTaskIds = uniqueStrings([
+          ...(blocker.repairTaskIds || []),
+          ...activeRepairTasks.map((task) => task.id),
+        ]);
+
+        if (repairTaskIds.length > 0) {
+          blockers.push({
+            ...blocker,
+            reason: `dependency is waiting for active repair task ${repairTaskIds.join(', ')}`,
+            autoRecoveryActive: true,
+            dependencyRepairActive: true,
+            repairTaskIds,
+            actionRequired: false,
+          });
+          continue;
+        }
+      }
+
       const repairTaskId = depTask?.baselineQualityGate?.repairTaskId;
       if (
         blocker.actionRequired
@@ -521,6 +641,7 @@ export async function checkDependencies(
     recovering: blockers
       .filter((blocker) => blocker.autoRecoveryActive && !blocker.actionRequired)
       .map((blocker) => blocker.prdId),
+    repairTaskIds: uniqueStrings(blockers.flatMap((blocker) => blocker.repairTaskIds || [])),
     missing: blockers
       .filter((blocker) => blocker.kind === 'missing')
       .map((blocker) => blocker.prdId),

@@ -53,7 +53,9 @@ export async function startCommand(
       reason: pendingState.reason === 'dependencies'
         ? pendingState.failedDependencies?.length
           ? 'blocked by failed dependencies'
-          : 'waiting for dependencies'
+          : pendingState.recoveringDependencies?.length
+            ? 'waiting for dependency recovery'
+            : 'waiting for dependencies'
         : pendingState.reason === 'coordination'
           ? pendingState.failedBlockers?.length
             ? 'blocked by failed overlapping tasks'
@@ -63,6 +65,7 @@ export async function startCommand(
       dependencies: pendingState.dependencies,
       failedDependencies: pendingState.failedDependencies,
       recoveringDependencies: pendingState.recoveringDependencies,
+      repairTaskIds: pendingState.repairTaskIds,
       blockers: pendingState.blockers,
       failedBlockers: pendingState.failedBlockers,
       recoveringBlockers: pendingState.recoveringBlockers,
@@ -72,7 +75,9 @@ export async function startCommand(
       message: pendingState.reason === 'dependencies'
         ? pendingState.failedDependencies?.length
           ? 'Task is blocked until failed dependency PRDs are retried or repaired'
-          : 'Task will start automatically when dependencies are completed'
+          : pendingState.recoveringDependencies?.length
+            ? 'Task will start automatically when dependency recovery completes'
+            : 'Task will start automatically when dependencies are completed'
         : pendingState.reason === 'coordination'
           ? pendingState.failedBlockers?.length
             ? 'Task is blocked until failed overlapping task(s) are retried or repaired'

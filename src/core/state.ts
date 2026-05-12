@@ -3,6 +3,7 @@ import * as path from 'path';
 import { Task, TaskStatus } from '../types/task';
 import { parsePRD } from '../utils/helpers';
 import { getRalphPaths, RalphHomeOptions, resolveRalphHome } from './paths';
+import { resolveEffectiveDependencyPrdIdFromPrd, resolveEffectiveDependencyPrdIdFromTask } from './dependency-identity';
 
 export interface SaveTaskOptions {
   allowStaleWrite?: boolean;
@@ -181,12 +182,13 @@ export class StateManager {
         return false;
       }
 
-      if (task.prdId) {
-        return task.prdId === prdId;
+      if (task.prdId === prdId || resolveEffectiveDependencyPrdIdFromTask(task) === prdId) {
+        return true;
       }
 
       try {
-        return parsePRD(task.prdPath).id === prdId;
+        const prd = parsePRD(task.prdPath);
+        return prd.id === prdId || resolveEffectiveDependencyPrdIdFromPrd(prd) === prdId;
       } catch {
         return false;
       }

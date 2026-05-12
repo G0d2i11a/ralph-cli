@@ -73,7 +73,7 @@ export function buildRalphToolchainEnv(input: {
   const baseEnv = input.baseEnv ?? process.env;
   const env: NodeJS.ProcessEnv = {
     ...baseEnv,
-    CI: baseEnv.CI ?? '1',
+    CI: '1',
     COREPACK_ENABLE_DOWNLOAD_PROMPT: '0',
     PRISMA_HIDE_UPDATE_MESSAGE: 'true',
   };

@@ -12,6 +12,11 @@ import {
 } from '../types/task';
 import { resolveTaskIntegrationStatus } from './task-delivery';
 import { resolveTaskRecoveryKind } from './auto-recovery-state';
+import {
+  isDependencyRepairPriority,
+  resolveEffectiveDependencyPrdIdFromTask,
+} from './dependency-identity';
+import { pendingTaskHasHigherPriorityThanCandidate } from './scheduler-priority';
 
 export interface TaskCoordinationState {
   status: TaskCoordinationStatus;
@@ -137,12 +142,7 @@ function compareTaskOrder(left: Pick<Task, 'id' | 'enqueuedAt' | 'startTime'>, r
 }
 
 function taskBlocksCoordination(task: Task): boolean {
-  if (
-    resolveTaskIntegrationStatus(task) === 'integrated'
-    && !hasHotConflictReservation(task)
-  ) {
-    return false;
-  }
+  const hasHotReservation = hasHotConflictReservation(task);
 
   if (
     (
@@ -160,12 +160,12 @@ function taskBlocksCoordination(task: Task): boolean {
 
   if (!BLOCKING_COORDINATION_STATUSES.has(task.status)) {
     return (task.status === 'failed' || task.status === 'stagnant')
-      ? hasHotConflictReservation(task)
+      ? hasHotReservation
       : false;
   }
 
   if (task.status === 'completed') {
-    return resolveTaskIntegrationStatus(task) !== 'integrated';
+    return hasHotReservation || resolveTaskIntegrationStatus(task) !== 'integrated';
   }
 
   return true;
@@ -229,6 +229,25 @@ function normalizePrdDependencyList(values?: string[]): string[] {
     .filter((value): value is string => Boolean(value)))];
 }
 
+function getGeneratedDependencyRepairPrdIds(task: Task): string[] {
+  if (!isDependencyRepairPriority(task.priorityClass)) {
+    return [];
+  }
+
+  const taskPrdId = normalizePrdId(task.prdId);
+  const resolvedPrdId = normalizePrdId(resolveEffectiveDependencyPrdIdFromTask(task));
+  return [...new Set([
+    normalizePrdId(task.repairOf?.prdId),
+    ...normalizePrdDependencyList(task.releasesDependenciesFor),
+    normalizePrdId(task.effectiveDependencyPrdId),
+    resolvedPrdId && resolvedPrdId !== taskPrdId ? resolvedPrdId : undefined,
+  ].filter((value): value is string => Boolean(value)))];
+}
+
+function isGeneratedDependencyRepairTask(task: Task): boolean {
+  return getGeneratedDependencyRepairPrdIds(task).length > 0;
+}
+
 function taskDependsOnPrd(
   task: Task,
   targetPrdId: string,
@@ -236,7 +255,7 @@ function taskDependsOnPrd(
 ): boolean {
   const byPrdId = new Map<string, Task>();
   for (const candidate of candidates) {
-    const candidatePrdId = normalizePrdId(candidate.prdId);
+    const candidatePrdId = normalizePrdId(resolveEffectiveDependencyPrdIdFromTask(candidate));
     if (candidatePrdId && sameRepoPath(candidate.repoPath, task.repoPath)) {
       byPrdId.set(candidatePrdId, candidate);
     }
@@ -276,12 +295,76 @@ function shouldBypassCandidateForDependencyOrder(
     return false;
   }
 
-  const taskPrdId = normalizePrdId(task.prdId);
+  const taskPrdId = normalizePrdId(resolveEffectiveDependencyPrdIdFromTask(task));
   if (!taskPrdId) {
     return false;
   }
 
   return taskDependsOnPrd(candidate, taskPrdId, candidates);
+}
+
+function isOrdinaryPendingDependencyRepairBypassCandidate(candidate: Task): boolean {
+  if (candidate.status !== 'pending') {
+    return false;
+  }
+
+  if (hasHotConflictReservation(candidate)) {
+    return false;
+  }
+
+  return !isDependencyRepairPriority(candidate.priorityClass)
+    && !isBaselineRepairTask(candidate)
+    && !candidate.repairContext
+    && !resolveTaskRecoveryKind(candidate);
+}
+
+function sharesDependencyRepairConflictCohort(
+  taskConflictDomains: string[],
+  candidate: Task,
+  phase: TaskCoordinationPhase,
+): boolean {
+  if (taskConflictDomains.length === 0) {
+    return false;
+  }
+
+  const hydratedCandidate = hydrateTaskForPhase(candidate, phase);
+  const candidateConflictDomains = getEffectiveConflictDomains(hydratedCandidate, phase);
+  return taskConflictDomains.some((domain) => candidateConflictDomains.includes(domain));
+}
+
+function shouldBypassCandidateForGeneratedDependencyRepair(
+  task: Task,
+  candidate: Task,
+  candidates: Task[],
+  phase: TaskCoordinationPhase,
+  taskConflictDomains: string[],
+): boolean {
+  const repairedPrdIds = getGeneratedDependencyRepairPrdIds(task);
+  if (repairedPrdIds.length === 0) {
+    return false;
+  }
+
+  if (!isOrdinaryPendingDependencyRepairBypassCandidate(candidate)) {
+    return false;
+  }
+
+  if (repairedPrdIds.some((repairedPrdId) => taskDependsOnPrd(candidate, repairedPrdId, candidates))) {
+    return true;
+  }
+
+  return sharesDependencyRepairConflictCohort(taskConflictDomains, candidate, phase);
+}
+
+function shouldBypassCandidateForPendingPriority(task: Task, candidate: Task): boolean {
+  if (isGeneratedDependencyRepairTask(task)) {
+    return false;
+  }
+
+  return pendingTaskHasHigherPriorityThanCandidate(task, candidate);
+}
+
+function isActiveCoordinationConflict(task: Task): boolean {
+  return task.status === 'running' || task.status === 'finalizing';
 }
 
 function shouldBypassCandidateForBaselineRepair(
@@ -649,6 +732,7 @@ export function findCoordinationBlockers(
   const taskPathSurface = getEffectivePathSurface(hydratedTask, phase);
   const taskHasKnownSurface = taskConflictDomains.length > 0 || taskPathSurface.length > 0;
   const lane = resolveTaskIntegrationLane(hydratedTask, options.targetBranch);
+  const currentTaskIsGeneratedDependencyRepair = isGeneratedDependencyRepairTask(hydratedTask);
   const matches: CoordinationOverlapMatch[] = [];
 
   for (const candidate of candidates) {
@@ -668,15 +752,31 @@ export function findCoordinationBlockers(
       continue;
     }
 
-    if (shouldBypassCandidateForGeneratedFollowup(task, candidate)) {
-      continue;
+    if (currentTaskIsGeneratedDependencyRepair) {
+      if (shouldBypassCandidateForGeneratedDependencyRepair(
+        hydratedTask,
+        candidate,
+        candidates,
+        phase,
+        taskConflictDomains,
+      )) {
+        continue;
+      }
+    } else {
+      if (shouldBypassCandidateForGeneratedFollowup(task, candidate)) {
+        continue;
+      }
+
+      if (shouldBypassCandidateForDependencyOrder(task, candidate, candidates)) {
+        continue;
+      }
+
+      if (shouldBypassCandidateForPendingPriority(task, candidate)) {
+        continue;
+      }
     }
 
-    if (shouldBypassCandidateForDependencyOrder(task, candidate, candidates)) {
-      continue;
-    }
-
-    if (compareTaskOrder(candidate, task) >= 0) {
+    if (!isActiveCoordinationConflict(candidate) && compareTaskOrder(candidate, task) >= 0) {
       continue;
     }
 

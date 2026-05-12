@@ -12,6 +12,7 @@ import { assertPrdHasExplicitTitle, generateTaskId, parsePRD, saveTaskPRD } from
 import { Task, TaskStatus } from '../types/task';
 import { appendTaskEvent } from './events';
 import { getRalphPaths, RalphHomeOptions } from './paths';
+import { resolveEffectiveDependencyPrdIdFromPrd } from './dependency-identity';
 
 type TaskStateStore = Pick<StateManager, 'saveTask' | 'loadTask' | 'listTasks'> & Partial<Pick<StateManager, 'getTaskDirPath'>>;
 
@@ -137,6 +138,7 @@ export async function enqueueTaskFromPrd(
   assertPrdHasExplicitTitle(resolvedPrdPath);
   const prd = parsePRD(resolvedPrdPath);
   const declaredCoordination = extractDeclaredCoordination(prd);
+  const effectiveDependencyPrdId = resolveEffectiveDependencyPrdIdFromPrd(prd);
   const sourceHash = hashFile(resolvedPrdPath);
   const base = resolveBaseRef(repoPath);
   const enqueuedAt = now();
@@ -182,6 +184,13 @@ export async function enqueueTaskFromPrd(
     declaredWriteSurface: declaredCoordination.declaredWriteSurface,
     declaredConflictDomains: declaredCoordination.declaredConflictDomains,
     integrationLane: declaredCoordination.integrationLane,
+    priorityClass: prd.priorityClass,
+    repairOf: prd.repairOf,
+    releasesDependenciesFor: prd.releasesDependenciesFor,
+    schedulerHints: prd.schedulerHints,
+    effectiveDependencyPrdId: effectiveDependencyPrdId !== prd.id
+      ? effectiveDependencyPrdId
+      : undefined,
     enqueuedAt,
     baseRef: base.baseRef,
     baseCommitSha: base.baseCommitSha,

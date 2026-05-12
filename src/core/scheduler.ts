@@ -26,6 +26,7 @@ import {
   WorktreeCleanupResult,
   WorktreeProcessInfo,
 } from './worktree-process-cleanup';
+import { comparePendingTaskScheduleOrder } from './scheduler-priority';
 
 const DEFAULT_MAX_CONCURRENT = 3;
 const LOCK_RETRY_MS = 50;
@@ -76,6 +77,7 @@ export interface PendingTaskState {
   dependencyBlockers?: DependencyBlocker[];
   failedDependencies?: string[];
   recoveringDependencies?: string[];
+  repairTaskIds?: string[];
   missingDependencies?: string[];
   blockers: string[];
   failedBlockers?: string[];
@@ -669,6 +671,7 @@ export class TaskScheduler {
         dependencyBlockers: dependencyState.blockers,
         failedDependencies: dependencyState.failed,
         recoveringDependencies: dependencyState.recovering,
+        repairTaskIds: dependencyState.repairTaskIds,
         missingDependencies: dependencyState.missing,
         blockers: [],
         maxConcurrent,
@@ -770,7 +773,7 @@ export class TaskScheduler {
 
       const pendingTasks = (await this.stateManager.listTasks('pending'))
         .slice()
-        .sort((a, b) => a.startTime - b.startTime);
+        .sort(comparePendingTaskScheduleOrder);
 
       for (const task of pendingTasks) {
         if (runningCount >= maxConcurrent) {

@@ -1,3 +1,5 @@
+import type { PRDPriorityClass, PRDRepairOf, PRDSchedulerHints } from './prd';
+
 export type TaskStatus = 'pending' | 'running' | 'ready_to_finalize' | 'finalizing' | 'completed' | 'failed' | 'failed_finalize' | 'stagnant';
 export type TaskMergeStrategy = 'manual' | 'ours' | 'theirs';
 export type StoryStatus = 'pending' | 'in_progress' | 'needs_repair' | 'passed' | 'failed';
@@ -292,6 +294,11 @@ export interface Task {
   declaredWriteSurface?: string[];
   declaredConflictDomains?: string[];
   integrationLane?: string;
+  priorityClass?: PRDPriorityClass;
+  repairOf?: PRDRepairOf;
+  releasesDependenciesFor?: string[];
+  schedulerHints?: PRDSchedulerHints;
+  effectiveDependencyPrdId?: string;
   enqueuedAt?: number;
   baseRef?: string;
   intendedMergeTarget?: string;

@@ -13,6 +13,7 @@ import {
 import { evaluateAutoRecovery, resolveTaskRecoveryKind } from '../core/auto-recovery-state';
 import { isBaselineQualityGateStateCurrent } from '../core/baseline-quality-gate';
 import { isDedicatedBaselineRepairTask } from '../core/baseline-repair';
+import { isDependencyRepairPriority } from '../core/dependency-identity';
 import { buildFailureObservationFromTask } from '../core/failure-observation';
 import { StateManager } from '../core/state';
 import { TaskScheduler } from '../core/scheduler';
@@ -26,6 +27,7 @@ interface PendingSummary {
   dependencyBlockers?: unknown[];
   failedDependencies?: string[];
   recoveringDependencies?: string[];
+  repairTaskIds?: string[];
   missingDependencies?: string[];
   blockers: string[];
   failedBlockers?: string[];
@@ -145,6 +147,9 @@ export interface QueueState {
   nextAction: string;
   autonomous: boolean;
   blockers?: string[];
+  repairTaskIds?: string[];
+  principalRepairTask?: string;
+  repairBlockedBy?: string[];
   recovery?: QueueRecoveryState;
   approval?: QueueApprovalState;
   policy?: QueuePolicyState;
@@ -179,6 +184,8 @@ interface QueueActionability {
   status: 'idle' | 'runnable' | 'running' | 'recovering' | 'awaiting_approval' | 'blocked' | 'blocked_by_policy' | 'diagnostics' | 'ingestion_backlog';
   reason?: string;
   principalBlocker?: string;
+  principalRepairTask?: string;
+  repairBlockedBy?: string[];
   nextAction?: string;
 }
 
@@ -690,6 +697,39 @@ function blockersForQueueState(task: Task, pendingState?: PendingSummary): strin
   return blockers?.length ? blockers : undefined;
 }
 
+function uniqueQueueStrings(values: Array<string | undefined>): string[] {
+  return Array.from(new Set(values.filter((value): value is string => Boolean(value))));
+}
+
+function dependencyBlockerTaskId(blocker: unknown): string | undefined {
+  if (!blocker || typeof blocker !== 'object' || Array.isArray(blocker)) {
+    return undefined;
+  }
+
+  const raw = blocker as { taskId?: unknown; prdId?: unknown };
+  return typeof raw.taskId === 'string' && raw.taskId.trim()
+    ? raw.taskId.trim()
+    : typeof raw.prdId === 'string' && raw.prdId.trim()
+      ? raw.prdId.trim()
+      : undefined;
+}
+
+function repairBlockedByForQueueState(task: Task, pendingState?: PendingSummary): string[] | undefined {
+  if (!pendingState || !isDependencyRepairPriority(task.priorityClass)) {
+    return undefined;
+  }
+
+  if (pendingState.reason === 'coordination') {
+    return uniqueQueueStrings(pendingState.blockers);
+  }
+
+  if (pendingState.reason === 'dependencies') {
+    return uniqueQueueStrings((pendingState.dependencyBlockers || []).map(dependencyBlockerTaskId));
+  }
+
+  return [];
+}
+
 function queueStateFromBlockReason(input: {
   task: Task;
   pendingState?: PendingSummary;
@@ -713,6 +753,9 @@ function queueStateFromBlockReason(input: {
     nextAction,
     autonomous,
     blockers,
+    repairTaskIds: pendingState?.repairTaskIds?.length ? pendingState.repairTaskIds : undefined,
+    principalRepairTask: pendingState?.repairTaskIds?.[0],
+    repairBlockedBy: repairBlockedByForQueueState(task, pendingState),
     recovery,
     ...extra,
   });
@@ -802,6 +845,9 @@ export function deriveQueueState(
     nextAction,
     autonomous,
     blockers,
+    repairTaskIds: pendingState?.repairTaskIds?.length ? pendingState.repairTaskIds : undefined,
+    principalRepairTask: pendingState?.repairTaskIds?.[0],
+    repairBlockedBy: repairBlockedByForQueueState(task, pendingState),
     recovery,
     ...extra,
   });
@@ -1050,6 +1096,11 @@ function compactTaskSummary(taskSummary: Record<string, any>) {
     id: taskSummary.id,
     status: taskSummary.status,
     prdId: taskSummary.prdId,
+    effectiveDependencyPrdId: taskSummary.effectiveDependencyPrdId,
+    priorityClass: taskSummary.priorityClass,
+    repairOf: taskSummary.repairOf,
+    releasesDependenciesFor: taskSummary.releasesDependenciesFor,
+    schedulerHints: taskSummary.schedulerHints,
     prdTitle: taskSummary.prdTitle,
     prdPath: taskSummary.prdPath,
     repoPath: taskSummary.repoPath,
@@ -1068,6 +1119,7 @@ function compactTaskSummary(taskSummary: Record<string, any>) {
     blockers: taskSummary.blockers,
     failedDependencies: taskSummary.failedDependencies,
     recoveringDependencies: taskSummary.recoveringDependencies,
+    repairTaskIds: taskSummary.repairTaskIds,
     missingDependencies: taskSummary.missingDependencies,
     failedBlockers: taskSummary.failedBlockers,
     recoveringBlockers: taskSummary.recoveringBlockers,
@@ -1105,6 +1157,11 @@ function summarizeTask(
     id: task.id,
     status: task.status,
     prdId: task.prdId,
+    effectiveDependencyPrdId: task.effectiveDependencyPrdId,
+    priorityClass: task.priorityClass,
+    repairOf: task.repairOf,
+    releasesDependenciesFor: task.releasesDependenciesFor,
+    schedulerHints: task.schedulerHints,
     prdTitle: task.prdTitle,
     prdPath: task.prdPath,
     repoPath: task.repoPath,
@@ -1123,6 +1180,7 @@ function summarizeTask(
     dependencyBlockers: pendingState?.dependencyBlockers,
     failedDependencies: pendingState?.failedDependencies,
     recoveringDependencies: pendingState?.recoveringDependencies,
+    repairTaskIds: pendingState?.repairTaskIds,
     missingDependencies: pendingState?.missingDependencies,
     blockers: pendingState?.reason === 'dependencies'
       ? pendingState.dependencies
@@ -1238,6 +1296,13 @@ export function resolveNextAction(
 
     if (task.repairContext?.mode === 'finalize') {
       return `start finalize repair anchored to ${task.repairContext.storyId}`;
+    }
+
+    if (
+      pendingState?.reason === 'queued'
+      && pendingState.running >= pendingState.maxConcurrent
+    ) {
+      return `wait for a concurrency slot; ${pendingState.running}/${pendingState.maxConcurrent} worker slot(s) are occupied`;
     }
 
     return 'start when a concurrency slot is available';
@@ -1594,6 +1659,171 @@ function isRecoveryPlanningQueueTask(task: Record<string, any>): boolean {
     );
 }
 
+interface PrincipalDependencyRepairActionability {
+  principalBlocker: string;
+  principalRepairTask: string;
+  repairBlockedBy: string[];
+  reason: string;
+  nextAction: string;
+}
+
+function stringArray(value: unknown): string[] {
+  return Array.isArray(value)
+    ? value.filter((entry): entry is string => typeof entry === 'string' && entry.trim().length > 0)
+    : [];
+}
+
+function firstDependencyRepairBlocker(task: Record<string, any>): string | undefined {
+  return [
+    ...stringArray(task.recoveringDependencies),
+    ...stringArray(task.failedDependencies),
+    ...stringArray(task.queueState?.blockers),
+    ...stringArray(task.blockers),
+  ][0];
+}
+
+function repairDependencyBlockerIds(task: Record<string, any>): string[] {
+  const dependencyBlockers = Array.isArray(task.dependencyBlockers)
+    ? task.dependencyBlockers
+    : [];
+
+  const taskIds = dependencyBlockers.map(dependencyBlockerTaskId);
+  return uniqueQueueStrings(taskIds.length > 0 ? taskIds : stringArray(task.queueState?.blockers));
+}
+
+function repairBlockedByForSummary(task: Record<string, any> | undefined): string[] {
+  if (!task) {
+    return [];
+  }
+
+  if (task.reason === 'coordination' || task.queueState?.detail === 'blocked_by_coordination') {
+    return uniqueQueueStrings([
+      ...stringArray(task.queueState?.blockers),
+      ...stringArray(task.blockers),
+    ]);
+  }
+
+  if (task.reason === 'dependencies' || task.queueState?.detail === 'blocked_by_dependency') {
+    return repairDependencyBlockerIds(task);
+  }
+
+  return [];
+}
+
+function resolveDependencyRepairReason(
+  repairTask: Record<string, any> | undefined,
+  repairBlockedBy: string[],
+  capacity: { available: number },
+): string {
+  if (repairBlockedBy.length > 0) {
+    return repairTask?.reason === 'dependencies' || repairTask?.queueState?.detail === 'blocked_by_dependency'
+      ? 'dependency_repair_blocked_by_dependency'
+      : 'dependency_repair_blocked_by_coordination';
+  }
+
+  if (!repairTask) {
+    return 'waiting_for_dependency_repair';
+  }
+
+  if (repairTask.status === 'pending' && capacity.available > 0) {
+    return 'dependency_repair_ready';
+  }
+
+  if (repairTask.status === 'pending') {
+    return 'dependency_repair_waiting_for_slot';
+  }
+
+  if (repairTask.status === 'running' || repairTask.status === 'ready_to_finalize' || repairTask.status === 'finalizing') {
+    return 'dependency_repair_in_progress';
+  }
+
+  if (repairTask.status === 'completed') {
+    return 'dependency_repair_pending_integration';
+  }
+
+  return 'waiting_for_dependency_repair';
+}
+
+function resolveDependencyRepairNextAction(input: {
+  principalBlocker: string;
+  principalRepairTask: string;
+  repairTask?: Record<string, any>;
+  repairBlockedBy: string[];
+  capacity: { available: number };
+}): string {
+  if (input.repairBlockedBy.length > 0) {
+    if (input.repairTask?.reason === 'dependencies' || input.repairTask?.queueState?.detail === 'blocked_by_dependency') {
+      return `wait for dependency task(s) before starting dependency repair ${input.principalRepairTask}: ${input.repairBlockedBy.join(', ')}; scheduler should start the repair after dependency checks clear`;
+    }
+
+    return `wait for running/finalizing overlap(s) to finish or integrate before starting dependency repair ${input.principalRepairTask}: ${input.repairBlockedBy.join(', ')}; scheduler should hold gracefully if any blocker is stale`;
+  }
+
+  if (!input.repairTask) {
+    return `inspect dependency repair task ${input.principalRepairTask} for failed dependency ${input.principalBlocker}`;
+  }
+
+  if (input.repairTask.status === 'pending') {
+    if (input.capacity.available > 0) {
+      return `scheduler should start dependency repair task ${input.principalRepairTask} for failed dependency ${input.principalBlocker}`;
+    }
+
+    return `wait for a worker slot before starting dependency repair task ${input.principalRepairTask} for failed dependency ${input.principalBlocker}`;
+  }
+
+  if (input.repairTask.status === 'running') {
+    return `wait for dependency repair task ${input.principalRepairTask} to complete for failed dependency ${input.principalBlocker}`;
+  }
+
+  if (input.repairTask.status === 'ready_to_finalize' || input.repairTask.status === 'finalizing') {
+    return `wait for dependency repair task ${input.principalRepairTask} to finalize for failed dependency ${input.principalBlocker}`;
+  }
+
+  if (input.repairTask.status === 'completed') {
+    return `integrate dependency repair task ${input.principalRepairTask} to release failed dependency ${input.principalBlocker}`;
+  }
+
+  return input.repairTask.nextAction
+    ?? `inspect dependency repair task ${input.principalRepairTask} for failed dependency ${input.principalBlocker}`;
+}
+
+function resolvePrincipalDependencyRepairActionability(input: {
+  tasks: Record<string, any>[];
+  capacity: { available: number };
+}): PrincipalDependencyRepairActionability | undefined {
+  const tasksById = new Map(input.tasks.map((task) => [task.id, task]));
+  const waitingDependencyTask = input.tasks.find((task) => (
+    task.queueState?.detail === 'blocked_by_dependency'
+    && stringArray(task.repairTaskIds).length > 0
+  ));
+  if (!waitingDependencyTask) {
+    return undefined;
+  }
+
+  const principalBlocker = firstDependencyRepairBlocker(waitingDependencyTask);
+  const principalRepairTask = stringArray(waitingDependencyTask.repairTaskIds)[0];
+  if (!principalBlocker || !principalRepairTask) {
+    return undefined;
+  }
+
+  const repairTask = tasksById.get(principalRepairTask);
+  const repairBlockedBy = repairBlockedByForSummary(repairTask);
+
+  return {
+    principalBlocker,
+    principalRepairTask,
+    repairBlockedBy,
+    reason: resolveDependencyRepairReason(repairTask, repairBlockedBy, input.capacity),
+    nextAction: resolveDependencyRepairNextAction({
+      principalBlocker,
+      principalRepairTask,
+      repairTask,
+      repairBlockedBy,
+      capacity: input.capacity,
+    }),
+  };
+}
+
 function resolveDeadlockReason(tasks: Record<string, any>[]): {
   reason: string;
   principalBlocker?: string;
@@ -1826,6 +2056,11 @@ export function resolveActionability(input: {
     queuedRunnable: number;
   };
 }): QueueActionability {
+  const dependencyRepair = resolvePrincipalDependencyRepairActionability({
+    tasks: input.tasks,
+    capacity: input.capacity,
+  });
+
   const policyBlock = [
     ...input.systemBlocks.filter((item) => item.phase === 'blocked_by_policy'),
     ...input.actions.filter((item) => item.queueState.phase === 'blocked_by_policy'),
@@ -1849,6 +2084,17 @@ export function resolveActionability(input: {
       reason: approval.reason,
       principalBlocker: approval.blockers?.[0] ?? ('id' in approval ? approval.id : undefined),
       nextAction: approval.nextAction,
+    };
+  }
+
+  if (dependencyRepair) {
+    return {
+      status: 'runnable',
+      reason: dependencyRepair.reason,
+      principalBlocker: dependencyRepair.principalBlocker,
+      principalRepairTask: dependencyRepair.principalRepairTask,
+      repairBlockedBy: dependencyRepair.repairBlockedBy,
+      nextAction: dependencyRepair.nextAction,
     };
   }
 
@@ -2051,6 +2297,10 @@ export async function buildQueueSnapshot(
       id: task.id,
       status: task.status,
       prdId: task.prdId,
+      effectiveDependencyPrdId: task.effectiveDependencyPrdId,
+      priorityClass: task.priorityClass,
+      repairOf: task.repairOf,
+      releasesDependenciesFor: task.releasesDependenciesFor,
       repoPath: task.repoPath,
       queueState: task.queueState,
       reason: task.queueState.reason,

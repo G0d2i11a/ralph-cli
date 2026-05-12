@@ -5,6 +5,7 @@ const os = require('node:os');
 const path = require('node:path');
 
 const { StateManager } = require('../dist/core/state.js');
+const { checkDependencies } = require('../dist/utils/helpers.js');
 
 function createTask(overrides = {}) {
   const now = 1_000;
@@ -94,6 +95,67 @@ test('StateManager isolates task storage by RALPH_HOME', async () => {
     assert.equal((await stateManagerB.listTasks()).length, 0);
     assert.equal(fs.existsSync(path.join(customHomeA, 'tasks', 'task-a', 'state.json')), true);
     assert.equal(fs.existsSync(path.join(customHomeB, 'tasks', 'task-a', 'state.json')), false);
+  } finally {
+    process.env.HOME = previousHome;
+    if (previousRalphHome === undefined) {
+      delete process.env.RALPH_HOME;
+    } else {
+      process.env.RALPH_HOME = previousRalphHome;
+    }
+    fs.rmSync(homeDir, { recursive: true, force: true });
+  }
+});
+
+test('StateManager resolves dependency repair tasks by original PRD identity', async () => {
+  const homeDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-state-repair-identity-'));
+  const previousHome = process.env.HOME;
+  const previousRalphHome = process.env.RALPH_HOME;
+
+  try {
+    process.env.HOME = homeDir;
+    delete process.env.RALPH_HOME;
+    const stateManager = new StateManager();
+
+    await stateManager.saveTask(createTask({
+      id: 'failed-source',
+      prdId: 'source-prd',
+      status: 'failed',
+      startTime: 100,
+      repoPath: '/tmp/repo',
+    }));
+    await stateManager.saveTask(createTask({
+      id: 'repair-followup',
+      prdId: 'followup:source-prd:abc123',
+      priorityClass: 'dependency_repair',
+      repairOf: {
+        prdId: 'source-prd',
+        taskId: 'failed-source',
+        reason: 'story_repair_hard_cap_reached',
+      },
+      releasesDependenciesFor: ['source-prd'],
+      effectiveDependencyPrdId: 'source-prd',
+      status: 'pending',
+      startTime: 200,
+      repoPath: '/tmp/repo',
+    }));
+
+    const dependencyTask = await stateManager.getTaskByPrdId('source-prd', { repoPath: '/tmp/repo' });
+    assert.equal(dependencyTask.id, 'repair-followup');
+    assert.equal(dependencyTask.prdId, 'followup:source-prd:abc123');
+    const followupTask = await stateManager.getTaskByPrdId('followup:source-prd:abc123', { repoPath: '/tmp/repo' });
+    assert.equal(followupTask.id, 'repair-followup');
+
+    const dependencyState = await checkDependencies({
+      id: 'downstream-prd',
+      title: 'Downstream',
+      description: '',
+      userStories: [],
+      dependencies: ['source-prd'],
+    }, stateManager, { repoPath: '/tmp/repo' });
+    assert.equal(dependencyState.satisfied, false);
+    assert.deepEqual(dependencyState.recovering, ['source-prd']);
+    assert.equal(dependencyState.blockers[0].taskId, 'repair-followup');
+    assert.equal(dependencyState.blockers[0].dependencyRepairActive, true);
   } finally {
     process.env.HOME = previousHome;
     if (previousRalphHome === undefined) {
