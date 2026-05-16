@@ -29,6 +29,7 @@ import {
   buildMergeRepairProof,
   deriveMergeRepairDisplayStatus,
 } from './merge-task-updates';
+import { resolveIntegrationSyncConflict } from './conflict-resolution';
 import {
   decideFinalizeRepairRequeue,
   evaluateFinalizeRepairFailure,
@@ -116,6 +117,7 @@ interface DependencyWatcherDeps {
   ensureBaselineRepairTask?: typeof ensureBaselineRepairTask;
   repairTaskWorktreeDependencyBootstrap?: typeof repairTaskWorktreeDependencyBootstrap;
   cleanupWorktreeProcesses?: typeof cleanupWorktreeProcesses;
+  resolveIntegrationSyncConflict?: typeof resolveIntegrationSyncConflict;
   reclamationService?: Pick<ReclamationService, 'run' | 'isAutomaticReclamationEnabled' | 'getIntervalMs' | 'getStartupDelayMs'>;
   lifecycle?: DependencyWatcherLifecycleHooks;
 }
@@ -1155,6 +1157,7 @@ export class DependencyWatcher {
   private readonly ensureBaselineRepairTaskFn: typeof ensureBaselineRepairTask;
   private readonly repairTaskWorktreeDependencyBootstrapFn: typeof repairTaskWorktreeDependencyBootstrap;
   private readonly cleanupWorktreeProcessesFn: typeof cleanupWorktreeProcesses;
+  private readonly resolveIntegrationSyncConflictFn: typeof resolveIntegrationSyncConflict;
   private readonly reclamationService: Pick<ReclamationService, 'run' | 'isAutomaticReclamationEnabled' | 'getIntervalMs' | 'getStartupDelayMs'>;
   private readonly lifecycle?: DependencyWatcherLifecycleHooks;
   private readonly autoIngestEnabled: boolean;
@@ -1181,6 +1184,7 @@ export class DependencyWatcher {
     this.ensureBaselineRepairTaskFn = deps.ensureBaselineRepairTask ?? ensureBaselineRepairTask;
     this.repairTaskWorktreeDependencyBootstrapFn = deps.repairTaskWorktreeDependencyBootstrap ?? repairTaskWorktreeDependencyBootstrap;
     this.cleanupWorktreeProcessesFn = deps.cleanupWorktreeProcesses ?? cleanupWorktreeProcesses;
+    this.resolveIntegrationSyncConflictFn = deps.resolveIntegrationSyncConflict ?? resolveIntegrationSyncConflict;
     this.reclamationService = deps.reclamationService ?? new ReclamationService({ stateManager, configManager });
     this.nextReclamationAtMs = Date.now() + this.reclamationService.getStartupDelayMs();
     this.scheduler = deps.scheduler ?? new TaskScheduler({ stateManager, managerOwnedScheduling: true });
@@ -1903,8 +1907,99 @@ export class DependencyWatcher {
       let stopMessage: string | undefined;
 
       if (integrationSyncConflict) {
-        stopReason = 'merge_repair_integration_sync_conflict';
-        stopMessage = 'Integration branch sync conflict must be resolved before task merge repair can continue';
+        const docsRepair = await this.resolveIntegrationSyncConflictFn({
+          task,
+          targetBranch: integrationPolicy.targetBranch,
+          conflictFiles: mergeProbeResult.conflictFiles,
+          integrationBranch: mergeProbeResult.integrationBranch,
+          integrationWorktree: mergeProbeResult.integrationWorktree,
+          mergeProbeResult,
+          configManager: this.configManager,
+          apply: true,
+          triggeredBy: 'manager',
+          now,
+        });
+
+        if (docsRepair.resolved) {
+          let postRepairProbe: Awaited<ReturnType<typeof probeTaskWorktreeMergeability>> | undefined;
+          try {
+            postRepairProbe = await this.probeWorktreeMergeability(task, integrationPolicy.targetBranch, {
+              pullLatest: integrationPolicy.pullLatest,
+              integrationWorktreeDir: integrationPolicy.integrationWorktreeDir,
+              syncTargetBranch: false,
+            });
+          } catch (error) {
+            this.logger.error(
+              `Exact post-repair mergeability probe failed for ${task.id}: ${error instanceof Error ? error.message : String(error)}`,
+            );
+          }
+
+          const postRepairClean = Boolean(postRepairProbe?.alreadyIntegrated || postRepairProbe?.mergeable);
+          const proof = docsRepair.proof
+            ? {
+                ...docsRepair.proof,
+                exactProbe: postRepairProbe
+                  ? {
+                      mergeable: postRepairProbe.mergeable,
+                      alreadyIntegrated: postRepairProbe.alreadyIntegrated,
+                      message: postRepairProbe.message,
+                      conflictFiles: postRepairProbe.conflictFiles,
+                      failurePhase: postRepairProbe.failurePhase,
+                    }
+                  : undefined,
+              }
+            : undefined;
+
+          if (postRepairProbe && !postRepairClean && postRepairProbe.failurePhase === 'integration_sync') {
+            stopReason = 'merge_repair_integration_sync_conflict_post_repair_probe_failed';
+            stopMessage = `Docs conflict repair applied but exact integration-sync probe still failed: ${postRepairProbe.message}`;
+          } else {
+            const previousProofs = task.conflictRepairProofs ?? [];
+            await this.stateManager.updateTask(task.id, {
+              ...commonUpdates,
+              conflictRepairProof: proof,
+              conflictRepairProofs: proof ? [...previousProofs, proof].slice(-20) : previousProofs,
+              mergeRepairDisplayStatus: postRepairProbe
+                ? deriveMergeRepairDisplayStatus(postRepairProbe)
+                : commonUpdates.mergeRepairDisplayStatus,
+              mergeRepairProof: postRepairProbe
+                ? buildMergeRepairProof(postRepairProbe, now)
+                : commonUpdates.mergeRepairProof,
+              mergeError: postRepairClean ? undefined : postRepairProbe?.message ?? commonUpdates.mergeError,
+              mergeConflictFiles: postRepairClean ? undefined : postRepairProbe?.conflictFiles ?? commonUpdates.mergeConflictFiles,
+              mergeConflictPhase: postRepairClean ? undefined : postRepairProbe?.failurePhase ?? commonUpdates.mergeConflictPhase,
+              mergeConflictAt: postRepairClean ? undefined : commonUpdates.mergeConflictAt,
+              integrationBranch: postRepairProbe?.integrationBranch ?? mergeProbeResult.integrationBranch,
+              integrationWorktree: postRepairProbe?.integrationWorktree ?? mergeProbeResult.integrationWorktree,
+              mergeRepairRecoveryStoppedAt: undefined,
+              mergeRepairRecoveryStopReason: undefined,
+              autoRecoveryKind: 'merge_repair',
+              autoRecoveryStoppedAt: undefined,
+              autoRecoveryStopReason: undefined,
+              autoRecoveryLastReason: docsRepair.message,
+            });
+            appendTaskEvent(task, {
+              type: 'integration_sync_conflict_auto_resolved',
+              status: task.status,
+              storyId: repairStoryId,
+              message: docsRepair.message,
+              data: {
+                strategy: docsRepair.strategy,
+                conflictFiles: docsRepair.conflictFiles,
+                proof,
+                exactProbeMessage: postRepairProbe?.message,
+                exactProbeClean: postRepairClean,
+              },
+            });
+            this.logger.log(`Task ${task.id} repaired allowlisted docs integration-sync conflict (${docsRepair.conflictFiles.join(', ')})`);
+            continue;
+          }
+        } else {
+          stopReason = docsRepair.stopReason === 'missing_integration_worktree'
+            ? 'merge_repair_integration_sync_conflict'
+            : docsRepair.stopReason ?? 'merge_repair_integration_sync_conflict';
+          stopMessage = docsRepair.message ?? 'Integration branch sync conflict must be resolved before task merge repair can continue';
+        }
       } else if (currentTotalRequeues >= repairConfig.repairHardCap || currentAutoRequeues >= repairConfig.repairHardCap) {
         stopReason = 'merge_repair_hard_cap_reached';
         stopMessage = 'Worker merge repair hard cap reached';

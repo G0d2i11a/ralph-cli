@@ -161,6 +161,17 @@ export interface RalphConfig {
     integrationWorktreeDir: string;
     syncTargetBranch: boolean;
     allowDestructiveAutoResolve: boolean;
+    autoResolveDocsConflicts: {
+      enabled: boolean;
+      allowlist: string[];
+      maxFiles: number;
+      maxBytesPerFile: number;
+      requireEvidence: boolean;
+      requireExactProbe: boolean;
+      llm: {
+        enabled: boolean;
+      };
+    };
   };
   finalizer: {
     qualityGateTimeout: number;
@@ -334,6 +345,17 @@ const DEFAULT_CONFIG: RalphConfig = {
     integrationWorktreeDir: '.ralph-integration',
     syncTargetBranch: true,
     allowDestructiveAutoResolve: false,
+    autoResolveDocsConflicts: {
+      enabled: true,
+      allowlist: ['docs/TODO.md', 'docs/PROJECT-STATUS.md'],
+      maxFiles: 3,
+      maxBytesPerFile: 200_000,
+      requireEvidence: true,
+      requireExactProbe: true,
+      llm: {
+        enabled: false,
+      },
+    },
   },
   finalizer: {
     qualityGateTimeout: 600,

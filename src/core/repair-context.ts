@@ -6,6 +6,7 @@ import {
   TaskRepairMode,
   TaskMergeConflictPhase,
 } from '../types/task';
+import { areAllAllowlistedDocsConflictFiles } from './conflict-resolution';
 
 interface RepairContextTaskView {
   repairContext?: TaskRepairContext;
@@ -59,12 +60,17 @@ export function buildMergeRepairReason(task: MergeRepairContextTaskView): string
     : 'unknown conflict files';
   const integrationTarget = task.integrationBranch || task.mergeTargetBranch || task.intendedMergeTarget || 'main';
   if (task.mergeConflictPhase === 'integration_sync') {
+    const docsConflictHint = areAllAllowlistedDocsConflictFiles(task.mergeConflictFiles)
+      ? 'These conflicts are in Ralph allowlisted status docs; first try `ralph repair-conflicts <task-id> --dry-run` / `--apply` to run deterministic fact-preserving docs repair.'
+      : undefined;
+
     return [
       'Integration branch sync repair required by Ralph.',
       `Conflict files: ${conflictFiles}.`,
       `Integration target: ${integrationTarget}.`,
       'The integration branch cannot sync the merge target before this task is checked.',
       'Resolve the conflict between the integration branch and the merge target first; editing only the task branch may not change the probe result.',
+      docsConflictHint,
       'Do not compare against origin/main unless it is the configured merge target.',
       task.mergeError || task.lastError ? `Original merge error: ${task.mergeError || task.lastError}` : undefined,
     ].filter(Boolean).join(' ');
@@ -174,12 +180,16 @@ function buildMergeRepairStory(
   const mergeFiles = formatInlineList(task.mergeConflictFiles);
   const isIntegrationSyncRepair = task.mergeConflictPhase === 'integration_sync'
     || /Integration branch sync failed/i.test(task.repairContext?.reason || lastStoryError || '');
+  const docsConflictHint = isIntegrationSyncRepair && areAllAllowlistedDocsConflictFiles(task.mergeConflictFiles)
+    ? 'These conflicts are in Ralph allowlisted status docs; first try `ralph repair-conflicts <task-id> --dry-run` / `--apply` before handing the repair to a worker.'
+    : undefined;
   const descriptionLines = [
     'Ralph is asking for merge repair, not a new feature pass.',
     'All PRD stories for this task have already passed. This user story is only the scheduling anchor for the repair.',
     isIntegrationSyncRepair
       ? 'The current failure is in the integration-branch sync phase, before this task branch is merged. Inspect the configured integration branch and merge target instead of defaulting to origin/main.'
       : 'Resolve the integration conflict semantically. Preserve both the already-integrated target behavior and this task\'s intended behavior.',
+    docsConflictHint,
     isIntegrationSyncRepair
       ? 'Ralph will only accept this repair after the integration branch can sync the configured merge target and then the task branch/worktree passes the exact mergeability probe.'
       : 'Ralph will only accept this repair when the actual task branch/worktree itself passes the exact mergeability probe against the integration target.',
@@ -188,7 +198,7 @@ function buildMergeRepairStory(
       : 'Do not stop at a temp clone, a manual merge transcript, a merge-tree grep, or a narrative about how the conflict could be resolved. Apply the resolution in this task worktree/branch.',
     'If you validate in a temp clone, treat that as advisory only. The real proof must still be the exact probe becoming clean without further manual edits.',
     `Repair reason: ${formatRepairReason(task.repairContext?.reason || lastStoryError || 'Merge repair required.')}`,
-  ];
+  ].filter((line): line is string => Boolean(line));
 
   if (mergeFiles) {
     descriptionLines.push(`Conflict files: ${mergeFiles}`);

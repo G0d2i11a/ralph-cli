@@ -49,6 +49,11 @@ export type TaskMergeRepairDisplayStatus = 'unresolved' | 'resolved_pending_fina
 export type TaskMergeProofSourceKind = 'branch_head' | 'worktree_snapshot' | 'resolved_pending_merge';
 export type TaskWorktreeMergeStateKind = 'none' | 'unresolved' | 'resolved_pending_commit';
 export type TaskMergeConflictPhase = 'integration_sync' | 'source_merge' | 'worktree_unresolved';
+export type TaskConflictRepairStrategy =
+  | 'deterministic_project_status_todo'
+  | 'markdown_union'
+  | 'llm_patch'
+  | 'manual';
 
 export interface StoryProgress {
   id: string;
@@ -282,6 +287,36 @@ export interface TaskMergeRepairProof {
   integrationBranch?: string;
 }
 
+export interface TaskConflictRepairProof {
+  taskId?: string;
+  observedAt: number;
+  phase: TaskMergeConflictPhase;
+  strategy: TaskConflictRepairStrategy;
+  conflictFiles: string[];
+  integrationBranch?: string;
+  integrationWorktree?: string;
+  targetBranch?: string;
+  baseSha?: string;
+  oursSha?: string;
+  theirsSha?: string;
+  resolverVersion: string;
+  beforeConflictHunksSha: string;
+  afterFilesSha: string;
+  retainedOursFacts: number;
+  retainedTheirsFacts: number;
+  droppedFacts: string[];
+  warnings?: string[];
+  validationCommands?: string[];
+  exactProbe?: {
+    mergeable: boolean;
+    alreadyIntegrated: boolean;
+    message: string;
+    conflictFiles?: string[];
+    failurePhase?: TaskMergeConflictPhase;
+  };
+  commitSha?: string;
+}
+
 export interface Task {
   id: string;
   prdPath: string;
@@ -456,6 +491,8 @@ export interface Task {
   mergeRepairWorktree?: string;
   mergeRepairDisplayStatus?: TaskMergeRepairDisplayStatus;
   mergeRepairProof?: TaskMergeRepairProof;
+  conflictRepairProof?: TaskConflictRepairProof;
+  conflictRepairProofs?: TaskConflictRepairProof[];
   mergeRepairRecoveryStartedAt?: number;
   mergeRepairRecoveryDeadlineAt?: number;
   mergeRepairRecoveryTotalRequeues?: number;

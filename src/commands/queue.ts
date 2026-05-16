@@ -1282,7 +1282,7 @@ export function resolveNextAction(
     }
 
     if (task.mergeConflictPhase === 'integration_sync') {
-      return 'resolve the integration branch sync conflict, then retry the blocked task';
+      return `resolve the integration branch sync conflict: run ralph repair-conflicts ${task.id} --dry-run; if only allowlisted docs/status conflicts are reported, run --apply, then let manager re-probe or retry the blocked task`;
     }
 
     if (task.mergeRepairRecoveryStoppedAt || task.mergeRepairDisplayStatus === 'stopped') {

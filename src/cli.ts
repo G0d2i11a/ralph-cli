@@ -12,6 +12,7 @@ import { finalizeCommand } from './commands/finalize';
 import { statsCommand } from './commands/stats';
 import { updateCommand } from './commands/update';
 import { retryCommand } from './commands/retry';
+import { repairConflictsCommand } from './commands/repair-conflicts';
 import { resetStagnationCommand } from './commands/reset-stagnation';
 import { completionCommand } from './commands/completion';
 import { watch } from './commands/watch';
@@ -164,6 +165,24 @@ Examples:
   $ ralph retry task-1772544497775-wdat8zyr5
   $ ralph retry task-1772544497775-wdat8zyr5 --finalize-only`)
   .action(retryCommand);
+
+program
+  .command('repair-conflicts <task-id>')
+  .description('Safely repair allowlisted docs/status integration-sync conflicts')
+  .option('--dry-run', 'Inspect deterministic docs repair without writing files')
+  .option('--apply', 'Apply deterministic docs repair, commit it, and record proof')
+  .option('--json', 'Emit compact JSON')
+  .option('--allow-llm', 'Allow optional LLM fallback when configured; deterministic resolver remains first')
+  .addHelpText('after', `
+Examples:
+  $ ralph repair-conflicts task-1772544497775-wdat8zyr5 --dry-run
+  $ ralph repair-conflicts task-1772544497775-wdat8zyr5 --apply
+
+Description:
+  Repairs only narrow, allowlisted docs/status conflicts such as docs/TODO.md
+  and docs/PROJECT-STATUS.md. The command preserves both sides' facts and
+  refuses code/config/schema/security/lockfile conflicts.`)
+  .action(repairConflictsCommand);
 
 program
   .command('reset-stagnation <task-id>')

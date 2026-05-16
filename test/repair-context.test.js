@@ -2,6 +2,7 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 
 const {
+  buildMergeRepairReason,
   buildStoryExecutionPayload,
   buildTaskRepairContext,
 } = require('../dist/core/repair-context.js');
@@ -90,6 +91,17 @@ test('buildStoryExecutionPayload rewrites anchored story into merge repair promp
   assert.match(result.description, /actual task branch\/worktree itself passes the exact mergeability probe/i);
   assert.match(result.acceptanceCriteria[0], /Resolve the merge conflict/);
   assert.match(result.acceptanceCriteria[2], /tests alone are not sufficient/i);
+});
+
+test('buildMergeRepairReason points allowlisted docs integration-sync conflicts at repair-conflicts', () => {
+  const reason = buildMergeRepairReason({
+    mergeConflictPhase: 'integration_sync',
+    mergeConflictFiles: ['docs/TODO.md', 'docs/PROJECT-STATUS.md'],
+    integrationBranch: 'ralph/integration/main',
+  });
+
+  assert.match(reason, /repair-conflicts/);
+  assert.match(reason, /deterministic fact-preserving docs repair/);
 });
 
 test('buildStoryExecutionPayload truncates oversized inline repair context lists', () => {
