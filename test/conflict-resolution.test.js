@@ -7,6 +7,8 @@ const path = require('node:path');
 
 const {
   areAllAllowlistedDocsConflictFiles,
+  resolveDocsConflictRepairConfig,
+  resolveIntegrationSyncConflict,
   resolveKnownDocsConflict,
   resolveKnownDocsConflictFile,
   verifyNoConflictMarkers,
@@ -97,11 +99,68 @@ test('resolveKnownDocsConflict apply stages and commits allowlisted docs repair'
   assert.equal(result.resolved, true);
   assert.equal(result.applied, true);
   assert.equal(unmerged, '');
-  assert.equal(subject, 'Resolve Ralph integration sync docs conflicts');
+  assert.equal(subject, 'chore: resolve Ralph integration sync docs conflicts');
   assert.match(content, /Integration item/);
   assert.match(content, /Target item/);
   assert.equal(verifyNoConflictMarkers(content), true);
   assert.ok(result.proof.commitSha);
+
+  fs.rmSync(repo, { recursive: true, force: true });
+});
+
+test('resolveIntegrationSyncConflict recreates probe-cleaned integration sync conflict state', async () => {
+  const repo = createConflictedTodoRepo();
+  git(repo, ['merge', '--abort']);
+
+  const baseInput = {
+    task: {
+      id: 'task-docs-conflict',
+      mergeConflictFiles: ['docs/TODO.md'],
+      mergeConflictPhase: 'integration_sync',
+      integrationBranch: 'ralph/integration/main',
+      integrationWorktree: repo,
+    },
+    targetBranch: 'main',
+    conflictFiles: ['docs/TODO.md'],
+    integrationBranch: 'ralph/integration/main',
+    integrationWorktree: repo,
+    mergeProbeResult: {
+      mergeable: false,
+      alreadyIntegrated: false,
+      failurePhase: 'integration_sync',
+      conflictFiles: ['docs/TODO.md'],
+      integrationBranch: 'ralph/integration/main',
+      integrationWorktree: repo,
+    },
+  };
+
+  const dryRun = await resolveIntegrationSyncConflict({
+    ...baseInput,
+    apply: false,
+    now: 456,
+  });
+
+  assert.equal(dryRun.resolved, true);
+  assert.equal(dryRun.applied, false);
+  assert.equal(dryRun.proof.observedAt, 456);
+  assert.equal(git(repo, ['status', '--short']), '');
+
+  const applyResult = await resolveIntegrationSyncConflict({
+    ...baseInput,
+    apply: true,
+  });
+  const content = fs.readFileSync(path.join(repo, 'docs/TODO.md'), 'utf8');
+  const unmerged = git(repo, ['diff', '--name-only', '--diff-filter=U']);
+  const subject = git(repo, ['log', '-1', '--pretty=%s']);
+
+  assert.equal(applyResult.resolved, true);
+  assert.equal(applyResult.applied, true);
+  assert.equal(unmerged, '');
+  assert.equal(subject, 'chore: resolve Ralph integration sync docs conflicts');
+  assert.match(content, /Integration item/);
+  assert.match(content, /Target item/);
+  assert.equal(verifyNoConflictMarkers(content), true);
+  assert.ok(applyResult.proof.commitSha);
 
   fs.rmSync(repo, { recursive: true, force: true });
 });
@@ -148,4 +207,8 @@ test('resolveKnownDocsConflictFile preserves prose status conflicts in an eviden
 test('allowlist helper only accepts known status docs', () => {
   assert.equal(areAllAllowlistedDocsConflictFiles(['docs/TODO.md', 'docs/PROJECT-STATUS.md']), true);
   assert.equal(areAllAllowlistedDocsConflictFiles(['docs/TODO.md', 'package-lock.json']), false);
+});
+
+test('docs conflict repair default accepts large project status files', () => {
+  assert.equal(resolveDocsConflictRepairConfig().maxBytesPerFile, 1_000_000);
 });

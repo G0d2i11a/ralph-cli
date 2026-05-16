@@ -349,7 +349,7 @@ const DEFAULT_CONFIG: RalphConfig = {
       enabled: true,
       allowlist: ['docs/TODO.md', 'docs/PROJECT-STATUS.md'],
       maxFiles: 3,
-      maxBytesPerFile: 200_000,
+      maxBytesPerFile: 1_000_000,
       requireEvidence: true,
       requireExactProbe: true,
       llm: {

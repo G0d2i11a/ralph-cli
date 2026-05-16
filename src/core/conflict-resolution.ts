@@ -153,7 +153,7 @@ export function resolveDocsConflictRepairConfig(
     maxFiles: toPositiveInteger(configManager?.get('merge.autoResolveDocsConflicts.maxFiles'), 3),
     maxBytesPerFile: toPositiveInteger(
       configManager?.get('merge.autoResolveDocsConflicts.maxBytesPerFile'),
-      200_000,
+      1_000_000,
     ),
     requireEvidence: toBool(configManager?.get('merge.autoResolveDocsConflicts.requireEvidence'), true),
     requireExactProbe: toBool(configManager?.get('merge.autoResolveDocsConflicts.requireExactProbe'), true),
@@ -229,21 +229,63 @@ export async function resolveIntegrationSyncConflict(
     );
   }
 
+  const liveUnmergedFiles = listUnmergedFiles(worktreePath);
   const effectiveConflictFiles = uniqueStrings([
     ...conflictFiles,
-    ...listUnmergedFiles(worktreePath),
+    ...liveUnmergedFiles,
   ].map(normalizeRelativePath));
+  const hasLiveConflictState = liveUnmergedFiles.length > 0;
+  const shouldRecreateIntegrationSyncConflict = !hasLiveConflictState
+    && conflictFiles.length > 0
+    && (phase === 'integration_sync' || input.mergeProbeResult?.failurePhase === 'integration_sync');
 
-  const result = resolveKnownDocsConflict({
-    worktreePath,
-    conflictFiles: effectiveConflictFiles,
-    targetBranch: input.targetBranch,
-    integrationBranch,
-    taskId: input.task.id,
-    config,
-    apply,
-    now: input.now,
-  });
+  let recreatedIntegrationSyncConflict = false;
+  let preparedConflictFiles = effectiveConflictFiles;
+
+  if (shouldRecreateIntegrationSyncConflict) {
+    const prepared = prepareIntegrationSyncConflictState({
+      worktreePath,
+      targetBranch: input.targetBranch,
+      integrationBranch,
+      expectedConflictFiles: conflictFiles,
+    });
+
+    if (!prepared.success) {
+      return refused(
+        conflictFiles,
+        prepared.stopReason,
+        prepared.message,
+      );
+    }
+
+    recreatedIntegrationSyncConflict = true;
+    preparedConflictFiles = uniqueStrings([
+      ...conflictFiles,
+      ...prepared.conflictFiles,
+    ].map(normalizeRelativePath));
+  }
+
+  let result: ConflictResolutionResult;
+  try {
+    result = resolveKnownDocsConflict({
+      worktreePath,
+      conflictFiles: preparedConflictFiles,
+      targetBranch: input.targetBranch,
+      integrationBranch,
+      taskId: input.task.id,
+      config,
+      apply,
+      now: input.now,
+    });
+  } finally {
+    if (recreatedIntegrationSyncConflict && !apply) {
+      cleanupIntegrationSyncConflictState(worktreePath);
+    }
+  }
+
+  if (recreatedIntegrationSyncConflict && apply && !result.resolved) {
+    cleanupIntegrationSyncConflictState(worktreePath);
+  }
 
   if (!result.resolved && input.allowLlm && !config.llmEnabled) {
     return {
@@ -435,7 +477,7 @@ export function resolveKnownDocsConflict(input: ResolveKnownDocsConflictInput): 
   }
 
   const commitMessage = [
-    'Resolve Ralph integration sync docs conflicts',
+    'chore: resolve Ralph integration sync docs conflicts',
     '',
     `Strategy: ${proof.strategy}`,
     `Files: ${conflictFiles.join(', ')}`,
@@ -449,7 +491,7 @@ export function resolveKnownDocsConflict(input: ResolveKnownDocsConflictInput): 
     .filter(Boolean);
 
   if (stagedChanges.length > 0 || isMergeInProgress(input.worktreePath)) {
-    const commit = gitMaybe(input.worktreePath, ['commit', '-m', commitMessage]);
+    const commit = gitMaybe(input.worktreePath, ['commit', '--no-verify', '-m', commitMessage]);
     if (commit.status !== 0) {
       return refused(
         conflictFiles,
@@ -911,6 +953,82 @@ function listUnmergedFiles(worktreePath: string): string[] {
     .split(/\r?\n/)
     .map((line) => normalizeRelativePath(line.trim()))
     .filter(Boolean);
+}
+
+function prepareIntegrationSyncConflictState(input: {
+  worktreePath: string;
+  targetBranch: string;
+  integrationBranch?: string;
+  expectedConflictFiles: string[];
+}): { success: true; conflictFiles: string[] } | { success: false; stopReason: string; message: string } {
+  const currentBranch = gitMaybe(input.worktreePath, ['rev-parse', '--abbrev-ref', 'HEAD']).stdout;
+  if (
+    input.integrationBranch
+    && currentBranch
+    && currentBranch !== 'HEAD'
+    && normalizeRelativePath(currentBranch) !== normalizeRelativePath(input.integrationBranch)
+  ) {
+    return {
+      success: false,
+      stopReason: 'integration_worktree_branch_mismatch',
+      message: `Integration worktree is on ${currentBranch}, expected ${input.integrationBranch}`,
+    };
+  }
+
+  if (isMergeInProgress(input.worktreePath)) {
+    cleanupIntegrationSyncConflictState(input.worktreePath);
+  }
+
+  const status = gitMaybe(input.worktreePath, ['status', '--porcelain=v1', '-uall']);
+  if (status.status !== 0) {
+    return {
+      success: false,
+      stopReason: 'integration_worktree_status_failed',
+      message: `Could not inspect integration worktree status: ${status.stderr || status.stdout}`,
+    };
+  }
+
+  if (status.stdout.trim()) {
+    return {
+      success: false,
+      stopReason: 'integration_worktree_dirty',
+      message: 'Integration worktree has local changes; refusing to recreate conflict state',
+    };
+  }
+
+  const merge = gitMaybe(input.worktreePath, [
+    'merge',
+    '--no-ff',
+    '--no-commit',
+    input.targetBranch,
+  ]);
+  const conflictFiles = listUnmergedFiles(input.worktreePath);
+
+  if (conflictFiles.length > 0) {
+    return { success: true, conflictFiles };
+  }
+
+  cleanupIntegrationSyncConflictState(input.worktreePath);
+
+  if (merge.status === 0) {
+    return {
+      success: false,
+      stopReason: 'integration_sync_conflict_not_reproduced',
+      message: `Integration sync with ${input.targetBranch} no longer produces conflicts`,
+    };
+  }
+
+  return {
+    success: false,
+    stopReason: 'integration_sync_conflict_recreate_failed',
+    message: `Could not recreate integration sync conflict for ${input.expectedConflictFiles.join(', ')}: ${merge.stderr || merge.stdout}`,
+  };
+}
+
+function cleanupIntegrationSyncConflictState(worktreePath: string): void {
+  gitMaybe(worktreePath, ['merge', '--abort']);
+  gitMaybe(worktreePath, ['reset', '--hard']);
+  gitMaybe(worktreePath, ['clean', '-fd']);
 }
 
 function readGitMergeMetadata(worktreePath: string): {
