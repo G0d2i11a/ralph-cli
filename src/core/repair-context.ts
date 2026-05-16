@@ -40,12 +40,14 @@ export function buildTaskRepairContext(input: {
   mode: TaskRepairMode;
   reason: string;
   createdAt?: number;
+  validationEvidenceSummary?: TaskRepairContext['validationEvidenceSummary'];
 }): TaskRepairContext {
   return {
     mode: input.mode,
     storyId: input.storyId,
     createdAt: input.createdAt ?? Date.now(),
     reason: input.reason,
+    validationEvidenceSummary: input.validationEvidenceSummary,
   };
 }
 

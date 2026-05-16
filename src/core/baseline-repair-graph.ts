@@ -235,6 +235,7 @@ export function selectCanonicalBaselineRepairTask(
     failed_finalize: 1,
     stagnant: 0,
     failed: 0,
+    stopped: 0,
   };
 
   return candidates.sort((left, right) => {

@@ -134,58 +134,6 @@ test('enqueueTaskFromPrd stores declared coordination metadata from PRD', async 
   }
 });
 
-test('enqueueTaskFromPrd stores dependency repair metadata from PRD', async () => {
-  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-intake-repair-metadata-'));
-  const previousHome = process.env.HOME;
-
-  try {
-    process.env.HOME = tempDir;
-    const prdPath = createPrdFile(tempDir, 'followup:source-prd:abc123', [], {
-      priorityClass: 'dependency_repair',
-      repairOf: {
-        prdId: 'source-prd',
-        taskId: 'source-task',
-        reason: 'story_repair_hard_cap_reached',
-      },
-      releasesDependenciesFor: ['source-prd'],
-      schedulerHints: {
-        priorityClass: 'dependency_repair',
-        effectiveDependencyPrdId: 'source-prd',
-        releasesDependenciesFor: ['source-prd'],
-      },
-    });
-    const stateManager = new FakeStateManager();
-    const scheduler = new NoopScheduler();
-
-    const result = await enqueueTaskFromPrd(prdPath, {
-      repoPath: tempDir,
-      stateManager,
-      scheduler,
-      configManager: { get: () => undefined },
-      now: () => 1_000,
-    });
-
-    const task = await stateManager.loadTask(result.taskId);
-    assert.equal(task.prdId, 'followup:source-prd:abc123');
-    assert.equal(task.priorityClass, 'dependency_repair');
-    assert.deepEqual(task.repairOf, {
-      prdId: 'source-prd',
-      taskId: 'source-task',
-      reason: 'story_repair_hard_cap_reached',
-    });
-    assert.deepEqual(task.releasesDependenciesFor, ['source-prd']);
-    assert.equal(task.effectiveDependencyPrdId, 'source-prd');
-    assert.deepEqual(task.schedulerHints, {
-      priorityClass: 'dependency_repair',
-      effectiveDependencyPrdId: 'source-prd',
-      releasesDependenciesFor: ['source-prd'],
-    });
-  } finally {
-    process.env.HOME = previousHome;
-    fs.rmSync(tempDir, { recursive: true, force: true });
-  }
-});
-
 test('enqueueTaskFromPrd dedupes active tasks by repo and prd id by default', async () => {
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-intake-dedupe-'));
   const previousHome = process.env.HOME;

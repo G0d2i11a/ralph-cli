@@ -7,6 +7,7 @@ import { resolveWorkspacePackageDirs } from './workspaces';
 import { PRD } from '../types/prd';
 import {
   Task,
+  TaskCoordinationConflict,
   TaskCoordinationPhase,
   TaskCoordinationStatus,
 } from '../types/task';
@@ -17,11 +18,14 @@ import {
   resolveEffectiveDependencyPrdIdFromTask,
 } from './dependency-identity';
 import { pendingTaskHasHigherPriorityThanCandidate } from './scheduler-priority';
+import { isQuarantineOwnershipReleased } from './quarantine';
 
 export interface TaskCoordinationState {
   status: TaskCoordinationStatus;
   phase?: TaskCoordinationPhase;
+  owner?: string;
   blockers?: string[];
+  conflicts?: TaskCoordinationConflict[];
   reason?: string;
   lane?: string;
   declaredWriteSurface?: string[];
@@ -31,12 +35,7 @@ export interface TaskCoordinationState {
   surfaceCapturedAt?: string;
 }
 
-export interface CoordinationOverlapMatch {
-  taskId: string;
-  overlapKinds: Array<'conflict_domain' | 'write_surface'>;
-  overlappingDomains: string[];
-  overlappingPaths: string[];
-}
+export type CoordinationOverlapMatch = TaskCoordinationConflict;
 
 export interface CoordinationCheckResult {
   blocked: boolean;
@@ -95,6 +94,36 @@ export function hasHotConflictReservation(task: Pick<
   }
 
   return /Merge conflicts detected/i.test(task.mergeError || task.lastError || '');
+}
+
+export function isHotConflictQuarantineOwner(task: Pick<
+  Task,
+  | 'status'
+  | 'repairContext'
+  | 'integrationStatus'
+  | 'postFinalizeMergeProbeRequired'
+  | 'mergeRepairAttempts'
+  | 'mergeConflictFiles'
+  | 'mergeError'
+  | 'lastError'
+  | 'quarantineExitKind'
+  | 'quarantineReleasedAt'
+>): boolean {
+  if (isQuarantineOwnershipReleased(task)) {
+    return false;
+  }
+
+  if (!hasHotConflictReservation(task)) {
+    return false;
+  }
+
+  if (task.status === 'completed') {
+    return task.integrationStatus === 'blocked_conflict';
+  }
+
+  return task.status === 'failed'
+    || task.status === 'stagnant'
+    || task.status === 'failed_finalize';
 }
 
 function normalizeSurfaceEntry(value: string): string {
@@ -160,7 +189,7 @@ function taskBlocksCoordination(task: Task): boolean {
 
   if (!BLOCKING_COORDINATION_STATUSES.has(task.status)) {
     return (task.status === 'failed' || task.status === 'stagnant')
-      ? hasHotReservation
+      ? isHotConflictQuarantineOwner(task)
       : false;
   }
 
@@ -490,6 +519,43 @@ function findPathOverlaps(left: string[], right: string[]): string[] {
   return [...overlaps].sort();
 }
 
+function formatSurfaceList(values: string[]): string {
+  const visibleValues = values
+    .slice(0, 3)
+    .map((value) => value === '<unknown-surface-during-hot-merge-repair>'
+      ? 'hot merge repair surface'
+      : value);
+  const suffix = values.length > visibleValues.length
+    ? `, +${values.length - visibleValues.length} more`
+    : '';
+
+  return `${visibleValues.join(', ')}${suffix}`;
+}
+
+export function formatCoordinationConflictSurface(match: CoordinationOverlapMatch): string {
+  const parts: string[] = [];
+
+  if (match.overlappingDomains.length > 0) {
+    parts.push(`domains: ${formatSurfaceList(match.overlappingDomains)}`);
+  }
+
+  if (match.overlappingPaths.length > 0) {
+    parts.push(`paths: ${formatSurfaceList(match.overlappingPaths)}`);
+  }
+
+  return parts.length > 0
+    ? parts.join('; ')
+    : match.overlapKinds.join(', ');
+}
+
+function formatCoordinationBlockReason(matches: CoordinationOverlapMatch[]): string {
+  const ownerSummaries = matches.map((match) => (
+    `${match.taskId} (${formatCoordinationConflictSurface(match)})`
+  ));
+
+  return `Earlier overlapping task(s) must integrate first: ${ownerSummaries.join(', ')}`;
+}
+
 function runGit(worktreePath: string, args: string[]): string {
   return execFileSync('git', args, {
     cwd: worktreePath,
@@ -594,26 +660,9 @@ function getEffectiveConflictDomains(task: Task, phase: TaskCoordinationPhase): 
     : normalizeSurfaceList(task.declaredConflictDomains) ?? [];
 }
 
-function shouldUseObservedSurfaceAtStart(task: Task): boolean {
-  return hasHotConflictReservation(task);
-}
-
 function getEffectivePathSurface(task: Task, phase: TaskCoordinationPhase): string[] {
   const declared = task.declaredWriteSurface || [];
   const conflictFiles = task.mergeConflictFiles || [];
-
-  if (phase === 'start') {
-    if (!shouldUseObservedSurfaceAtStart(task)) {
-      return normalizeSurfaceList(declared) ?? [];
-    }
-
-    return normalizeSurfaceList([
-      ...declared,
-      ...(task.observedWriteSurface || []),
-      ...(task.observedPackageSurface || []),
-      ...conflictFiles,
-    ]) ?? [];
-  }
 
   return normalizeSurfaceList([
     ...declared,
@@ -685,6 +734,7 @@ export function buildCoordinationState(task: Pick<
   | 'coordinationStatus'
   | 'coordinationPhase'
   | 'coordinationBlockers'
+  | 'coordinationConflicts'
   | 'coordinationReason'
   | 'integrationLane'
   | 'declaredWriteSurface'
@@ -697,6 +747,7 @@ export function buildCoordinationState(task: Pick<
     || task.coordinationPhase !== undefined
     || (task.coordinationBlockers && task.coordinationBlockers.length > 0)
     || task.coordinationReason !== undefined
+    || (task.coordinationConflicts && task.coordinationConflicts.length > 0)
     || (task.declaredWriteSurface && task.declaredWriteSurface.length > 0)
     || (task.declaredConflictDomains && task.declaredConflictDomains.length > 0)
     || (task.observedWriteSurface && task.observedWriteSurface.length > 0)
@@ -710,7 +761,9 @@ export function buildCoordinationState(task: Pick<
   return {
     status: task.coordinationStatus || 'clear',
     phase: task.coordinationPhase,
+    owner: task.coordinationBlockers?.[0],
     blockers: task.coordinationBlockers,
+    conflicts: task.coordinationConflicts,
     reason: task.coordinationReason,
     lane: task.integrationLane,
     declaredWriteSurface: task.declaredWriteSurface,
@@ -831,7 +884,7 @@ export function findCoordinationBlockers(
     ? (phase === 'start' ? 'blocked_predicted_overlap' : 'blocked_observed_overlap')
     : 'clear';
   const reason = blocked
-    ? `Earlier overlapping task(s) must integrate first: ${blockers.join(', ')}`
+    ? formatCoordinationBlockReason(matches)
     : undefined;
 
   return {
@@ -852,6 +905,7 @@ export function findCoordinationBlockers(
       coordinationStatus: blocked ? status : undefined,
       coordinationPhase: blocked ? phase : undefined,
       coordinationBlockers: blocked ? blockers : undefined,
+      coordinationConflicts: blocked ? matches : undefined,
       coordinationReason: blocked ? reason : undefined,
     },
   };

@@ -26,7 +26,7 @@ _ralph_completion() {
       COMPREPLY=( $(compgen -f -X '!*.@(md|json)' -- \${cur}) )
       return 0
       ;;
-    status|stop|merge|finalize|stats|reset-stagnation|retry|update)
+    status|stop|demote|merge|finalize|stats|reset-stagnation|retry|prove-integration|update)
       local task_ids=$(ralph list 2>/dev/null | grep -oE 'task-[0-9]+-[a-z0-9]+' | sort -u)
       COMPREPLY=( $(compgen -W "\${task_ids}" -- \${cur}) )
       return 0
@@ -44,7 +44,7 @@ _ralph_completion() {
       return 0
       ;;
     --status)
-      COMPREPLY=( $(compgen -W "pending running ready_to_finalize finalizing completed failed failed_finalize stagnant" -- \${cur}) )
+      COMPREPLY=( $(compgen -W "pending running ready_to_finalize finalizing completed failed failed_finalize stagnant stopped" -- \${cur}) )
       return 0
       ;;
     --strategy)
@@ -82,10 +82,12 @@ _ralph() {
     'status:Show status of a task or all running tasks'
     'list:List all tasks'
     'stop:Stop a running task'
+    'demote:Release a merge-repair quarantine owner'
     'merge:Merge a completed task'
     'finalize:Commit task changes using the restricted finisher flow'
     'update:Update a task or user story status'
     'retry:Retry a failed or stopped task'
+    'prove-integration:Run exact integration proof for a quarantined task'
     'reset-stagnation:Reset stagnation counters for a task'
     'watch:Poll the queue and optionally auto-ingest new PRDs'
     'watchdog:Monitor Ralph managers and restart stale or code-drifted services'
@@ -113,21 +115,23 @@ _ralph() {
             '1:PRD file:_files -g "*.md|*.json"' \\
             '--repo[Repository path]:directory:_directories' \\
             '--agent[Agent to use]:agent:(claude codex)' \\
-            '--backend[Backend to use]:backend:(cli agent-runners)'
+            '--backend[Backend to use]:backend:(cli agent-runners)' \\
+            '--allow-umbrella-prd[Allow broad umbrella or strategy PRDs without executable frontmatter]'
           ;;
         batch-start)
           _arguments \\
             '*:PRD file:_files -g "*.md|*.json"' \\
             '--repo[Repository path]:directory:_directories' \\
             '--agent[Agent to use]:agent:(claude codex)' \\
-            '--backend[Backend to use]:backend:(cli agent-runners)'
+            '--backend[Backend to use]:backend:(cli agent-runners)' \\
+            '--allow-umbrella-prd[Allow broad umbrella or strategy PRDs without executable frontmatter]'
           ;;
         status)
           _arguments \\
             '1:task ID:(\${task_ids})' \\
             '--detailed[Show detailed task status]'
           ;;
-        stop|merge|finalize|retry|reset-stagnation|update)
+        stop|demote|merge|finalize|retry|prove-integration|reset-stagnation|update)
           _arguments \\
             '1:task ID:(\${task_ids})' \\
             '--auto[Auto-resolve conflicts]' \\
@@ -135,7 +139,9 @@ _ralph() {
             '--target[Target branch]:branch:' \\
             '--story-id[User story ID]:story id:' \\
             '--passes[Mark story as passing]' \\
-            '--notes[Implementation notes]:notes:'
+            '--notes[Implementation notes]:notes:' \\
+            '--reason[Auditable reason]:reason:' \\
+            '--to[Transfer quarantine ownership to task]:task ID:(\${task_ids})'
           ;;
         stats)
           _arguments \\
@@ -145,7 +151,7 @@ _ralph() {
           ;;
         list)
           _arguments \\
-            '--status[Filter by status]:status:(pending running ready_to_finalize finalizing completed failed failed_finalize stagnant)'
+            '--status[Filter by status]:status:(pending running ready_to_finalize finalizing completed failed failed_finalize stagnant stopped)'
           ;;
         watch)
           _arguments \\

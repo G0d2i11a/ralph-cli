@@ -8,7 +8,11 @@ import { appendTaskEvent } from './events';
 import { FinalizeResult, finalizeTaskOutput } from './finalizer';
 import { isQualityGateFailure } from './finalize-failure-classifier';
 import { assertRalphHomeIsolation } from './home-isolation';
-import { resolveTaskIntegrationStatus, resolveTaskTargetSyncStatus } from './task-delivery';
+import {
+  buildValidationEvidenceSummary,
+  resolveTaskIntegrationStatus,
+  resolveTaskTargetSyncStatus,
+} from './task-delivery';
 import {
   resolveIntegrationPolicy,
   resolveMergeTargetBranch,
@@ -40,6 +44,7 @@ import {
   findCoordinationBlockers,
   resolveTaskIntegrationLane,
 } from './task-coordination';
+import { isQuarantineOwnershipReleased } from './quarantine';
 import { buildFinalizeRetryReset } from './task-reset';
 import { evaluateFailedTaskForFinalizeRecovery } from './soft-success';
 import {
@@ -89,6 +94,11 @@ import {
 } from './worktree-process-cleanup';
 import { ReclamationMode, ReclamationService } from './reclamation';
 
+interface AutoIngestor {
+  initialize(): Promise<void>;
+  scan(): Promise<unknown[]>;
+}
+
 export interface WatchCommandOptions {
   interval?: number;
   repo?: string;
@@ -98,13 +108,14 @@ export interface WatchCommandOptions {
   autoIngestEz4ielts?: boolean;
   ingestExistingEz4ielts?: boolean;
   ez4ieltsDir?: string;
+  allowUmbrellaPrds?: boolean;
 }
 
 interface DependencyWatcherDeps {
   stateManager?: StateManager;
   scheduler?: TaskScheduler;
   configManager?: Pick<ConfigManager, 'get'>;
-  autoIngestor?: Pick<PrdAutoIngestor, 'initialize' | 'scan'>;
+  autoIngestor?: AutoIngestor;
   detectAlreadyIntegratedTask?: (task: Task, targetBranch: string) => boolean;
   sleep?: (ms: number) => Promise<void>;
   logger?: Pick<typeof console, 'log' | 'error'>;
@@ -158,6 +169,87 @@ function resolveFinalizerLeaseTimeoutMs(value: unknown): number {
   return numericValue * 1000;
 }
 
+interface ConfiguredPrdGlob {
+  glob: string;
+  repoPath?: string;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function normalizeConfiguredPrdGlobs(value: unknown): ConfiguredPrdGlob[] {
+  if (value === undefined || value === null) {
+    return [];
+  }
+
+  if (!Array.isArray(value)) {
+    throw new Error('ingestion.prds.globs must be an array of glob strings or { glob, repo } objects.');
+  }
+
+  return value.map((entry, index) => {
+    if (typeof entry === 'string') {
+      const glob = entry.trim();
+      if (!glob) {
+        throw new Error(`ingestion.prds.globs entry ${index + 1} must not be empty.`);
+      }
+
+      return { glob };
+    }
+
+    if (!isRecord(entry)) {
+      throw new Error(`ingestion.prds.globs entry ${index + 1} must be a glob string or object.`);
+    }
+
+    const glob = typeof entry.glob === 'string' ? entry.glob.trim() : '';
+    if (!glob) {
+      throw new Error(`ingestion.prds.globs entry ${index + 1} must define a non-empty glob.`);
+    }
+
+    const repoValue = entry.repoPath ?? entry.repo;
+    if (repoValue !== undefined && (typeof repoValue !== 'string' || !repoValue.trim())) {
+      throw new Error(`ingestion.prds.globs entry ${index + 1} repo must be a non-empty string when provided.`);
+    }
+
+    return {
+      glob,
+      repoPath: typeof repoValue === 'string' ? repoValue.trim() : undefined,
+    };
+  });
+}
+
+function resolveSettleMs(value: unknown): number {
+  const settleMs = Number(value);
+  return Number.isFinite(settleMs) && settleMs >= 0
+    ? settleMs
+    : DEFAULT_EZ4IELTS_SETTLE_MS;
+}
+
+function combineAutoIngestors(ingestors: AutoIngestor[]): AutoIngestor | undefined {
+  if (ingestors.length === 0) {
+    return undefined;
+  }
+
+  if (ingestors.length === 1) {
+    return ingestors[0];
+  }
+
+  return {
+    initialize: async () => {
+      for (const ingestor of ingestors) {
+        await ingestor.initialize();
+      }
+    },
+    scan: async () => {
+      const results = [];
+      for (const ingestor of ingestors) {
+        results.push(...await ingestor.scan());
+      }
+      return results;
+    },
+  };
+}
+
 function hasMergeConflict(task: Task): boolean {
   if (task.mergeConflictFiles && task.mergeConflictFiles.length > 0) {
     return true;
@@ -197,6 +289,22 @@ function buildMergeConflictSignature(conflictFiles?: string[]): string | undefin
   }
 
   return [...new Set(conflictFiles)].sort().join('\n');
+}
+
+function didMergeConflictSignatureShrink(previous?: string, current?: string): boolean {
+  if (!previous || !current) {
+    return false;
+  }
+
+  const previousEntries = previous.split('\n').filter(Boolean);
+  const currentEntries = current.split('\n').filter(Boolean);
+
+  if (currentEntries.length >= previousEntries.length) {
+    return false;
+  }
+
+  const previousSet = new Set(previousEntries);
+  return currentEntries.every((entry) => previousSet.has(entry));
 }
 
 function isResolvedPendingMergeProof(
@@ -807,6 +915,7 @@ function buildCompletedConflictRepairReset(task: Task, repairStoryId: string): {
       storyId: repairStoryId,
       reason: repairMessage,
       createdAt: updatedAt,
+      validationEvidenceSummary: buildValidationEvidenceSummary(task),
     }),
   };
 }
@@ -1143,7 +1252,7 @@ export class DependencyWatcher {
   private readonly pollInterval: number;
   private readonly sleep: (ms: number) => Promise<void>;
   private readonly logger: Pick<typeof console, 'log' | 'error'>;
-  private readonly autoIngestor?: Pick<PrdAutoIngestor, 'initialize' | 'scan'>;
+  private readonly autoIngestor?: AutoIngestor;
   private readonly stateManager: StateManager;
   private readonly configManager: Pick<ConfigManager, 'get'>;
   private readonly detectAlreadyIntegratedTask: (task: Task, targetBranch: string) => boolean;
@@ -1191,10 +1300,16 @@ export class DependencyWatcher {
     this.logger = deps.logger ?? console;
     this.lifecycle = deps.lifecycle;
 
-    this.autoIngestEnabled = options.autoIngestEz4ielts
+    const prdGlobs = normalizeConfiguredPrdGlobs(configManager.get('ingestion.prds.globs'));
+    const prdGlobAutoIngestEnabled = options.autoIngestEz4ielts === false
+      ? false
+      : Boolean(configManager.get('ingestion.prds.enabled'));
+    const ez4ieltsAutoIngestEnabled = options.autoIngestEz4ielts
       ?? Boolean(configManager.get('ingestion.ez4ielts.enabled'));
     this.autoIngestExistingOnStartupEnabled = options.ingestExistingEz4ielts
       ?? Boolean(configManager.get('ingestion.ez4ielts.ingestExistingOnStartup'));
+
+    this.autoIngestEnabled = prdGlobAutoIngestEnabled || ez4ieltsAutoIngestEnabled;
 
     if (deps.autoIngestor) {
       this.autoIngestor = deps.autoIngestor;
@@ -1202,33 +1317,59 @@ export class DependencyWatcher {
     }
 
     if (this.autoIngestEnabled) {
-      const settleMs = Number(configManager.get('ingestion.ez4ielts.settleMs'));
-      const configuredPattern = configManager.get('ingestion.ez4ielts.pattern');
-      const configuredWatchDir = configManager.get('ingestion.ez4ielts.watchDir');
-      const watchDir = options.ez4ieltsDir || configuredWatchDir || process.env.RALPH_EZ4IELTS_WATCH_DIR;
-
-      if (!watchDir || !String(watchDir).trim()) {
-        throw new Error('ez4ielts auto-ingest requires a watch directory. Pass `--ez4ielts-dir` or set `ingestion.ez4ielts.watchDir` / `RALPH_EZ4IELTS_WATCH_DIR`.');
-      }
-
-      const repoPath = options.repo || path.dirname(path.resolve(watchDir));
       const backend = options.backend
         ? resolveAgentBackend(options.backend)
         : resolveConfiguredBackend(configManager);
+      const agent = resolveAgentType(options.agent || DEFAULT_AGENT);
+      const autoIngestors: AutoIngestor[] = [];
 
-      this.autoIngestor = new PrdAutoIngestor({
-        repoPath,
-        agent: resolveAgentType(options.agent || DEFAULT_AGENT),
-        backend,
-        watchDir,
-        pattern: typeof configuredPattern === 'string' ? configuredPattern : DEFAULT_EZ4IELTS_PATTERN,
-        settleMs: Number.isFinite(settleMs) && settleMs >= 0 ? settleMs : DEFAULT_EZ4IELTS_SETTLE_MS,
-        ingestExistingOnStartup: this.autoIngestExistingOnStartupEnabled,
-        logger: (message) => this.logger.log(message),
-      }, {
-        stateManager,
-        scheduler: this.scheduler,
-      });
+      if (ez4ieltsAutoIngestEnabled) {
+        const configuredPattern = configManager.get('ingestion.ez4ielts.pattern');
+        const configuredWatchDir = configManager.get('ingestion.ez4ielts.watchDir');
+        const watchDir = options.ez4ieltsDir
+          || (typeof configuredWatchDir === 'string' ? configuredWatchDir : undefined)
+          || process.env.RALPH_EZ4IELTS_WATCH_DIR;
+
+        if (!watchDir || !String(watchDir).trim()) {
+          throw new Error('ez4ielts auto-ingest requires a watch directory. Pass `--ez4ielts-dir` or set `ingestion.ez4ielts.watchDir` / `RALPH_EZ4IELTS_WATCH_DIR`.');
+        }
+
+        autoIngestors.push(new PrdAutoIngestor({
+          repoPath: options.repo || path.dirname(path.resolve(watchDir)),
+          agent,
+          backend,
+          watchDir,
+          pattern: typeof configuredPattern === 'string' ? configuredPattern : DEFAULT_EZ4IELTS_PATTERN,
+          settleMs: resolveSettleMs(configManager.get('ingestion.ez4ielts.settleMs')),
+          ingestExistingOnStartup: this.autoIngestExistingOnStartupEnabled,
+          allowUmbrellaPrd: options.allowUmbrellaPrds,
+          logger: (message) => this.logger.log(message),
+        }, {
+          stateManager,
+          scheduler: this.scheduler,
+        }));
+      }
+
+      if (prdGlobAutoIngestEnabled) {
+        const settleMs = resolveSettleMs(configManager.get('ingestion.prds.settleMs'));
+        for (const configuredGlob of prdGlobs) {
+          autoIngestors.push(new PrdAutoIngestor({
+            repoPath: configuredGlob.repoPath || options.repo || process.cwd(),
+            agent,
+            backend,
+            glob: configuredGlob.glob,
+            settleMs,
+            ingestExistingOnStartup: this.autoIngestExistingOnStartupEnabled,
+            allowUmbrellaPrd: options.allowUmbrellaPrds,
+            logger: (message) => this.logger.log(message),
+          }, {
+            stateManager,
+            scheduler: this.scheduler,
+          }));
+        }
+      }
+
+      this.autoIngestor = combineAutoIngestors(autoIngestors);
     }
   }
 
@@ -1624,7 +1765,6 @@ export class DependencyWatcher {
         lastErrorHadObjectiveProgress: undefined,
         mergeError: undefined,
         mergeConflictFiles: undefined,
-        mergeConflictPhase: undefined,
         mergeConflictAt: undefined,
         integrationBranch: mergeProofRecovery?.integrationBranch ?? task.integrationBranch,
         integrationWorktree: mergeProofRecovery?.integrationWorktree ?? task.integrationWorktree,
@@ -1660,6 +1800,10 @@ export class DependencyWatcher {
 
     for (const task of failedTasks) {
       if (!requiresMergeRepairProof(task)) {
+        continue;
+      }
+
+      if (isQuarantineOwnershipReleased(task)) {
         continue;
       }
 
@@ -1717,10 +1861,6 @@ export class DependencyWatcher {
       const shouldRefreshRecoveryWindow = (deadlineExpired || canReviveStoppedMergeRepair)
         && currentTotalRequeues < repairConfig.repairHardCap
         && currentAutoRequeues < repairConfig.repairHardCap;
-      const startedAt = shouldRefreshRecoveryWindow ? now : initialStartedAt;
-      const deadlineAt = shouldRefreshRecoveryWindow
-        ? now + (repairConfig.repairDeadlineSeconds * 1000)
-        : initialDeadlineAt;
       const currentObservationSignature = buildMergeRepairObservationSignature(mergeProbeResult);
       const previousSignature = task.mergeRepairRecoveryLastConflictSignature
         || buildMergeConflictSignature(task.mergeConflictFiles)
@@ -1731,12 +1871,28 @@ export class DependencyWatcher {
         || 'merge_conflict';
       const previousObservationSignature = task.mergeRepairRecoveryLastObservationSignature;
       const resolvedPendingMergeProof = isResolvedPendingMergeProof(mergeProbeResult);
-      const hasProgress = !firstRecoveryObservation && (
-        resolvedPendingMergeProof
-        || (previousObservationSignature
-          ? previousObservationSignature !== currentObservationSignature
-          : currentSignature !== previousSignature)
+      const conflictSetShrank = didMergeConflictSignatureShrink(previousSignature, currentSignature);
+      const observationSignatureChanged = Boolean(
+        previousObservationSignature
+        && previousObservationSignature !== currentObservationSignature
       );
+      const conflictSignatureChanged = !previousObservationSignature
+        && currentSignature !== previousSignature;
+      const progressReason = resolvedPendingMergeProof
+        ? 'Observed resolved pending merge awaiting finalizer commit'
+        : conflictSetShrank
+          ? 'Merge conflict file set shrank'
+          : observationSignatureChanged
+            ? 'Merge-repair proof signature changed'
+            : conflictSignatureChanged
+              ? 'Merge conflict signature changed'
+              : undefined;
+      const hasProgress = !firstRecoveryObservation && Boolean(progressReason);
+      const shouldResetRecoveryWindow = shouldRefreshRecoveryWindow || hasProgress;
+      const startedAt = shouldResetRecoveryWindow ? now : initialStartedAt;
+      const deadlineAt = shouldResetRecoveryWindow
+        ? now + (repairConfig.repairDeadlineSeconds * 1000)
+        : initialDeadlineAt;
       const nextConsecutiveNoProgress = firstRecoveryObservation
         ? 0
         : hasProgress
@@ -1745,9 +1901,7 @@ export class DependencyWatcher {
       const nextProgressReason = firstRecoveryObservation
         ? 'Initialized worker merge-repair recovery tracking'
         : hasProgress
-          ? resolvedPendingMergeProof
-            ? 'Observed resolved pending merge awaiting finalizer commit'
-            : 'Merge-repair worktree observation changed'
+          ? progressReason
           : task.mergeRepairRecoveryLastProgressReason;
       const commonUpdates: Partial<Task> = {
         lastError: mergeProbeResult.message,
@@ -1869,7 +2023,6 @@ export class DependencyWatcher {
           lastErrorHadObjectiveProgress: undefined,
           mergeError: undefined,
           mergeConflictFiles: undefined,
-          mergeConflictPhase: undefined,
           mergeConflictAt: undefined,
           repairContext: undefined,
           autoRecoveryKind: undefined,
@@ -1943,7 +2096,6 @@ export class DependencyWatcher {
         ...task,
         mergeError: mergeProbeResult.message,
         mergeConflictFiles: mergeProbeResult.conflictFiles,
-        mergeConflictPhase: mergeProbeResult.failurePhase,
         integrationBranch: mergeProbeResult.integrationBranch,
       });
       const resetState = resetSingleStory(task, repairStoryId, {
@@ -1951,10 +2103,12 @@ export class DependencyWatcher {
         updatedAt: now,
         message: repairMessage,
       });
-      const nextMergeRepairRequeues = currentTotalRequeues + 1;
-      const nextAutoRecoveryRequeues = currentAutoRequeues + 1;
+      const nextMergeRepairRequeues = hasProgress ? 1 : currentTotalRequeues + 1;
+      const nextAutoRecoveryRequeues = hasProgress ? 1 : currentAutoRequeues + 1;
 
-      const autoRecoveryReason = shouldRefreshRecoveryWindow
+      const autoRecoveryReason = hasProgress
+        ? nextProgressReason || mergeProbeResult.message
+        : shouldRefreshRecoveryWindow
         ? stoppedReason
           ? `Refreshed merge repair recovery window after ${stoppedReason}`
           : 'Refreshed merge repair recovery window after deadline exhaustion'
@@ -1976,6 +2130,7 @@ export class DependencyWatcher {
           storyId: repairStoryId,
           reason: repairMessage,
           createdAt: now,
+          validationEvidenceSummary: buildValidationEvidenceSummary(task),
         }),
         mergeRepairAttempts: (task.mergeRepairAttempts ?? 0) + 1,
         mergeRepairRecoveryTotalRequeues: nextMergeRepairRequeues,
@@ -1997,12 +2152,11 @@ export class DependencyWatcher {
         data: {
           exactProbeMessage: mergeProbeResult.message,
           conflictFiles: mergeProbeResult.conflictFiles,
-          failurePhase: mergeProbeResult.failurePhase,
           consecutiveNoProgress: nextConsecutiveNoProgress,
           totalRequeues: nextMergeRepairRequeues,
           deadlineAt,
-          previousDeadlineAt: shouldRefreshRecoveryWindow ? initialDeadlineAt : undefined,
-          recoveryWindowRefreshed: shouldRefreshRecoveryWindow,
+          previousDeadlineAt: shouldResetRecoveryWindow ? initialDeadlineAt : undefined,
+          recoveryWindowRefreshed: shouldResetRecoveryWindow,
           revivedStoppedRecovery: canReviveStoppedMergeRepair,
           previousStopReason: canReviveStoppedMergeRepair ? stoppedReason : undefined,
           progressReason: nextProgressReason,
@@ -2534,6 +2688,10 @@ export class DependencyWatcher {
       .sort((a: Task, b: Task) => a.startTime - b.startTime);
 
     for (const task of stagnantTasks) {
+      if (hasMergeConflict(task) && isQuarantineOwnershipReleased(task)) {
+        continue;
+      }
+
       const now = Date.now();
       const currentAutoRequeues = task.autoRecoveryTotalRequeues ?? 0;
       const stopReason = 'stagnation_auto_recovery_hard_cap_reached';
@@ -2578,6 +2736,7 @@ export class DependencyWatcher {
             storyId: repairStoryId ?? task.repairContext.storyId,
             reason: buildMergeRepairReason(task),
             createdAt: now,
+            validationEvidenceSummary: buildValidationEvidenceSummary(task),
           })
         : undefined;
       const resetState = repairStoryId
@@ -2634,6 +2793,7 @@ export class DependencyWatcher {
         mergeRepairRecoveryDeadlineAt: undefined,
         mergeRepairRecoveryTotalRequeues: undefined,
         mergeRepairRecoveryConsecutiveNoProgress: undefined,
+        mergeRepairRecoveryLastObservationSignature: undefined,
         mergeRepairRecoveryLastConflictSignature: undefined,
         mergeRepairRecoveryLastProbeMessage: undefined,
         mergeRepairRecoveryLastProgressReason: undefined,
@@ -3550,6 +3710,10 @@ export class DependencyWatcher {
       const mergeConflict = hasMergeConflict(activeTask);
       let backfilledFinalizeRepairState = false;
 
+      if (mergeConflict && isQuarantineOwnershipReleased(activeTask)) {
+        continue;
+      }
+
       if (
         !activeTask.finalizeRepairStartedAt
         || !activeTask.finalizeRepairDeadlineAt
@@ -3913,7 +4077,6 @@ export class DependencyWatcher {
           lastError: undefined,
           mergeError: undefined,
           mergeConflictFiles: undefined,
-          mergeConflictPhase: undefined,
           mergeConflictAt: undefined,
           finalizerFailure: undefined,
           repairContext: undefined,
@@ -4034,6 +4197,7 @@ export class DependencyWatcher {
         mode: mergeConflict ? 'merge' : 'finalize',
         reason: repairMessage,
         createdAt: updatedAt,
+        validationEvidenceSummary: buildValidationEvidenceSummary(activeTask),
       });
       const completedUS = activeTask.completedUS.filter((storyId) => storyId !== repairStoryId);
       const storyProgress = (activeTask.storyProgress || []).map((story) => story.id === repairStoryId
@@ -4134,7 +4298,11 @@ export class DependencyWatcher {
     const integrationPolicy = resolveIntegrationPolicy(this.configManager);
     const targetBranch = resolveMergeTargetBranch(this.configManager.get('merge.targetBranch'));
     const completedConflictTasks = (await this.stateManager.listTasks('completed'))
-      .filter((task) => resolveTaskIntegrationStatus(task) === 'blocked_conflict' && hasMergeConflict(task))
+      .filter((task) => (
+        resolveTaskIntegrationStatus(task) === 'blocked_conflict'
+        && hasMergeConflict(task)
+        && !isQuarantineOwnershipReleased(task)
+      ))
       .slice()
       .sort((a: Task, b: Task) => a.startTime - b.startTime);
 
@@ -4189,7 +4357,6 @@ export class DependencyWatcher {
             integrationStatus: 'integrated',
             mergeError: undefined,
             mergeConflictFiles: undefined,
-            mergeConflictPhase: undefined,
             mergeConflictAt: undefined,
             postFinalizeMergeProbeRequired: undefined,
             integrationBranch: mergeProbeResult.integrationBranch,
@@ -4197,6 +4364,7 @@ export class DependencyWatcher {
             coordinationStatus: undefined,
             coordinationPhase: undefined,
             coordinationBlockers: undefined,
+            coordinationConflicts: undefined,
             coordinationReason: undefined,
             mergeRepairDisplayStatus: undefined,
             mergeRepairProof: undefined,
@@ -4255,7 +4423,6 @@ export class DependencyWatcher {
               mergeMessage: undefined,
               mergeError: undefined,
               mergeConflictFiles: undefined,
-              mergeConflictPhase: undefined,
               mergeConflictAt: undefined,
               postFinalizeMergeProbeRequired: undefined,
               targetSyncedAt: undefined,
@@ -4264,6 +4431,7 @@ export class DependencyWatcher {
               coordinationStatus: undefined,
               coordinationPhase: undefined,
               coordinationBlockers: undefined,
+              coordinationConflicts: undefined,
               coordinationReason: undefined,
               mergeRepairDisplayStatus: undefined,
               mergeRepairProof: undefined,
@@ -4302,7 +4470,6 @@ export class DependencyWatcher {
             lastErrorHadObjectiveProgress: undefined,
             mergeError: undefined,
             mergeConflictFiles: undefined,
-            mergeConflictPhase: undefined,
             mergeConflictAt: undefined,
             postFinalizeMergeProbeRequired: true,
             repairContext: undefined,
@@ -4481,7 +4648,6 @@ export class DependencyWatcher {
       mergeMessage: undefined,
       mergeError: message,
       mergeConflictFiles: undefined,
-      mergeConflictPhase: undefined,
       mergeConflictAt: undefined,
       integrationStatus: 'failed',
       targetSyncStatus: 'not_requested',
@@ -4489,6 +4655,7 @@ export class DependencyWatcher {
       coordinationStatus: undefined,
       coordinationPhase: undefined,
       coordinationBlockers: undefined,
+      coordinationConflicts: undefined,
       coordinationReason: undefined,
     };
   }
@@ -4879,9 +5046,9 @@ export class DependencyWatcher {
             finalizerCommitMessage: finalizeResult.commitMessage,
             finalizerCommitSha: finalizeResult.commitSha,
             finalizerCommittedAt,
+            validationEvidence: finalizeResult.validationEvidence,
             mergeError: undefined,
             mergeConflictFiles: undefined,
-            mergeConflictPhase: undefined,
             mergeConflictAt: undefined,
             postFinalizeMergeProbeRequired: undefined,
             finalizerFailure: undefined,
@@ -4913,6 +5080,7 @@ export class DependencyWatcher {
               committed: finalizeResult.committed,
               commitSha: finalizeResult.commitSha,
               commitMessage: finalizeResult.commitMessage,
+              validationEvidenceSummary: finalizeResult.validationEvidence?.summary,
             },
           });
 
@@ -4970,6 +5138,10 @@ export class DependencyWatcher {
           const finalizerAttempts = (latestTask?.finalizerAttempts ?? task.finalizerAttempts ?? 0) + 1;
           const failureUpdates = getTaskUpdatesFromError(error);
           const finalizerFailure = isQualityGateFailure(error) ? error.details : undefined;
+          const validationEvidence = isQualityGateFailure(error)
+            ? error.validationEvidence
+            : finalizeResult?.validationEvidence;
+          const validationEvidenceSummary = buildValidationEvidenceSummary({ validationEvidence });
           const failureMessage = error instanceof Error ? error.message : String(error);
           const observedAt = Date.now();
           const transientFailure = !finalizerFailure && !failureUpdates.mergeConflictFiles?.length
@@ -5092,6 +5264,7 @@ export class DependencyWatcher {
                 mode: mergeConflict ? 'merge' : 'finalize',
                 reason: failureMessage,
                 createdAt: observedAt,
+                validationEvidenceSummary,
               })
             : undefined;
           const latestFailure = finalizerFailure
@@ -5114,6 +5287,7 @@ export class DependencyWatcher {
             finalizerCommitSha: finalizeResult?.commitSha,
             finalizerCommittedAt,
             finalizerAttempts,
+            validationEvidence,
             mergeError: failureMessage,
             finalizerFailure,
             latestFailure,
@@ -5161,6 +5335,7 @@ export class DependencyWatcher {
               repairMode: repairContext?.mode,
               repairStoryId,
               diagnosticCount: finalizerFailure?.diagnosticCount,
+              validationEvidenceSummary: validationEvidence?.summary,
               conflictFiles: failureUpdates.mergeConflictFiles,
             },
           });
@@ -5542,7 +5717,6 @@ export class DependencyWatcher {
         finalizeRepairStopReason: undefined,
         mergeError: undefined,
         mergeConflictFiles: undefined,
-        mergeConflictPhase: undefined,
         mergeConflictAt: undefined,
         mergeRepairDisplayStatus: undefined,
         mergeRepairProof: undefined,
@@ -5553,6 +5727,7 @@ export class DependencyWatcher {
         coordinationStatus: undefined,
         coordinationPhase: undefined,
         coordinationBlockers: undefined,
+        coordinationConflicts: undefined,
         coordinationReason: undefined,
         failedBlockerRecoveryStartedAt: startedAt,
         failedBlockerRecoveryDeadlineAt: deadlineAt,

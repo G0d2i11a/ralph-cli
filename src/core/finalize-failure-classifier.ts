@@ -3,8 +3,31 @@ import {
   FinalizeFailureDiagnostic,
   FinalizerFailureDetails,
   PackageGateFailure,
+  TaskValidationEvidenceManifest,
+  ValidationOutputSummary,
 } from '../types/task';
 import * as path from 'path';
+
+const OUTPUT_SUMMARY_EXCERPT_LIMIT = 2000;
+
+export function summarizeValidationOutput(output?: string): ValidationOutputSummary | undefined {
+  if (!output) {
+    return undefined;
+  }
+
+  const buffer = Buffer.from(output);
+  const truncated = buffer.length > OUTPUT_SUMMARY_EXCERPT_LIMIT;
+  const excerpt = truncated
+    ? buffer.subarray(0, OUTPUT_SUMMARY_EXCERPT_LIMIT).toString('utf-8')
+    : output;
+
+  return {
+    byteLength: buffer.length,
+    lineCount: output.split(/\r?\n/).length,
+    truncated,
+    excerpt,
+  };
+}
 
 export interface QualityGateFailureInput {
   requestedScript: string;
@@ -18,6 +41,9 @@ export interface QualityGateFailureInput {
   stdout?: string;
   stderr?: string;
   exitCode?: number | null;
+  durationMs?: number;
+  startedAt?: number;
+  completedAt?: number;
   timedOut?: boolean;
   startFailed?: boolean;
   taskId?: string;
@@ -27,11 +53,13 @@ export interface QualityGateFailureInput {
 
 export class QualityGateFailure extends Error {
   readonly details: FinalizerFailureDetails;
+  readonly validationEvidence?: TaskValidationEvidenceManifest;
 
-  constructor(details: FinalizerFailureDetails) {
+  constructor(details: FinalizerFailureDetails, validationEvidence?: TaskValidationEvidenceManifest) {
     super(details.rawMessage);
     this.name = 'QualityGateFailure';
     this.details = details;
+    this.validationEvidence = validationEvidence;
   }
 }
 
@@ -92,8 +120,13 @@ export function classifyQualityGateFailure(input: QualityGateFailureInput): Fina
     parentCommand: primaryNestedFailure ? input.command : undefined,
     parentCwd: primaryNestedFailure ? input.cwd : undefined,
     exitCode: typeof input.exitCode === 'number' ? input.exitCode : undefined,
+    durationMs: input.durationMs,
+    startedAt: input.startedAt,
+    completedAt: input.completedAt,
     timedOut: input.timedOut || undefined,
     startFailed: input.startFailed || undefined,
+    stdoutSummary: summarizeValidationOutput(input.stdout),
+    stderrSummary: summarizeValidationOutput(input.stderr),
     diagnosticCount: diagnostics.length > 0 ? diagnostics.length : undefined,
     diagnosticSignature,
     failedFiles: failedFiles.length > 0 ? failedFiles : undefined,

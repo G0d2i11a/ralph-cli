@@ -33,53 +33,48 @@ function normalizeStringArray(value: unknown): string[] {
     .filter(Boolean);
 }
 
+function normalizeMetadataStringArray(value: unknown, fieldName: string, sourceLabel: string): string[] {
+  if (value === undefined || value === null) {
+    return [];
+  }
+
+  if (!Array.isArray(value)) {
+    throw new Error(`PRD ${sourceLabel} field "${fieldName}" must be an array of non-empty strings.`);
+  }
+
+  return value.map((entry, index) => {
+    if (typeof entry !== 'string' || !entry.trim()) {
+      throw new Error(`PRD ${sourceLabel} field "${fieldName}" entry ${index + 1} must be a non-empty string.`);
+    }
+
+    return entry.trim();
+  });
+}
+
 function normalizeOptionalStringArray(value: unknown): string[] | undefined {
   const normalized = normalizeStringArray(value);
   return normalized.length > 0 ? normalized : undefined;
 }
 
-function normalizeRepairOf(value: unknown): PRDRepairOf | undefined {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+function normalizeOptionalBoolean(value: unknown): boolean | undefined {
+  if (typeof value === 'boolean') {
+    return value;
+  }
+
+  if (typeof value !== 'string') {
     return undefined;
   }
 
-  const raw = value as Partial<PRDRepairOf>;
-  const prdId = normalizeString(raw.prdId);
-  if (!prdId) {
-    return undefined;
+  const normalized = value.trim().toLowerCase();
+  if (['true', 'yes', 'y', '1', 'executable'].includes(normalized)) {
+    return true;
   }
 
-  return {
-    prdId,
-    taskId: normalizeString(raw.taskId) || undefined,
-    reason: normalizeString(raw.reason) || undefined,
-  };
-}
-
-function normalizeSchedulerHints(value: unknown): PRDSchedulerHints | undefined {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) {
-    return undefined;
+  if (['false', 'no', 'n', '0', 'non-executable', 'non executable'].includes(normalized)) {
+    return false;
   }
 
-  const raw = value as Record<string, unknown>;
-  const hints: PRDSchedulerHints = { ...raw };
-  const priorityClass = normalizeString(raw.priorityClass);
-  const effectiveDependencyPrdId = normalizeString(raw.effectiveDependencyPrdId);
-  const releasesDependenciesFor = normalizeOptionalStringArray(raw.releasesDependenciesFor);
-
-  if (priorityClass) {
-    hints.priorityClass = priorityClass;
-  }
-
-  if (effectiveDependencyPrdId) {
-    hints.effectiveDependencyPrdId = effectiveDependencyPrdId;
-  }
-
-  if (releasesDependenciesFor) {
-    hints.releasesDependenciesFor = releasesDependenciesFor;
-  }
-
-  return hints;
+  return undefined;
 }
 
 function resolvePrdTitle(prd: Partial<PRD> & Record<string, unknown>, fallbackId: string): string {
@@ -116,19 +111,59 @@ function normalizeUserStory(value: unknown, index: number): UserStory {
   };
 }
 
-function normalizePrd(prd: Partial<PRD> & Record<string, unknown>, fallbackId: string): PRD {
-  const userStories = Array.isArray(prd.userStories)
+function normalizeExecutable(prd: Partial<PRD> & Record<string, unknown>): boolean | undefined {
+  const nonExecutable = normalizeOptionalBoolean(prd.nonExecutable);
+  if (nonExecutable === true) {
+    return false;
+  }
+
+  return normalizeOptionalBoolean(prd.executable);
+}
+
+function resolvePrdStatus(prd: Partial<PRD> & Record<string, unknown>): string | undefined {
+  const status = normalizeString(prd.status) || undefined;
+  if (status) {
+    return status;
+  }
+
+  return prd.archived === true ? 'archived' : undefined;
+}
+
+function normalizePrd(
+  prd: Partial<PRD> & Record<string, unknown>,
+  fallbackId: string,
+  sourceLabel: string = fallbackId
+): PRD {
+  const topLevelAcceptanceCriteria = normalizeStringArray(prd.acceptanceCriteria);
+  const normalizedUserStories = Array.isArray(prd.userStories)
     ? prd.userStories.map((story, index) => normalizeUserStory(story, index))
     : [];
+  const userStories = normalizedUserStories.length > 0
+    ? normalizedUserStories
+    : topLevelAcceptanceCriteria.length > 0
+      ? [normalizeUserStory({
+          id: 'US-001',
+          title: normalizeString(prd.title, `Implement ${fallbackId}`),
+          description: normalizeString(prd.description),
+          acceptanceCriteria: topLevelAcceptanceCriteria,
+          priority: normalizeString(prd.priority) || undefined,
+        }, 0)]
+      : [];
+  const writeSurface = prd.writeSurface ?? prd.declaredWriteSurface;
+  const conflictDomains = prd.conflictDomains ?? prd.declaredConflictDomains;
 
   return {
     id: normalizeString(prd.id, fallbackId),
     title: resolvePrdTitle(prd, fallbackId),
     description: normalizeString(prd.description),
+    status: resolvePrdStatus(prd),
+    priority: normalizeString(prd.priority) || undefined,
+    executable: normalizeExecutable(prd),
+    acceptanceCriteria: topLevelAcceptanceCriteria.length > 0 ? topLevelAcceptanceCriteria : undefined,
     userStories,
-    dependencies: normalizeStringArray(prd.dependencies),
-    writeSurface: normalizeOptionalStringArray(prd.writeSurface),
-    conflictDomains: normalizeOptionalStringArray(prd.conflictDomains),
+    dependencies: normalizeMetadataStringArray(prd.dependencies, 'dependencies', sourceLabel),
+    writeSurface: normalizeOptionalStringArray(writeSurface),
+    conflictDomains: normalizeOptionalStringArray(conflictDomains),
     integrationLane: normalizeString(prd.integrationLane) || undefined,
     priorityClass: normalizeString(prd.priorityClass) || undefined,
     repairOf: normalizeRepairOf(prd.repairOf),
@@ -140,9 +175,10 @@ function normalizePrd(prd: Partial<PRD> & Record<string, unknown>, fallbackId: s
 export function parsePRD(prdPath: string): PRD {
   const content = fs.readFileSync(prdPath, 'utf-8');
   const fallbackId = path.basename(prdPath, path.extname(prdPath));
+  const sourceLabel = path.basename(prdPath);
 
   if (path.extname(prdPath).toLowerCase() === '.json') {
-    return normalizePrd(JSON.parse(content) as Partial<PRD>, fallbackId);
+    return normalizePrd(JSON.parse(content) as Partial<PRD>, fallbackId, sourceLabel);
   }
 
   return parsePRDContent(content, prdPath);
@@ -183,35 +219,95 @@ export function assertPrdHasExplicitTitle(prdPath: string): void {
 
 export function parsePRDContent(content: string, prdPath: string = 'prd.json'): PRD {
   const fallbackId = path.basename(prdPath, path.extname(prdPath));
+  const sourceLabel = path.basename(prdPath);
 
   try {
-    return normalizePrd(JSON.parse(content) as Partial<PRD>, fallbackId);
-  } catch {
+    const parsedJson = JSON.parse(content) as Partial<PRD>;
+    return normalizePrd(parsedJson, fallbackId, sourceLabel);
+  } catch (error) {
+    if (!(error instanceof SyntaxError)) {
+      throw error;
+    }
     // Fall through to markdown parsing.
   }
 
   const parsed = matter(content);
-  const frontmatter = parsed.data as Partial<PRD>;
+  const frontmatter = parsed.data as Partial<PRD> & Record<string, unknown>;
   const body = parsed.content;
   const bodyStories = parseUserStoriesFromMarkdown(body);
+  const bodyAcceptanceCriteria = bodyStories.length > 0 ? [] : parseAcceptanceCriteriaFromMarkdown(body);
   const frontmatterStories = Array.isArray(frontmatter.userStories)
     ? frontmatter.userStories
     : undefined;
+  const acceptanceCriteria = Array.isArray(frontmatter.acceptanceCriteria)
+    ? frontmatter.acceptanceCriteria
+    : bodyAcceptanceCriteria;
 
-  return normalizePrd({
+  const markdownPrdMetadata: Record<string, unknown> = {
     id: frontmatter.id,
     title: frontmatter.title,
     description: frontmatter.description,
-    userStories: frontmatterStories && frontmatterStories.length > 0 ? frontmatterStories : bodyStories,
+    status: frontmatter.status,
+    priority: frontmatter.priority,
+    executable: frontmatter.executable,
+    nonExecutable: frontmatter.nonExecutable,
+    acceptanceCriteria,
+    userStories: frontmatterStories && frontmatterStories.length > 0
+      ? frontmatterStories
+      : bodyStories.length > 0
+        ? bodyStories
+        : undefined,
     dependencies: frontmatter.dependencies,
-    writeSurface: frontmatter.writeSurface,
-    conflictDomains: frontmatter.conflictDomains,
+    writeSurface: frontmatter.writeSurface ?? frontmatter.declaredWriteSurface,
+    conflictDomains: frontmatter.conflictDomains ?? frontmatter.declaredConflictDomains,
     integrationLane: frontmatter.integrationLane,
-    priorityClass: frontmatter.priorityClass,
-    repairOf: frontmatter.repairOf,
-    releasesDependenciesFor: frontmatter.releasesDependenciesFor,
-    schedulerHints: frontmatter.schedulerHints,
-  }, fallbackId);
+  };
+
+  return normalizePrd(markdownPrdMetadata as Partial<PRD> & Record<string, unknown>, fallbackId, sourceLabel);
+}
+
+function parseAcceptanceCriteriaFromMarkdown(markdown: string): string[] {
+  const headingMatch = markdown.match(/^#{2,6}\s+Acceptance Criteria:?\s*$/im);
+  if (!headingMatch || headingMatch.index === undefined) {
+    return [];
+  }
+
+  const afterHeading = markdown.slice(headingMatch.index + headingMatch[0].length);
+  const nextHeadingIndex = afterHeading.search(/^#{1,6}\s+/m);
+  const section = nextHeadingIndex >= 0 ? afterHeading.slice(0, nextHeadingIndex) : afterHeading;
+
+  return section
+    .split('\n')
+    .map((line) => line.trim())
+    .map((line) => line.match(/^(?:[-*]|\d+[.)])\s+(.+)$/)?.[1]?.trim() || '')
+    .filter(Boolean);
+}
+
+export function isPrdExplicitlyNonExecutable(prd: Pick<PRD, 'executable'>): boolean {
+  return prd.executable === false;
+}
+
+export function formatNonExecutablePrdMessage(prdPath: string): string {
+  return `PRD ${path.basename(prdPath)} is marked non-executable. Create a narrow implementation PRD or set executable: true before enqueueing it.`;
+}
+
+export function assertPrdIsExecutable(prd: PRD, prdPath: string): void {
+  if (prd.status === 'completed' || prd.status === 'archived') {
+    throw new Error(`PRD ${path.basename(prdPath)} is ${prd.status}. Create a narrow delta PRD before enqueueing it.`);
+  }
+
+  if (isPrdExplicitlyNonExecutable(prd)) {
+    throw new Error(formatNonExecutablePrdMessage(prdPath));
+  }
+
+  if (prd.userStories.length > 0) {
+    return;
+  }
+
+  throw new Error(
+    `PRD ${path.basename(prdPath)} must define at least one user story or acceptanceCriteria entry. `
+    + `Prose-only strategy documents are not executable by default; mark them executable with implementation criteria or set executable: false for auto-ingest skip.`
+  );
 }
 
 function parseUserStoriesFromMarkdown(markdown: string): PRD['userStories'] {
@@ -646,4 +742,48 @@ export async function checkDependencies(
       .filter((blocker) => blocker.kind === 'missing')
       .map((blocker) => blocker.prdId),
   };
+}
+
+function normalizeRepairOf(value: unknown): PRDRepairOf | undefined {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    return undefined;
+  }
+
+  const raw = value as Partial<PRDRepairOf>;
+  const prdId = normalizeString(raw.prdId);
+  if (!prdId) {
+    return undefined;
+  }
+
+  return {
+    prdId,
+    taskId: normalizeString(raw.taskId) || undefined,
+    reason: normalizeString(raw.reason) || undefined,
+  };
+}
+
+function normalizeSchedulerHints(value: unknown): PRDSchedulerHints | undefined {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    return undefined;
+  }
+
+  const raw = value as Record<string, unknown>;
+  const hints: PRDSchedulerHints = { ...raw };
+  const priorityClass = normalizeString(raw.priorityClass);
+  const effectiveDependencyPrdId = normalizeString(raw.effectiveDependencyPrdId);
+  const releasesDependenciesFor = normalizeOptionalStringArray(raw.releasesDependenciesFor);
+
+  if (priorityClass) {
+    hints.priorityClass = priorityClass;
+  }
+
+  if (effectiveDependencyPrdId) {
+    hints.effectiveDependencyPrdId = effectiveDependencyPrdId;
+  }
+
+  if (releasesDependenciesFor) {
+    hints.releasesDependenciesFor = releasesDependenciesFor;
+  }
+
+  return hints;
 }

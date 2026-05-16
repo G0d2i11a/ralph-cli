@@ -1,5 +1,7 @@
 import { StateManager } from '../core/state';
 import { finalizeTask } from '../core/scheduler';
+import { buildQuarantineReleaseUpdates } from '../core/quarantine';
+import { hasHotConflictReservation } from '../core/task-coordination';
 import { Task } from '../types/task';
 import { isProcessRunning } from '../utils/helpers';
 
@@ -73,7 +75,7 @@ function buildOperatorStopRecoveryUpdates(task: Task, stoppedAt: number): Partia
   return updates;
 }
 
-export async function stopCommand(taskId: string): Promise<void> {
+export async function stopCommand(taskId: string, options: { reason?: string } = {}): Promise<void> {
   try {
     const stateManager = new StateManager();
     const task = await stateManager.loadTask(taskId);
@@ -98,17 +100,31 @@ export async function stopCommand(taskId: string): Promise<void> {
       console.error(JSON.stringify({ error: 'No PID found for task' }));
       process.exit(1);
     }
+
+    const releaseQuarantine = hasHotConflictReservation(task);
+    const releaseReason = options.reason?.trim()
+      || 'Task stopped by explicit user request';
+    const quarantineUpdates = releaseQuarantine
+      ? buildQuarantineReleaseUpdates('stop', releaseReason)
+      : {};
+    if (releaseQuarantine) {
+      Object.assign(task, quarantineUpdates);
+    }
     
     if (!isProcessRunning(task.pid)) {
       console.log(JSON.stringify({ 
         message: 'Process already stopped',
-        taskId 
+        taskId,
+        quarantineReleased: releaseQuarantine,
       }));
       const stoppedAt = Date.now();
       const recoveryUpdates = buildOperatorStopRecoveryUpdates(task, stoppedAt);
       Object.assign(task, recoveryUpdates);
-      await stateManager.updateTask(task.id, recoveryUpdates);
-      await finalizeTask(task, 'failed', { stateManager });
+      await stateManager.updateTask(task.id, {
+        ...recoveryUpdates,
+        ...quarantineUpdates,
+      });
+      await finalizeTask(task, 'stopped', { stateManager });
       return;
     }
     
@@ -127,12 +143,16 @@ export async function stopCommand(taskId: string): Promise<void> {
       const stoppedAt = Date.now();
       const recoveryUpdates = buildOperatorStopRecoveryUpdates(task, stoppedAt);
       Object.assign(task, recoveryUpdates);
-      await stateManager.updateTask(task.id, recoveryUpdates);
-      await finalizeTask(task, 'failed', { stateManager });
+      await stateManager.updateTask(task.id, {
+        ...recoveryUpdates,
+        ...quarantineUpdates,
+      });
+      await finalizeTask(task, 'stopped', { stateManager });
       
       console.log(JSON.stringify({
         message: 'Task stopped',
-        taskId
+        taskId,
+        quarantineReleased: releaseQuarantine,
       }));
       
     } catch (error) {

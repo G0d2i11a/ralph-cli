@@ -1,5 +1,10 @@
 import { ConfigManager } from '../config/manager';
-import { buildAutoRecoveryState, buildDeliveryState, buildTransientRetryState } from '../core/task-delivery';
+import {
+  buildAutoRecoveryState,
+  buildDeliveryState,
+  buildTransientRetryState,
+  buildValidationEvidenceSummary,
+} from '../core/task-delivery';
 import { buildCoordinationState } from '../core/task-coordination';
 import { buildFailureObservationFromTask } from '../core/failure-observation';
 import { StateManager } from '../core/state';
@@ -29,6 +34,7 @@ export async function statusCommand(taskId?: string, options?: StatusOptions): P
           lastErrorKind: task.lastErrorKind,
           lastErrorClass: task.lastErrorClass,
           transientRetryCount: task.transientRetryCount,
+          validationEvidenceSummary: buildValidationEvidenceSummary(task),
           integrationStatus: buildDeliveryState(task).integrationStatus,
           targetSyncStatus: buildDeliveryState(task).targetSyncStatus,
         }))

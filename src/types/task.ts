@@ -1,6 +1,4 @@
-import type { PRDPriorityClass, PRDRepairOf, PRDSchedulerHints } from './prd';
-
-export type TaskStatus = 'pending' | 'running' | 'ready_to_finalize' | 'finalizing' | 'completed' | 'failed' | 'failed_finalize' | 'stagnant';
+export type TaskStatus = 'pending' | 'running' | 'ready_to_finalize' | 'finalizing' | 'completed' | 'failed' | 'failed_finalize' | 'stagnant' | 'stopped';
 export type TaskMergeStrategy = 'manual' | 'ours' | 'theirs';
 export type StoryStatus = 'pending' | 'in_progress' | 'needs_repair' | 'passed' | 'failed';
 export type FinalizeRepairFailureKind = 'merge_conflict' | 'quality_gate' | 'finalizer_error';
@@ -47,10 +45,12 @@ export type TaskIntegrationStatus = 'not_started' | 'integrated' | 'blocked_conf
 export type TaskTargetSyncStatus = 'not_requested' | 'synced' | 'deferred_dirty_checkout' | 'disabled' | 'failed';
 export type TaskCoordinationStatus = 'clear' | 'blocked_predicted_overlap' | 'blocked_observed_overlap';
 export type TaskCoordinationPhase = 'start' | 'finalize' | 'merge';
+export type TaskCoordinationOverlapKind = 'conflict_domain' | 'write_surface';
 export type TaskMergeRepairDisplayStatus = 'unresolved' | 'resolved_pending_finalize' | 'probe_mergeable' | 'requeued' | 'stopped';
 export type TaskMergeProofSourceKind = 'branch_head' | 'worktree_snapshot' | 'resolved_pending_merge';
 export type TaskWorktreeMergeStateKind = 'none' | 'unresolved' | 'resolved_pending_commit';
 export type TaskMergeConflictPhase = 'integration_sync' | 'source_merge' | 'worktree_unresolved';
+export type TaskQuarantineExitKind = 'stop' | 'demote' | 'exact_mergeability' | 'already_integrated';
 
 export interface StoryProgress {
   id: string;
@@ -97,6 +97,88 @@ export interface FinalizeFailureDiagnostic {
   message: string;
 }
 
+export type ValidationEvidenceStatus = 'passed' | 'failed' | 'skipped';
+export type ValidationEvidencePhase = 'quality_gate' | 'quality_gate_preparation';
+export type ValidationEvidenceClassification = FinalizeFailureClass | 'passed' | 'skipped' | 'legacy_debt';
+
+export interface ValidationOutputSummary {
+  byteLength: number;
+  lineCount: number;
+  truncated: boolean;
+  excerpt?: string;
+}
+
+export interface ValidationEvidenceRun {
+  phase: ValidationEvidencePhase;
+  requestedGate: string;
+  gate: string;
+  status: ValidationEvidenceStatus;
+  classification: ValidationEvidenceClassification;
+  packageLabel?: string;
+  cwd?: string;
+  command?: string;
+  exitCode?: number;
+  durationMs?: number;
+  startedAt?: number;
+  completedAt?: number;
+  timedOut?: boolean;
+  startFailed?: boolean;
+  reason?: string;
+  stdoutSummary?: ValidationOutputSummary;
+  stderrSummary?: ValidationOutputSummary;
+  diagnosticCount?: number;
+  diagnosticSignature?: string;
+  failedFiles?: string[];
+  failedCodes?: string[];
+  failedSymbols?: string[];
+  diagnostics?: FinalizeFailureDiagnostic[];
+}
+
+export interface ValidationEvidenceSummary {
+  total: number;
+  passed: number;
+  failed: number;
+  skipped: number;
+  classifications: Record<string, number>;
+}
+
+export interface TaskValidationEvidenceManifest {
+  schemaVersion: 1;
+  source: 'finalizer';
+  taskId: string;
+  generatedAt: number;
+  configuredGates: string[];
+  summary: ValidationEvidenceSummary;
+  runs: ValidationEvidenceRun[];
+}
+
+export interface TaskValidationEvidenceGateSummary {
+  phase: ValidationEvidencePhase;
+  requestedGate: string;
+  gate: string;
+  status: ValidationEvidenceStatus;
+  classification: ValidationEvidenceClassification;
+  packageLabel?: string;
+  command?: string;
+  exitCode?: number;
+  durationMs?: number;
+  timedOut?: boolean;
+  startFailed?: boolean;
+  diagnosticCount?: number;
+  reason?: string;
+}
+
+export interface TaskValidationEvidenceSummary {
+  generatedAt?: string;
+  configuredGates: string[];
+  total: number;
+  passed: number;
+  failed: number;
+  skipped: number;
+  classifications: Record<string, number>;
+  gates: TaskValidationEvidenceGateSummary[];
+}
+
 export interface FinalizerFailureDetails {
   failureKind: FinalizeRepairFailureKind;
   class: FinalizeFailureClass;
@@ -110,8 +192,13 @@ export interface FinalizerFailureDetails {
   parentCommand?: string;
   parentCwd?: string;
   exitCode?: number;
+  durationMs?: number;
+  startedAt?: number;
+  completedAt?: number;
   timedOut?: boolean;
   startFailed?: boolean;
+  stdoutSummary?: ValidationOutputSummary;
+  stderrSummary?: ValidationOutputSummary;
   diagnosticCount?: number;
   diagnosticSignature?: string;
   failedFiles?: string[];
@@ -160,6 +247,14 @@ export interface TaskRepairContext {
   storyId: string;
   createdAt: number;
   reason: string;
+  validationEvidenceSummary?: TaskValidationEvidenceSummary;
+}
+
+export interface TaskCoordinationConflict {
+  taskId: string;
+  overlapKinds: TaskCoordinationOverlapKind[];
+  overlappingDomains: string[];
+  overlappingPaths: string[];
 }
 
 export type BaselineQualityGateRootCause =
@@ -294,10 +389,10 @@ export interface Task {
   declaredWriteSurface?: string[];
   declaredConflictDomains?: string[];
   integrationLane?: string;
-  priorityClass?: PRDPriorityClass;
-  repairOf?: PRDRepairOf;
+  priorityClass?: import('./prd').PRDPriorityClass;
+  repairOf?: import('./prd').PRDRepairOf;
   releasesDependenciesFor?: string[];
-  schedulerHints?: PRDSchedulerHints;
+  schedulerHints?: import('./prd').PRDSchedulerHints;
   effectiveDependencyPrdId?: string;
   enqueuedAt?: number;
   baseRef?: string;
@@ -332,6 +427,7 @@ export interface Task {
   sessionId?: string;
   threadId?: string;
   threadStoryId?: string;
+  validationEvidence?: TaskValidationEvidenceManifest;
   // Stagnation detection
   loopCount: number;
   consecutiveNoProgress: number;
@@ -449,6 +545,7 @@ export interface Task {
   coordinationStatus?: TaskCoordinationStatus;
   coordinationPhase?: TaskCoordinationPhase;
   coordinationBlockers?: string[];
+  coordinationConflicts?: TaskCoordinationConflict[];
   coordinationReason?: string;
   mergeCommitSha?: string;
   mergeTargetBranch?: string;
@@ -474,4 +571,8 @@ export interface Task {
   mergeRepairRecoveryStoppedAt?: number;
   mergeRepairRecoveryStopReason?: string;
   postFinalizeMergeProbeRequired?: boolean;
+  quarantineExitKind?: TaskQuarantineExitKind;
+  quarantineReleasedAt?: number;
+  quarantineReleaseReason?: string;
+  quarantineTransferredTo?: string;
 }

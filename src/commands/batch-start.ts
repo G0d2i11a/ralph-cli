@@ -1,25 +1,59 @@
 import { resolve } from 'path';
-import { enqueueTaskFromPrd } from '../core/task-intake';
+import {
+  assessPrdPaths,
+  enqueueTaskFromPrd,
+  PrdPreflightResult,
+} from '../core/task-intake';
 import { DEFAULT_AGENT, resolveAgentType } from '../core/agent';
 import { assertNoDuplicateRepoManagers } from '../core/repo-manager-registry';
+import { StateManager } from '../core/state';
 
 interface BatchStartOptions {
   repo?: string;
   agent?: string;
   backend?: string;
   allowDuplicate?: boolean;
+  allowUmbrellaPrd?: boolean;
+}
+
+function formatPreflightResult(result: PrdPreflightResult) {
+  return {
+    prdPath: result.prdPath,
+    absolutePrdPath: result.absolutePrdPath,
+    prdId: result.prdId,
+    title: result.title,
+    action: result.decision,
+    success: false,
+    reasons: result.issues.map((issue) => issue.kind),
+    issues: result.issues,
+    activeDuplicates: result.activeDuplicates,
+    completedDuplicates: result.completedDuplicates,
+    missingDependencies: result.missingDependencies,
+    blockedBatchDependencies: result.blockedBatchDependencies,
+    writeSurfaceOverlaps: result.writeSurfaceOverlaps,
+  };
 }
 
 export async function batchStartCommand(prdPaths: string[], options: BatchStartOptions) {
   const repo = options.repo ? resolve(options.repo) : process.cwd();
   const agent = resolveAgentType(options.agent || DEFAULT_AGENT);
+  const stateManager = new StateManager();
   assertNoDuplicateRepoManagers({
     repoPath: repo,
     operation: 'batch-start Ralph tasks',
   });
+  const preflightResults = await assessPrdPaths(prdPaths, {
+    repoPath: repo,
+    stateManager,
+    allowUmbrellaPrd: options.allowUmbrellaPrd,
+  });
 
   const results: Array<{
     prdPath: string;
+    absolutePrdPath?: string;
+    prdId?: string;
+    title?: string;
+    action?: string;
     success: boolean;
     taskId?: string;
     worktree?: string;
@@ -30,20 +64,32 @@ export async function batchStartCommand(prdPaths: string[], options: BatchStartO
     threadId?: string;
     error?: string;
   }> = [];
+  const enqueued: unknown[] = [];
+  const blocked = preflightResults
+    .filter((result) => result.decision === 'blocked')
+    .map(formatPreflightResult);
+  const skipped = preflightResults
+    .filter((result) => result.decision === 'skipped')
+    .map(formatPreflightResult);
+  const errors: unknown[] = [];
 
-  for (const prdPath of prdPaths) {
+  for (const preflight of preflightResults.filter((result) => result.decision === 'ready')) {
     try {
-      const absolutePrdPath = resolve(prdPath);
-
-      const queuedTask = await enqueueTaskFromPrd(absolutePrdPath, {
+      const queuedTask = await enqueueTaskFromPrd(preflight.absolutePrdPath, {
         repoPath: repo,
         agent,
         backend: options.backend,
         allowDuplicate: options.allowDuplicate,
+        allowUmbrellaPrd: options.allowUmbrellaPrd,
+        stateManager,
       });
 
-      results.push({
-        prdPath,
+      const enqueuedResult = {
+        prdPath: preflight.prdPath,
+        absolutePrdPath: preflight.absolutePrdPath,
+        prdId: preflight.prdId,
+        title: preflight.title,
+        action: 'enqueued',
         success: true,
         taskId: queuedTask.taskId,
         worktree: queuedTask.latestTask.worktree,
@@ -53,25 +99,39 @@ export async function batchStartCommand(prdPaths: string[], options: BatchStartO
         sessionId: queuedTask.latestTask.sessionId,
         threadId: queuedTask.latestTask.threadId,
         ...(queuedTask.alreadyExists ? { existing: true } : {}),
-      });
+      };
+      enqueued.push(enqueuedResult);
+      results.push(enqueuedResult);
     } catch (error) {
-      results.push({
-        prdPath,
+      const failedResult = {
+        prdPath: preflight.prdPath,
+        absolutePrdPath: preflight.absolutePrdPath,
+        prdId: preflight.prdId,
+        title: preflight.title,
+        action: 'failed',
         success: false,
         error: error instanceof Error ? error.message : String(error),
-      });
+      };
+      errors.push(failedResult);
+      results.push(failedResult);
     }
   }
+
+  results.push(...blocked, ...skipped);
 
   // Output results as JSON
   console.log(JSON.stringify({
     total: prdPaths.length,
-    successful: results.filter(r => r.success).length,
-    failed: results.filter(r => !r.success).length,
+    successful: enqueued.length,
+    failed: blocked.length + skipped.length + errors.length,
+    enqueued,
+    blocked,
+    skipped,
+    errors,
     results,
   }));
 
-  if (results.some(r => !r.success)) {
+  if (blocked.length > 0 || skipped.length > 0 || errors.length > 0) {
     process.exit(1);
   }
 }

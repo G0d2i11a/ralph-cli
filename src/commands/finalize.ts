@@ -21,6 +21,7 @@ import {
   evaluateTaskStoryCompletion,
   formatStoryCompletionInvariantMessage,
 } from '../core/story-completion';
+import { buildValidationEvidenceSummary } from '../core/task-delivery';
 import {
   evaluateFinalizeRepairFailure,
   resolveFinalizeRepairConfig,
@@ -85,6 +86,7 @@ export async function finalizeCommand(taskId: string): Promise<void> {
   const scheduler = new TaskScheduler({ stateManager });
   const configManager = new ConfigManager();
   const integrationPolicy = resolveIntegrationPolicy(configManager);
+  let attemptedValidationEvidence: Task['validationEvidence'];
 
   try {
     const output = await withTaskFinalizeLock(taskId, async () => {
@@ -191,6 +193,7 @@ export async function finalizeCommand(taskId: string): Promise<void> {
         }
 
         const result = finalizeTaskOutput(latestTask);
+        attemptedValidationEvidence = result.validationEvidence;
         const finalizerCommittedAt = result.committed ? Date.now() : undefined;
 
         if (requiresPostFinalizeMergeProbe(latestTask)) {
@@ -227,6 +230,7 @@ export async function finalizeCommand(taskId: string): Promise<void> {
           finalizerCommitSha: result.commitSha,
           finalizerCommittedAt,
           finalizerFailure: undefined,
+          validationEvidence: result.validationEvidence,
           repairContext: undefined,
           finalizeRepairStartedAt: undefined,
           finalizeRepairDeadlineAt: undefined,
@@ -260,6 +264,7 @@ export async function finalizeCommand(taskId: string): Promise<void> {
             committed: result.committed,
             commitSha: result.commitSha,
             commitMessage: result.commitMessage,
+            validationEvidenceSummary: result.validationEvidence?.summary,
           },
         });
 
@@ -345,6 +350,7 @@ export async function finalizeCommand(taskId: string): Promise<void> {
               coordinationStatus: undefined,
               coordinationPhase: undefined,
               coordinationBlockers: undefined,
+              coordinationConflicts: undefined,
               coordinationReason: undefined,
             };
             await stateManager.updateTask(taskId, failureUpdates);
@@ -408,6 +414,10 @@ export async function finalizeCommand(taskId: string): Promise<void> {
     const finalizerAttempts = (latestTask?.finalizerAttempts ?? 0) + 1;
     const failureUpdates = getTaskUpdatesFromError(error);
     const finalizerFailure = isQualityGateFailure(error) ? error.details : undefined;
+    const validationEvidence = isQualityGateFailure(error)
+      ? error.validationEvidence
+      : attemptedValidationEvidence;
+    const validationEvidenceSummary = buildValidationEvidenceSummary({ validationEvidence });
     const failureMessage = error instanceof Error ? error.message : String(error);
     const observedAt = Date.now();
     const repairConfig = resolveFinalizeRepairConfig(configManager);
@@ -432,6 +442,7 @@ export async function finalizeCommand(taskId: string): Promise<void> {
           mode: mergeConflict ? 'merge' : 'finalize',
           reason: failureMessage,
           createdAt: observedAt,
+          validationEvidenceSummary,
         })
       : undefined;
     const latestFailure = finalizerFailure
@@ -510,6 +521,7 @@ export async function finalizeCommand(taskId: string): Promise<void> {
           finalizerFailureGate: finalizerFailure?.gate,
           finalizerFailurePackage: finalizerFailure?.packageLabel,
           diagnosticCount: finalizerFailure?.diagnosticCount,
+          validationEvidenceSummary: validationEvidence?.summary,
           conflictFiles: failureUpdates.mergeConflictFiles,
         },
       });
