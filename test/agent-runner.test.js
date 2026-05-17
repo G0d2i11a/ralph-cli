@@ -259,6 +259,74 @@ test('AgentRunner gives Codex write access to linked worktree git metadata', asy
   }
 });
 
+test('AgentRunner can run Codex with configured danger-full sandbox', async () => {
+  const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-agent-codex-sandbox-'));
+  const worktreePath = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-agent-worktree-'));
+  const logPath = path.join(tempRoot, 'agent.log');
+  const repoGitDir = path.join(tempRoot, 'repo', '.git');
+  const linkedGitDir = path.join(repoGitDir, 'worktrees', 'task-1');
+  const previousHome = process.env.HOME;
+  const previousRunnerEnv = captureRunnerEnv();
+  const originalSpawn = childProcess.spawn;
+
+  let captured;
+
+  try {
+    fs.mkdirSync(linkedGitDir, { recursive: true });
+    fs.writeFileSync(path.join(linkedGitDir, 'commondir'), '../..');
+    fs.writeFileSync(path.join(worktreePath, '.git'), `gitdir: ${linkedGitDir}\n`);
+    fs.mkdirSync(path.join(tempRoot, '.ralph'), { recursive: true });
+    fs.writeFileSync(
+      path.join(tempRoot, '.ralph', 'config.json'),
+      JSON.stringify({
+        agent: {
+          codexSandboxMode: 'danger-full-access',
+        },
+      }, null, 2),
+    );
+    process.env.HOME = tempRoot;
+    delete process.env.RALPH_AGENT_RUNNERS_CLI;
+    delete process.env.RALPH_SDK_RUNNER_CLI;
+    childProcess.spawn = (command, args, options) => {
+      captured = { command, args, options };
+      return createMockChild({
+        stdoutLines: [JSON.stringify({ kind: 'final', payload: { status: 'success' } })],
+      });
+    };
+
+    const { AgentRunner } = require('../dist/core/agent.js');
+    const runner = new AgentRunner();
+
+    const result = await runner.runUserStory(
+      {
+        id: 'US-1',
+        title: 'Codex sandbox smoke',
+        description: 'Allow localhost browser checks in trusted task worktrees.',
+        acceptanceCriteria: ['Reply with OK in the summary.'],
+      },
+      worktreePath,
+      'codex',
+      logPath,
+    );
+
+    assert.equal(result.success, true);
+    assert.ok(captured, 'spawn should be called');
+    const sandboxIndex = captured.args.indexOf('--sandbox');
+    assert.notEqual(sandboxIndex, -1);
+    assert.equal(captured.args[sandboxIndex + 1], 'danger-full-access');
+    const addDirIndex = captured.args.indexOf('--add-dir');
+    assert.notEqual(addDirIndex, -1);
+    assert.equal(captured.args[addDirIndex + 1], repoGitDir);
+  } finally {
+    childProcess.spawn = originalSpawn;
+    process.env.HOME = previousHome;
+    restoreRunnerEnv(previousRunnerEnv);
+    await cleanupPath(tempRoot);
+    await cleanupPath(worktreePath);
+    delete require.cache[require.resolve('../dist/core/agent.js')];
+  }
+});
+
 test('AgentRunner persists and resumes Codex thread ids via agent-runners CLI', async () => {
   const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-agent-codex-thread-'));
   const worktreePath = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-agent-worktree-'));

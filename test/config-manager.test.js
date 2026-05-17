@@ -64,6 +64,7 @@ test('ConfigManager defaults agent.backend to cli', withTempHome(async () => {
 
   assert.equal(manager.get('agent.backend'), 'cli');
   assert.equal(manager.get('agent.codexConversationScope'), 'story');
+  assert.equal(manager.get('agent.codexSandboxMode'), 'workspace-write');
   assert.equal(manager.has('agent.backend'), true);
   assert.equal(resolveConfiguredBackend(manager), 'cli');
   assert.equal(manager.get('autoMerge'), false);
@@ -324,6 +325,58 @@ test('resolveConfiguredBackend keeps configured codex binary paths on cli backen
 
   assert.equal(manager.has('agent.backend'), false);
   assert.equal(resolveConfiguredBackend(manager), 'cli');
+}));
+
+test('ConfigManager can configure Codex sandbox mode', withTempHome(async (homeDir) => {
+  const configDir = path.join(homeDir, '.ralph');
+  fs.mkdirSync(configDir, { recursive: true });
+  fs.writeFileSync(
+    path.join(configDir, 'config.json'),
+    JSON.stringify({
+      agent: {
+        codexSandboxMode: 'danger-full-access',
+      },
+    }, null, 2),
+  );
+
+  const { ConfigManager } = require('../dist/config/manager.js');
+  const { resolveCodexSandboxMode } = require('../dist/core/agent.js');
+  const manager = new ConfigManager();
+
+  assert.equal(manager.get('agent.codexSandboxMode'), 'danger-full-access');
+  assert.equal(resolveCodexSandboxMode(manager), 'danger-full-access');
+}));
+
+test('ConfigManager lets RALPH_CODEX_SANDBOX_MODE override Codex sandbox mode', withTempHome(async (homeDir) => {
+  const configDir = path.join(homeDir, '.ralph');
+  const previousSandboxMode = process.env.RALPH_CODEX_SANDBOX_MODE;
+
+  fs.mkdirSync(configDir, { recursive: true });
+  fs.writeFileSync(
+    path.join(configDir, 'config.json'),
+    JSON.stringify({
+      agent: {
+        codexSandboxMode: 'workspace-write',
+      },
+    }, null, 2),
+  );
+
+  try {
+    process.env.RALPH_CODEX_SANDBOX_MODE = 'danger-full-access';
+
+    const { ConfigManager } = require('../dist/config/manager.js');
+    const { resolveCodexSandboxMode } = require('../dist/core/agent.js');
+    const manager = new ConfigManager();
+
+    assert.equal(manager.get('agent.codexSandboxMode'), 'workspace-write');
+    assert.equal(resolveCodexSandboxMode(manager), 'danger-full-access');
+  } finally {
+    if (previousSandboxMode === undefined) {
+      delete process.env.RALPH_CODEX_SANDBOX_MODE;
+    } else {
+      process.env.RALPH_CODEX_SANDBOX_MODE = previousSandboxMode;
+    }
+  }
 }));
 
 test('resolveConfiguredBackend still accepts legacy sdk-runner env hints', withTempHome(async (homeDir) => {

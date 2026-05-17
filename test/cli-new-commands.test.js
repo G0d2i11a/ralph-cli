@@ -1615,6 +1615,7 @@ test('doctor command respects configured codex CLI path', () => {
   const homeDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-doctor-path-home-'));
   const repoDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-doctor-path-repo-'));
   const fakeCodex = path.join(homeDir, 'bin', 'fake-codex');
+  const previousSandboxMode = process.env.RALPH_CODEX_SANDBOX_MODE;
 
   try {
     execFileSync('git', ['init', '-b', 'main'], { cwd: repoDir, stdio: 'ignore' });
@@ -1627,15 +1628,24 @@ test('doctor command respects configured codex CLI path', () => {
         path: fakeCodex,
       },
     }));
+    process.env.RALPH_CODEX_SANDBOX_MODE = 'danger-full-access';
 
     const result = runCli(['doctor', '--repo', repoDir], { HOME: homeDir });
     const output = JSON.parse(result.stdout);
     const codexCheck = output.checks.find((check) => check.name === 'codex');
+    const sandboxCheck = output.checks.find((check) => check.name === 'codex.sandbox');
 
     assert.equal(result.status, 0, result.stderr);
     assert.equal(codexCheck.ok, true);
     assert.match(codexCheck.message, /fake-codex is available/);
+    assert.equal(output.codexSandboxMode, 'danger-full-access');
+    assert.equal(sandboxCheck.message, 'codexSandboxMode=danger-full-access');
   } finally {
+    if (previousSandboxMode === undefined) {
+      delete process.env.RALPH_CODEX_SANDBOX_MODE;
+    } else {
+      process.env.RALPH_CODEX_SANDBOX_MODE = previousSandboxMode;
+    }
     fs.rmSync(homeDir, { recursive: true, force: true });
     fs.rmSync(repoDir, { recursive: true, force: true });
   }

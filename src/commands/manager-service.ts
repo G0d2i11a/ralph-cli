@@ -70,6 +70,7 @@ function envEntries(): string {
     'PATH',
     'HOME',
     'RALPH_HOME',
+    'RALPH_CODEX_SANDBOX_MODE',
     'SHELL',
     'HTTP_PROXY',
     'HTTPS_PROXY',

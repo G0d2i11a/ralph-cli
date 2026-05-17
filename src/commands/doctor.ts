@@ -2,7 +2,7 @@ import { execFileSync } from 'child_process';
 import * as fs from 'fs';
 import * as path from 'path';
 import { ConfigManager } from '../config/manager';
-import { resolveCodexCliCommand, resolveConfiguredBackend } from '../core/agent';
+import { resolveCodexCliCommand, resolveCodexSandboxMode, resolveConfiguredBackend } from '../core/agent';
 import { evaluateRalphHomeIsolation } from '../core/home-isolation';
 import { resolveAutoIntegrate } from '../core/integration-policy';
 import { getManagerStatus } from '../core/manager-state';
@@ -92,6 +92,7 @@ export async function doctorCommand(options: { repo?: string } = {}): Promise<vo
   const configManager = new ConfigManager({ ralphHome });
   const backend = resolveConfiguredBackend(configManager);
   const codexCommand = resolveCodexCliCommand(configManager);
+  const codexSandboxMode = resolveCodexSandboxMode(configManager);
   const repoIsGit = isGitRepo(repoPath);
   const repoIsDirty = repoIsGit && hasDirtyWorktree(repoPath);
   const usesIntegrationWorktree = configManager.get('merge.useIntegrationWorktree') !== false;
@@ -165,6 +166,11 @@ export async function doctorCommand(options: { repo?: string } = {}): Promise<vo
           : 'agent-runners backend selected but no valid CLI path was found',
     },
     {
+      name: 'codex.sandbox',
+      ok: true,
+      message: `codexSandboxMode=${codexSandboxMode}`,
+    },
+    {
       name: 'config.runner',
       ok: Number(configManager.get('runner.maxConcurrent')) >= 1,
       message: `maxConcurrent=${configManager.get('runner.maxConcurrent')}`,
@@ -211,6 +217,7 @@ export async function doctorCommand(options: { repo?: string } = {}): Promise<vo
     ralphHome,
     repoPath,
     backend,
+    codexSandboxMode,
     ...repoSummary,
     manager: managerStatus,
     repoManagerOwnership: duplicateManagers,

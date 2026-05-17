@@ -9,6 +9,7 @@ import { listWorktreeProcessCandidatePids } from './worktree-process-cleanup';
 export type AgentType = 'claude' | 'codex';
 export type AgentBackend = 'cli' | 'agent-runners';
 export type CodexConversationScope = 'attempt' | 'story' | 'task';
+export type CodexSandboxMode = 'workspace-write' | 'danger-full-access';
 
 export type AcceptedAgentBackend = AgentBackend | 'sdk-runner';
 export interface AgentRunResult {
@@ -25,6 +26,7 @@ export const DEFAULT_BACKEND: AgentBackend = 'cli';
 const AGENT_RUNNERS_ENV = 'RALPH_AGENT_RUNNERS_CLI';
 const LEGACY_SDK_RUNNER_ENV = 'RALPH_SDK_RUNNER_CLI';
 const OPENCLAW_HOME_ENV = 'OPENCLAW_HOME';
+const CODEX_SANDBOX_MODE_ENV = 'RALPH_CODEX_SANDBOX_MODE';
 const FORCE_KILL_GRACE_MS = 5000;
 const DEFAULT_LONG_RUNNING_COMMAND_PATTERNS = ['next build', 'pnpm run build', 'npm run build', 'yarn build', 'turbo build', 'tsc'];
 
@@ -217,6 +219,21 @@ function resolveLongRunningCommandPatterns(config: Pick<ConfigManager, 'get'>): 
   )];
 
   return patterns.length > 0 ? patterns : DEFAULT_LONG_RUNNING_COMMAND_PATTERNS;
+}
+
+export function resolveCodexSandboxMode(config: Pick<ConfigManager, 'get'>): CodexSandboxMode {
+  const envMode = process.env[CODEX_SANDBOX_MODE_ENV]?.trim();
+  if (envMode === 'workspace-write' || envMode === 'danger-full-access') {
+    return envMode;
+  }
+
+  const configuredMode = config.get('agent.codexSandboxMode');
+
+  if (configuredMode === 'workspace-write' || configuredMode === 'danger-full-access') {
+    return configuredMode;
+  }
+
+  return 'workspace-write';
 }
 
 function resolveWorktreeGitEnv(worktreePath: string): Partial<NodeJS.ProcessEnv> {
@@ -437,7 +454,10 @@ Treat this path as the only editable project checkout for the task. Do not edit 
       } else {
         command = resolveCodexCliCommand(this.config);
         const writableDirs = resolveCodexWritableDirs(worktreePath);
-        if (writableDirs.length > 0) {
+        const codexSandboxMode = resolveCodexSandboxMode(this.config);
+        if (codexSandboxMode === 'danger-full-access') {
+          args = ['exec', guardedPrompt, '--sandbox', 'danger-full-access', '--cd', worktreePath];
+        } else if (writableDirs.length > 0) {
           // Linked worktree merges write objects/index state outside the worktree root.
           // Keep the task sandbox bounded to the worktree plus explicit git metadata.
           args = ['exec', guardedPrompt, '--sandbox', 'workspace-write', '--cd', worktreePath];

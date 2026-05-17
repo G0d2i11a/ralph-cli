@@ -16,6 +16,7 @@ export interface RalphConfig {
     longRunningCommandPatterns: string[];
     model: string;
     codexConversationScope: 'attempt' | 'story' | 'task';
+    codexSandboxMode: 'workspace-write' | 'danger-full-access';
   };
   runner: {
     maxConcurrent: number;
@@ -200,6 +201,7 @@ const DEFAULT_CONFIG: RalphConfig = {
     longRunningCommandPatterns: ['next build', 'pnpm run build', 'npm run build', 'yarn build', 'turbo build', 'tsc'],
     model: 'claude-opus-4-6-thinking-xchai',
     codexConversationScope: 'story',
+    codexSandboxMode: 'workspace-write',
   },
   runner: {
     maxConcurrent: 3,
