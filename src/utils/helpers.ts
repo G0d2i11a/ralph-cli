@@ -1,7 +1,7 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import matter from 'gray-matter';
-import type { PRD, UserStory } from '../types/prd';
+import type { PRD, PRDReferenceImplementation, UserStory } from '../types/prd';
 import type { Task } from '../types/task';
 import type { StateManager } from '../core/state';
 import { deriveTaskDeliveryStatus, resolveTaskIntegrationStatus } from '../core/task-delivery';
@@ -36,6 +36,14 @@ function normalizeStringArray(value: unknown): string[] {
 function normalizeOptionalStringArray(value: unknown): string[] | undefined {
   const normalized = normalizeStringArray(value);
   return normalized.length > 0 ? normalized : undefined;
+}
+
+function normalizeOptionalRecord<T extends Record<string, unknown>>(value: unknown): T | undefined {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    return undefined;
+  }
+
+  return value as T;
 }
 
 function resolvePrdTitle(prd: Partial<PRD> & Record<string, unknown>, fallbackId: string): string {
@@ -82,10 +90,16 @@ function normalizePrd(prd: Partial<PRD> & Record<string, unknown>, fallbackId: s
     title: resolvePrdTitle(prd, fallbackId),
     description: normalizeString(prd.description),
     userStories,
+    acceptanceCriteria: normalizeOptionalStringArray(prd.acceptanceCriteria),
+    nonGoals: normalizeOptionalStringArray(prd.nonGoals),
+    safetyBoundaries: normalizeOptionalStringArray(prd.safetyBoundaries),
+    forbiddenWriteSurface: normalizeOptionalStringArray(prd.forbiddenWriteSurface),
+    verificationCommands: normalizeOptionalStringArray(prd.verificationCommands),
     dependencies: normalizeStringArray(prd.dependencies),
     writeSurface: normalizeOptionalStringArray(prd.writeSurface),
     conflictDomains: normalizeOptionalStringArray(prd.conflictDomains),
     integrationLane: normalizeString(prd.integrationLane) || undefined,
+    referenceImplementation: normalizeOptionalRecord<PRDReferenceImplementation>(prd.referenceImplementation),
   };
 }
 
@@ -155,10 +169,16 @@ export function parsePRDContent(content: string, prdPath: string = 'prd.json'): 
     title: frontmatter.title,
     description: frontmatter.description,
     userStories: frontmatterStories && frontmatterStories.length > 0 ? frontmatterStories : bodyStories,
+    acceptanceCriteria: frontmatter.acceptanceCriteria,
+    nonGoals: frontmatter.nonGoals,
+    safetyBoundaries: frontmatter.safetyBoundaries,
+    forbiddenWriteSurface: frontmatter.forbiddenWriteSurface,
+    verificationCommands: frontmatter.verificationCommands,
     dependencies: frontmatter.dependencies,
     writeSurface: frontmatter.writeSurface,
     conflictDomains: frontmatter.conflictDomains,
     integrationLane: frontmatter.integrationLane,
+    referenceImplementation: frontmatter.referenceImplementation,
   }, fallbackId);
 }
 

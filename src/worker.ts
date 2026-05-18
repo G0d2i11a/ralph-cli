@@ -242,7 +242,8 @@ async function runWorker(taskId: string) {
               threadId: task.threadId,
               threadStoryId: task.threadStoryId,
               storyId: us.id,
-            }
+            },
+            prd,
           ).finally(() => heartbeat.stop());
 
           let continuationStateChanged = false;

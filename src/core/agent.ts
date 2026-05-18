@@ -3,7 +3,7 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import { ConfigManager } from '../config/manager';
-import { UserStory } from '../types/prd';
+import { PRD, UserStory } from '../types/prd';
 import { listWorktreeProcessCandidatePids } from './worktree-process-cleanup';
 
 export type AgentType = 'claude' | 'codex';
@@ -359,8 +359,9 @@ export class AgentRunner {
     logPath: string,
     backendOrState?: AgentBackend | AgentRunState,
     maybeState?: AgentRunState,
+    prd?: PRD,
   ): Promise<AgentRunResult> {
-    const prompt = this.generatePrompt(us);
+    const prompt = this.generatePrompt(us, prd);
     const backend = typeof backendOrState === 'string'
       ? resolveAgentBackend(backendOrState)
       : resolveConfiguredBackend(this.config);
@@ -369,7 +370,40 @@ export class AgentRunner {
     return this.execAgent(agent, prompt, worktreePath, logPath, backend, state);
   }
 
-  private generatePrompt(us: UserStory): string {
+  private generatePrdContext(prd?: PRD): string {
+    if (!prd) {
+      return '';
+    }
+
+    const context = {
+      id: prd.id,
+      title: prd.title,
+      description: prd.description,
+      writeSurface: prd.writeSurface,
+      forbiddenWriteSurface: prd.forbiddenWriteSurface,
+      conflictDomains: prd.conflictDomains,
+      integrationLane: prd.integrationLane,
+      dependencies: prd.dependencies,
+      acceptanceCriteria: prd.acceptanceCriteria,
+      nonGoals: prd.nonGoals,
+      safetyBoundaries: prd.safetyBoundaries,
+      verificationCommands: prd.verificationCommands,
+      referenceImplementation: prd.referenceImplementation,
+    };
+
+    return `
+## Full PRD Context
+Use this PRD-level context as authoritative task scope. The current user story is one slice of this PRD; do not ignore top-level non-goals, forbidden write surfaces, verification commands, or the reference implementation.
+
+\`\`\`json
+${JSON.stringify(context, null, 2)}
+\`\`\`
+
+If \`referenceImplementation.status\` is \`candidate_complete\`, treat it as Oracle's candidate implementation bundle. Apply or adapt that candidate first, then validate, repair, and report concrete evidence. Do not hand-roll a replacement unless the candidate is incompatible with the live worktree, and keep any adaptation inside the declared write surface and safety boundaries.
+`.trim();
+  }
+
+  private generatePrompt(us: UserStory, prd?: PRD): string {
     return `
 # User Story: ${us.title}
 
@@ -377,6 +411,8 @@ ${us.description}
 
 ## Acceptance Criteria:
 ${us.acceptanceCriteria.map((ac, i) => `${i + 1}. ${ac}`).join('\n')}
+
+${this.generatePrdContext(prd)}
 
 Please implement this user story. Make sure all acceptance criteria are met.
 Do not commit your changes. Instead, leave the worktree ready for a separate finisher step and include a suggested commit message in your final summary.
