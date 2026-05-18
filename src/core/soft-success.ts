@@ -31,6 +31,7 @@ export interface SoftSuccessDecision {
 export function hasStrongCompletionSignals(signals: CompletionSignals): boolean {
   return Boolean(
     (signals.hasCompletionSummary && (signals.hasValidationSignal || signals.hasSuggestedCommitMessage))
+    || (signals.hasValidationSignal && signals.hasSuggestedCommitMessage)
     || signals.matchedSignals.length >= 3
   );
 }
@@ -44,6 +45,7 @@ export function detectCompletionSignals(rawText: string): CompletionSignals {
     /\*\*Result\*\*/i,
     /implementation complete/i,
     /implemented and validated/i,
+    /implemented and left uncommitted/i,
     /acceptance criteria (are )?(covered|met)/i,
     /all acceptance criteria (are )?(covered|met)/i,
     /task .* completed successfully/i,

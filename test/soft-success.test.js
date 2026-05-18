@@ -241,3 +241,48 @@ test('reuseTaskLevelEvidenceForStorySuccess accepts retained base-relative evide
     fs.rmSync(repoPath, { recursive: true, force: true });
   }
 });
+
+test('reuseTaskLevelEvidenceForStorySuccess accepts validated uncommitted worker summaries with retained diff', () => {
+  const repoPath = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-retained-worker-summary-'));
+
+  try {
+    git(repoPath, ['init']);
+    git(repoPath, ['config', 'user.email', 'test@example.com']);
+    git(repoPath, ['config', 'user.name', 'Test User']);
+
+    const filePath = path.join(repoPath, 'tracked.txt');
+    fs.writeFileSync(filePath, 'base\n');
+    git(repoPath, ['add', 'tracked.txt']);
+    git(repoPath, ['commit', '-m', 'initial']);
+
+    const baseCommitSha = execFileSync('git', ['rev-parse', 'HEAD'], {
+      cwd: repoPath,
+      encoding: 'utf8',
+    }).trim();
+
+    fs.writeFileSync(filePath, 'retained task evidence\n');
+
+    const reusedEvidence = reuseTaskLevelEvidenceForStorySuccess({
+      output: `
+Implemented and left uncommitted in the Ralph worktree.
+
+Verification passed:
+- \`npm test\`
+- \`git diff --check\`
+
+Suggested commit message:
+\`Expose skill canary monitoring evidence\`
+`,
+      worktreePath: repoPath,
+      baseCommitSha,
+      storyId: 'US-003',
+    });
+
+    assert.ok(reusedEvidence);
+    assert.equal(reusedEvidence.hasProgress, true);
+    assert.equal(reusedEvidence.filesChanged > 0, true);
+    assert.match(reusedEvidence.reason, /Retained task-level worktree evidence/);
+  } finally {
+    fs.rmSync(repoPath, { recursive: true, force: true });
+  }
+});
