@@ -157,6 +157,62 @@ test('finalizeTaskOutput runs available quality gates before commit', { concurre
   }
 });
 
+test('finalizeTaskOutput accepts Ralph task worktrees under a repo that is itself a git worktree', { concurrency: false }, () => {
+  const repoDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-finalizer-linked-root-'));
+  const linkedRepoDir = path.join(os.tmpdir(), `ralph-finalizer-linked-repo-${process.pid}-${Date.now()}`);
+  const prdPath = path.join(linkedRepoDir, 'prd.json');
+
+  try {
+    git(['init'], repoDir);
+    git(['checkout', '-b', 'main'], repoDir);
+    git(['config', 'user.name', 'Ralph Test'], repoDir);
+    git(['config', 'user.email', 'ralph@example.com'], repoDir);
+    fs.writeFileSync(path.join(repoDir, 'feature.txt'), 'base\n');
+    git(['add', '.'], repoDir);
+    git(['commit', '-m', 'feat: initial'], repoDir);
+
+    git(['worktree', 'add', '-b', 'linked-root', linkedRepoDir, 'main'], repoDir);
+    fs.writeFileSync(prdPath, JSON.stringify({
+      id: 'prd-linked-root',
+      title: 'Linked Root Task',
+      description: 'Finalize from a Ralph repoPath that is itself a git worktree',
+      userStories: [],
+      dependencies: [],
+    }, null, 2));
+
+    const worktreePath = path.join(linkedRepoDir, '.ralph-worktrees', 'task-linked-root');
+    fs.mkdirSync(path.dirname(worktreePath), { recursive: true });
+    git(['worktree', 'add', '-b', 'ralph/task-linked-root', worktreePath, 'linked-root'], linkedRepoDir);
+    fs.appendFileSync(path.join(worktreePath, 'feature.txt'), 'change\n');
+
+    const task = {
+      id: 'task-linked-root',
+      prdPath,
+      status: 'ready_to_finalize',
+      startTime: Date.now(),
+      completedUS: [],
+      worktree: worktreePath,
+      logPath: path.join(linkedRepoDir, '.ralph', 'tasks', 'task-linked-root', 'agent.log'),
+      agent: 'codex',
+      repoPath: linkedRepoDir,
+      loopCount: 0,
+      consecutiveNoProgress: 0,
+      consecutiveErrors: 0,
+      lastProgressTime: Date.now(),
+      lastFilesChanged: 1,
+    };
+
+    const result = finalizeTaskOutput(task);
+
+    assert.equal(result.success, true);
+    assert.equal(result.committed, true);
+    assert.match(git(['log', '--oneline', '-1'], worktreePath), /feat\(ralph\): complete linked root task/);
+  } finally {
+    fs.rmSync(linkedRepoDir, { recursive: true, force: true });
+    fs.rmSync(repoDir, { recursive: true, force: true });
+  }
+});
+
 test('finalizeTaskOutput validates existing task commits instead of silently treating them as no-op', { concurrency: false }, () => {
   const repoDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-finalizer-existing-'));
   const prdPath = path.join(repoDir, 'prd.json');

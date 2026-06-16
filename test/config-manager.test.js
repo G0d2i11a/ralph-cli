@@ -77,7 +77,7 @@ test('ConfigManager defaults agent.backend to cli', withTempHome(async () => {
   assert.equal(manager.get('finalizer.maxNoProgressRepairRounds'), 2);
   assert.equal(manager.get('finalizer.repairDeadlineSeconds'), 7200);
   assert.equal(manager.get('finalizer.repairHardCap'), 20);
-  assert.equal(manager.get('runner.maxTransientRetriesPerStory'), 3);
+  assert.equal(manager.get('runner.maxTransientRetriesPerStory'), 0);
   assert.equal(manager.get('runner.transientRetryBaseDelaySeconds'), 15);
   assert.equal(manager.get('runner.transientRetryMaxDelaySeconds'), 180);
   assert.equal(manager.get('runner.maxTransientRecoveryRequeues'), 5);
@@ -86,6 +86,8 @@ test('ConfigManager defaults agent.backend to cli', withTempHome(async () => {
   assert.equal(manager.get('runner.transientRecoveryDeadlineSeconds'), 7200);
   assert.equal(manager.get('runner.maxTransientRecoverySameSignature'), 3);
   assert.equal(manager.get('runner.transientRecoveryProgressAwareSameSignature'), true);
+  assert.equal(manager.get('runner.transientRateLimitCircuitBreakerEnabled'), true);
+  assert.equal(manager.get('runner.transientRateLimitCircuitBreakerSameSignatureLimit'), 2);
   assert.equal(manager.get('runner.autoRecoveryHardCap'), 20);
   assert.equal(manager.get('runner.autoRemediateFailedBlockers'), true);
   assert.equal(manager.get('runner.maxFailedBlockerStoryRequeues'), 1);
@@ -95,6 +97,7 @@ test('ConfigManager defaults agent.backend to cli', withTempHome(async () => {
   assert.equal(manager.get('runner.maxStoryRepairRequeues'), 1);
   assert.equal(manager.get('runner.storyRepairRecoveryDeadlineSeconds'), 7200);
   assert.equal(manager.get('runner.storyRepairRecoveryHardCap'), 2);
+  assert.equal(manager.get('runner.maxGeneratedFollowupDepth'), 1);
   assert.equal(manager.get('runner.autoRemediateAgentContextFailures'), true);
   assert.equal(manager.get('runner.maxAgentContextRecoveryRequeues'), 1);
   assert.equal(manager.get('runner.agentContextRecoveryDeadlineSeconds'), 7200);
@@ -121,11 +124,17 @@ test('ConfigManager defaults agent.backend to cli', withTempHome(async () => {
   assert.equal(manager.get('reclamation.startupDelaySeconds'), 30);
   assert.equal(manager.get('reclamation.maxRunSeconds'), 30);
   assert.equal(manager.get('reclamation.worktrees.enabled'), true);
+  assert.equal(manager.get('reclamation.worktrees.cleanTerminalRetentionHours'), 0);
+  assert.equal(manager.get('reclamation.worktrees.cleanTerminalSweepIntervalSeconds'), 30);
   assert.equal(manager.get('reclamation.worktrees.completedRetentionHours'), 24);
   assert.equal(manager.get('reclamation.worktrees.failedRetentionHours'), 168);
   assert.equal(manager.get('reclamation.worktrees.cleanupOrphans'), true);
-  assert.equal(manager.get('reclamation.worktrees.keepNewestPerRepo'), 5);
+  assert.equal(manager.get('reclamation.worktrees.keepNewestCleanPerRepo'), 0);
+  assert.equal(manager.get('reclamation.worktrees.keepNewestDirtyPerRepo'), 5);
+  assert.equal(manager.get('reclamation.worktrees.keepNewestPerRepo'), 0);
   assert.equal(manager.get('reclamation.worktrees.maxRemovalsPerRun'), 25);
+  assert.equal(manager.get('reclamation.worktrees.pressureMaxRemovalsPerRun'), 100);
+  assert.equal(manager.get('reclamation.worktrees.pressureEmergencyMaxRemovalsPerRun'), 250);
   assert.equal(manager.get('reclamation.worktrees.removeDirtyFailedWorktrees'), false);
   assert.equal(manager.get('reclamation.worktrees.dirtyTerminalMode'), 'archive_only');
   assert.equal(manager.get('reclamation.worktrees.dirtyOrphanMode'), 'retain');
@@ -148,6 +157,8 @@ test('ConfigManager defaults agent.backend to cli', withTempHome(async () => {
   assert.equal(manager.get('ingestion.ez4ielts.enabled'), false);
   assert.equal(manager.get('ingestion.ez4ielts.ingestExistingOnStartup'), false);
   assert.equal(resolveTransientRecoveryConfig(manager).transientRecoveryProgressAwareSameSignature, true);
+  assert.equal(resolveTransientRecoveryConfig(manager).transientRateLimitCircuitBreakerEnabled, true);
+  assert.equal(resolveTransientRecoveryConfig(manager).transientRateLimitCircuitBreakerSameSignatureLimit, 2);
   assert.deepEqual(resolveAutonomyRepairConfig(manager), {
     autoRecoverBlockedTasks: true,
     autonomyRepairDeadlineSeconds: 86400,
@@ -262,7 +273,7 @@ test('ConfigManager loads auto-merge settings from config', withTempHome(async (
   assert.equal(manager.get('finalizer.maxNoProgressRepairRounds'), 4);
   assert.equal(manager.get('finalizer.repairDeadlineSeconds'), 90);
   assert.equal(manager.get('finalizer.repairHardCap'), 8);
-  assert.equal(manager.get('runner.maxTransientRetriesPerStory'), 3);
+  assert.equal(manager.get('runner.maxTransientRetriesPerStory'), 0);
   assert.equal(manager.get('runner.maxTransientRecoveryRequeues'), 5);
 }));
 

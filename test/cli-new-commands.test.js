@@ -21,6 +21,65 @@ function hashFile(filePath) {
   return createHash('sha256').update(fs.readFileSync(filePath)).digest('hex');
 }
 
+test('pause and resume commands update Ralph manager control state', () => {
+  const homeDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-pause-home-'));
+
+  try {
+    const pauseResult = runCli(['pause', '--reason', 'backend rate limited'], { HOME: homeDir });
+    assert.equal(pauseResult.status, 0, pauseResult.stderr);
+    const pauseOutput = JSON.parse(pauseResult.stdout);
+    const controlPath = path.join(homeDir, '.ralph', 'manager', 'control.json');
+    const pausedControl = JSON.parse(fs.readFileSync(controlPath, 'utf-8'));
+
+    assert.equal(pauseOutput.paused, true);
+    assert.equal(pausedControl.schedulingPaused, true);
+    assert.equal(pausedControl.pauseReason, 'backend rate limited');
+
+    const queueResult = runCli(['queue'], { HOME: homeDir });
+    assert.equal(queueResult.status, 0, queueResult.stderr);
+    const queueOutput = JSON.parse(queueResult.stdout);
+    assert.equal(queueOutput.control.schedulingPaused, true);
+    assert.equal(queueOutput.actionability.status, 'paused');
+
+    const resumeResult = runCli(['resume'], { HOME: homeDir });
+    assert.equal(resumeResult.status, 0, resumeResult.stderr);
+    const resumedControl = JSON.parse(fs.readFileSync(controlPath, 'utf-8'));
+
+    assert.equal(resumedControl.schedulingPaused, false);
+    assert.equal(resumedControl.pauseReason, undefined);
+    assert.ok(resumedControl.resumedAt);
+  } finally {
+    fs.rmSync(homeDir, { recursive: true, force: true });
+  }
+});
+
+test('queue fails closed when manager control state is unreadable', () => {
+  const homeDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-control-corrupt-home-'));
+
+  try {
+    const controlDir = path.join(homeDir, '.ralph', 'manager');
+    fs.mkdirSync(controlDir, { recursive: true });
+    fs.writeFileSync(path.join(controlDir, 'control.json'), '{not-json');
+
+    const queueResult = runCli(['queue'], { HOME: homeDir });
+    assert.equal(queueResult.status, 0, queueResult.stderr);
+    const queueOutput = JSON.parse(queueResult.stdout);
+
+    assert.equal(queueOutput.control.schedulingPaused, true);
+    assert.equal(queueOutput.control.readable, false);
+    assert.equal(queueOutput.control.error, 'manager_control_unreadable');
+    assert.equal(queueOutput.actionability.status, 'paused');
+    assert.equal(queueOutput.actionability.reason, 'manager_control_unreadable');
+
+    const resumeResult = runCli(['resume'], { HOME: homeDir });
+    assert.equal(resumeResult.status, 0, resumeResult.stderr);
+    const resumedControl = JSON.parse(fs.readFileSync(path.join(controlDir, 'control.json'), 'utf-8'));
+    assert.equal(resumedControl.schedulingPaused, false);
+  } finally {
+    fs.rmSync(homeDir, { recursive: true, force: true });
+  }
+});
+
 test('queue command reports active queue state', () => {
   const homeDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-queue-home-'));
 

@@ -8,6 +8,7 @@ import { TaskScheduler } from './scheduler';
 import { StateManager } from './state';
 import { enqueueTaskFromPrd } from './task-intake';
 import { appendTaskEvent } from './events';
+import { DEPENDENCY_REPAIR_PRIORITY_CLASS } from './dependency-identity';
 
 export interface GeneratedPrd {
   prd: PRD;
@@ -54,6 +55,31 @@ function safeIdPart(value: string): string {
 
 function uniqueStrings(values: Array<string | undefined>): string[] {
   return [...new Set(values.filter((value): value is string => Boolean(value)))];
+}
+
+function isDependencyRepairFollowup(input: BuildFollowupPrdInput): boolean {
+  if (input.task.status !== 'failed' && input.task.status !== 'stagnant') {
+    return false;
+  }
+
+  return /(?:^|_)hard_cap_reached$/.test(input.reason);
+}
+
+function buildWriteSurface(input: BuildFollowupPrdInput): string[] {
+  const narrowedScope = uniqueStrings([
+    ...(input.scope ?? []),
+    ...(input.failure?.failedFiles ?? []),
+  ]);
+
+  if (isDependencyRepairFollowup(input) && narrowedScope.length > 0) {
+    return narrowedScope;
+  }
+
+  return uniqueStrings([
+    ...narrowedScope,
+    ...(input.task.declaredWriteSurface ?? []),
+    input.failure?.packageLabel,
+  ]);
 }
 
 function buildFailureSummary(failure?: FailureObservation): string[] {
@@ -108,15 +134,11 @@ export function buildFollowupPrdForTask(input: BuildFollowupPrdInput): Generated
   const signature = input.failure?.signature ?? input.task.lastErrorSignature ?? signatureSource;
   const hash = signatureHash(signatureSource || signature);
   const sourcePrd = input.task.prdId ?? path.basename(input.task.prdPath, path.extname(input.task.prdPath));
-  const scope = uniqueStrings([
-    ...(input.scope ?? []),
-    ...(input.failure?.failedFiles ?? []),
-    ...(input.task.declaredWriteSurface ?? []),
-    input.failure?.packageLabel,
-  ]);
+  const scope = buildWriteSurface(input);
   const recommendations = input.recommendedStories.length
     ? input.recommendedStories
     : defaultStories(input);
+  const dependencyRepair = isDependencyRepairFollowup(input);
   const prd: PRD = {
     id: `followup:${safeIdPart(sourcePrd)}:${hash}`,
     title: `Follow up ${input.task.prdTitle ?? sourcePrd}: ${input.reason}`,
@@ -133,6 +155,28 @@ export function buildFollowupPrdForTask(input: BuildFollowupPrdInput): Generated
     conflictDomains: input.task.declaredConflictDomains,
     integrationLane: input.task.integrationLane,
   };
+
+  if (dependencyRepair) {
+    const releasesDependenciesFor = [sourcePrd];
+    prd.priorityClass = DEPENDENCY_REPAIR_PRIORITY_CLASS;
+    prd.repairOf = {
+      prdId: sourcePrd,
+      taskId: input.task.id,
+      reason: input.reason,
+    };
+    prd.releasesDependenciesFor = releasesDependenciesFor;
+    prd.schedulerHints = {
+      priorityClass: DEPENDENCY_REPAIR_PRIORITY_CLASS,
+      effectiveDependencyPrdId: sourcePrd,
+      releasesDependenciesFor,
+      repairTaskId: input.task.id,
+      repairReason: input.reason,
+      demandTaskIds: uniqueStrings([
+        ...(input.task.failedBlockerRecoveryDemandTaskIds ?? []),
+        ...(input.task.storyRepairRecoveryDemandTaskIds ?? []),
+      ]),
+    };
+  }
 
   return { prd, signature };
 }

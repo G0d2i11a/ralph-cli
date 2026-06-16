@@ -1,6 +1,8 @@
+import { ConfigManager } from '../config/manager';
 import { StateManager } from '../core/state';
 import { mergeBranch, MergeStrategy } from '../core/merge';
 import { appendTaskEvent } from '../core/events';
+import { resolveIntegrationPolicy } from '../core/integration-policy';
 import { buildFailedMergeTaskUpdates, buildSuccessfulMergeTaskUpdates } from '../core/merge-task-updates';
 import { withIntegrationLaneLock } from '../core/locks';
 import { findCoordinationBlockers, resolveTaskIntegrationLane } from '../core/task-coordination';
@@ -16,6 +18,7 @@ export async function mergeCommand(
 ): Promise<void> {
   try {
     const stateManager = new StateManager();
+    const integrationPolicy = resolveIntegrationPolicy(new ConfigManager());
     const task = await stateManager.loadTask(taskId);
 
     if (!task) {
@@ -53,7 +56,7 @@ export async function mergeCommand(
     }
 
     const strategy = (options.strategy || 'manual') as MergeStrategy;
-    const targetBranch = options.target || 'main';
+    const targetBranch = options.target || integrationPolicy.targetBranch;
 
     if (!options.auto && strategy !== 'manual') {
       console.error(JSON.stringify({
@@ -116,7 +119,12 @@ export async function mergeCommand(
         process.exit(1);
       }
 
-      return mergeBranch(latestTask, targetBranch, strategy);
+      return mergeBranch(latestTask, targetBranch, strategy, {
+        pullLatest: integrationPolicy.pullLatest,
+        useIntegrationWorktree: integrationPolicy.useIntegrationWorktree,
+        integrationWorktreeDir: integrationPolicy.integrationWorktreeDir,
+        syncTargetBranch: integrationPolicy.syncTargetBranch,
+      });
     });
 
     if (result.success) {

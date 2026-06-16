@@ -7,6 +7,8 @@ export interface TransientRecoveryConfig {
   transientRecoveryDeadlineSeconds: number;
   maxTransientRecoverySameSignature: number;
   transientRecoveryProgressAwareSameSignature: boolean;
+  transientRateLimitCircuitBreakerEnabled: boolean;
+  transientRateLimitCircuitBreakerSameSignatureLimit: number;
   autoRecoveryHardCap: number;
 }
 
@@ -45,6 +47,8 @@ const DEFAULT_TRANSIENT_RECOVERY_MAX_DELAY_SECONDS = 900;
 const DEFAULT_TRANSIENT_RECOVERY_DEADLINE_SECONDS = 7200;
 const DEFAULT_MAX_TRANSIENT_RECOVERY_SAME_SIGNATURE = 3;
 const DEFAULT_TRANSIENT_RECOVERY_PROGRESS_AWARE_SAME_SIGNATURE = true;
+const DEFAULT_TRANSIENT_RATE_LIMIT_CIRCUIT_BREAKER_ENABLED = true;
+const DEFAULT_TRANSIENT_RATE_LIMIT_CIRCUIT_BREAKER_SAME_SIGNATURE_LIMIT = 2;
 const DEFAULT_AUTO_RECOVERY_HARD_CAP = 20;
 const DEFAULT_AUTO_REMEDIATE_FAILED_BLOCKERS = true;
 const DEFAULT_MAX_FAILED_BLOCKER_STORY_REQUEUES = 1;
@@ -99,6 +103,14 @@ export function resolveTransientRecoveryConfig(
     transientRecoveryProgressAwareSameSignature: sanitizeBoolean(
       config.get('runner.transientRecoveryProgressAwareSameSignature'),
       DEFAULT_TRANSIENT_RECOVERY_PROGRESS_AWARE_SAME_SIGNATURE,
+    ),
+    transientRateLimitCircuitBreakerEnabled: sanitizeBoolean(
+      config.get('runner.transientRateLimitCircuitBreakerEnabled'),
+      DEFAULT_TRANSIENT_RATE_LIMIT_CIRCUIT_BREAKER_ENABLED,
+    ),
+    transientRateLimitCircuitBreakerSameSignatureLimit: sanitizeCount(
+      config.get('runner.transientRateLimitCircuitBreakerSameSignatureLimit'),
+      DEFAULT_TRANSIENT_RATE_LIMIT_CIRCUIT_BREAKER_SAME_SIGNATURE_LIMIT,
     ),
     autoRecoveryHardCap: sanitizeCount(
       config.get('runner.autoRecoveryHardCap'),

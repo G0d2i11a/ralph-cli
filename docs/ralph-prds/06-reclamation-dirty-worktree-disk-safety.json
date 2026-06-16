@@ -1,0 +1,193 @@
+{
+  "id": "06-reclamation-dirty-worktree-disk-safety",
+  "title": "Reclamation dirty worktree disk safety and idempotent evidence archives",
+  "description": "Fix Ralph worktree reclamation so completed/integrated dirty worktrees are safely archived once and reclaimed according to target-sync-specific retention, while retry/manual-review dirty worktrees remain conservative and evidence/log growth is bounded.",
+  "sourceEvidenceCitation": ":contentReference[oaicite:0]{index=0}",
+  "artifactPath": "docs/ralph-prds/06-reclamation-dirty-worktree-disk-safety.json",
+  "patchArtifactPath": "docs/ralph-prds/artifacts/06-reclamation-dirty-worktree-disk-safety.patch",
+  "targetRepo": "/Users/shawn/Project/ralph-cli",
+  "targetBranch": "main",
+  "targetHead": "a2ed4d174e37789bac118ea6ca64bb0c8267c69f",
+  "ralphHome": "/Users/shawn/Project/ralph-cli/.ralph-cli-home",
+  "queueStatus": "blocked_by_policy_due_existing_integration_sync_conflict",
+  "integrationLane": "reclamation-disk-safety",
+  "policyApprovalsRequired": [
+    "Do not enqueue automatically while intake/queue gates are blocked by the existing integration_sync_conflict.",
+    "Operator may explicitly choose to apply/adapt this PRD after queue gates are clear or by intentional override."
+  ],
+  "userStories": [
+    {
+      "id": "US-1",
+      "title": "Clean terminal worktrees are aggressively reclaimed",
+      "story": "As Shawn, I want clean completed/terminal Ralph worktrees removed promptly so they do not consume disk after integration.",
+      "acceptanceCriteria": [
+        "Clean terminal task worktrees continue to use remove_clean with force=false.",
+        "Clean terminal reclamation still validates the task is terminal, not active or leased, inside .ralph-worktrees, and still clean immediately before removal.",
+        "Existing cleanup CLI dry-run semantics continue to report wouldRemove without deleting."
+      ]
+    },
+    {
+      "id": "US-2",
+      "title": "Dirty completed integrated worktrees reclaim by safe target-sync class",
+      "story": "As Shawn, I want dirty completed/integrated worktrees to be archived once and reclaimed after a short safe TTL based on target sync status.",
+      "acceptanceCriteria": [
+        "completed+integrated+targetSync=synced dirty worktrees default to archive_then_reclaim after 0 hours retention.",
+        "completed+integrated+targetSync=disabled dirty worktrees default to archive_then_reclaim after 24 hours retention.",
+        "completed+integrated+targetSync=deferred_dirty_checkout or failed remains archive_only in normal periodic mode until disk pressure and TTL safety gates allow reclaim.",
+        "completed tasks with integrationStatus failed or blocked_conflict are not blindly reclaimed by this change."
+      ]
+    },
+    {
+      "id": "US-3",
+      "title": "Evidence archive is idempotent and fingerprint-gated",
+      "story": "As Shawn, I want repeated manager sweeps to reuse complete matching evidence instead of generating duplicate timestamped archives.",
+      "acceptanceCriteria": [
+        "A reusable evidence archive requires an existing managed manifest, complete=true, matching taskId/repoPath/worktree/kind, compatible decision, and matching dirty fingerprint.",
+        "The dirty fingerprint includes status porcelain, unstaged diff, cached diff, head/branch identity, and untracked file fingerprints where safe.",
+        "A changed dirty worktree fingerprint causes a new evidence archive rather than reusing stale evidence.",
+        "Before archive_then_reclaim removal, Ralph revalidates the current fingerprint still matches the manifest."
+      ]
+    },
+    {
+      "id": "US-4",
+      "title": "Disk pressure reclaims safe dirty completed integrated worktrees earlier",
+      "story": "As Shawn, I want ordinary disk pressure to reclaim safe completed/integrated dirty worktrees before emergency disk exhaustion.",
+      "acceptanceCriteria": [
+        "Ordinary under-pressure mode enables dirtyTerminalModeOverride=archive_then_reclaim, but ReclamationService downgrades non-eligible dirty terminal worktrees to archive_only.",
+        "Retry/manual_review dirty failed worktrees remain archive_only unless explicit manual abandon policy is used.",
+        "Emergency mode can still include dirty orphan reclaim, constrained by existing path/status/unmerged safety gates."
+      ]
+    },
+    {
+      "id": "US-5",
+      "title": "Reclamation evidence and report logs have bounded growth",
+      "story": "As Shawn, I want successful dirty reclamation to prune duplicate evidence and rotate reclamation.jsonl so Ralph does not refill disk with its own cleanup artifacts.",
+      "acceptanceCriteria": [
+        "After successful archive_then_reclaim, duplicate complete matching evidence for the same task/repo/worktree is pruned to reclamation.evidence.maxArchivesPerTask, default 1.",
+        "Pruning only deletes directories under the configured evidence root, skips .tmp, requires complete matching manifests, and preserves the current manifest.",
+        "reclamation.reporting.maxJsonlBytes and maxJsonlFiles rotate reclamation.jsonl before append; defaults are 50MiB and 5 rotated files."
+      ]
+    }
+  ],
+  "acceptanceCriteria": [
+    "No active, leased, non-terminal, unmerged, status-error, branch-unexpected, path-out-of-.ralph-worktrees, or user-source-outside-.ralph-worktrees worktree is deleted by normal automation.",
+    "Default dirtyTerminalMode remains archive_only globally; completed+integrated eligible dirty task worktrees are selectively promoted to archive_then_reclaim by effective decision logic.",
+    "keepNewestDirtyPerRepo protects dirty retry/manual_review/target_sync attention states, not already completed+integrated synced/disabled reclaimable worktrees.",
+    "Failed retry/manual_review dirty worktrees are not blindly removed by normal periodic or ordinary disk-pressure automation, but their evidence archive is idempotent.",
+    "Repeated manager sweeps over an unchanged dirty worktree reuse existing complete fingerprint-matching evidence and do not increment new archive counts.",
+    "If removal fails after successful archive, the next run can reuse the previous complete archive and retry removal without duplicating evidence.",
+    "After successful archive_then_reclaim removal, task state records worktreeReclaimedAt/ReclaimedBy/ReclaimDecision and current evidence manifest path best-effort.",
+    "reclamation.jsonl rotates before append when it exceeds reclamation.reporting.maxJsonlBytes.",
+    "The patch does not touch scheduler/queue/followup recovery logic or resolve the existing integration_sync_conflict."
+  ],
+  "verificationCommands": [
+    "git apply --check docs/ralph-prds/artifacts/06-reclamation-dirty-worktree-disk-safety.patch",
+    "npm run build",
+    "node --test test/reclamation.test.js test/dependency-watcher-config.test.js",
+    "npm test -- --test-name-pattern=reclamation",
+    "npm test -- --test-name-pattern=dependency-watcher",
+    "node dist/cli.js cleanup --dry-run --archive-dirty --reclaim-archived-dirty --repo /Users/shawn/Project/ralph-cli --older-than-hours 24"
+  ],
+  "rollbackSafetyNotes": [
+    "Revert the patch before running manager if unexpected reclamation decisions appear in dry-run reports.",
+    "Evidence archives are only pruned after successful archive_then_reclaim and only under reclamation evidence root; rollback can disable pruning by setting reclamation.evidence.pruneDuplicateArchives=false.",
+    "Dirty under-pressure promotion can be disabled operationally by setting reclamation.worktrees.reclaimDirtyCompletedIntegratedUnderPressure=false.",
+    "JSONL rotation can be disabled by setting reclamation.reporting.maxJsonlBytes=0.",
+    "Do not manually delete dirty failed/manual_review worktrees during rollback unless an operator has inspected evidence and intentionally abandons them."
+  ],
+  "handoffNotes": [
+    "This is a candidate implementation bundle for Ralph/Codex to apply or adapt; acceptance criteria are authoritative over patch text.",
+    "Current queue is blocked_by_policy due older scheduler-recovery integration_sync_conflict; do not enqueue this PRD until gates are clear or operator explicitly chooses next action.",
+    "The attached Oracle diagnosis was treated as architectural guidance unless contradicted by attached live source.",
+    "The patch is intentionally scoped to reclamation/config/evidence/disk-pressure tests and avoids unrelated scheduler/queue/followup recovery code.",
+    "Run dry-run cleanup and inspect report.candidates/report.skipped before enabling unattended manager on Shawn's repo."
+  ],
+  "dependencies": [
+    "Live repo must still match the attached source structure around src/config/manager.ts, src/core/reclamation.ts, src/core/reclamation-evidence.ts, and src/core/dependency-watcher.ts.",
+    "Ralph queue/intake gates must be clear, or an operator must explicitly override the blocked_by_policy condition.",
+    "Git worktree removal must continue to route through WorktreeManager.removeWorktreeSafe and pre-removal validation."
+  ],
+  "satisfiedDependencies": [
+    "Attached source includes current reclamation, evidence archiver, dependency watcher, config, task delivery, worktree manager, and relevant tests.",
+    "Existing safety gates and pre-removal revalidation are present and reused rather than bypassed."
+  ],
+  "writeSurface": [
+    "docs/ralph-prds/06-reclamation-dirty-worktree-disk-safety.json",
+    "docs/ralph-prds/artifacts/06-reclamation-dirty-worktree-disk-safety.patch",
+    "src/config/manager.ts",
+    "src/core/reclamation.ts",
+    "src/core/reclamation-evidence.ts",
+    "src/core/dependency-watcher.ts",
+    "test/reclamation.test.js",
+    "test/dependency-watcher-config.test.js"
+  ],
+  "forbiddenWriteSurface": [
+    "src/core/scheduler.ts",
+    "src/core/followup-prd.ts",
+    "src/core/conflict-resolution.ts",
+    "src/core/merge-repair and unrelated scheduler/queue recovery paths",
+    ".ralph-worktrees outside the target repo during implementation",
+    "User source outside /Users/shawn/Project/ralph-cli/.ralph-worktrees"
+  ],
+  "conflictDomains": [
+    "reclamation_policy",
+    "reclamation_evidence_archives",
+    "disk_pressure_cleanup",
+    "manager_config_defaults",
+    "reclamation_reporting_logs"
+  ],
+  "referenceImplementation": {
+    "status": "candidate_complete",
+    "kind": "patch_or_complete_files",
+    "artifactPath": "docs/ralph-prds/artifacts/06-reclamation-dirty-worktree-disk-safety.patch",
+    "patchMarker": "BEGIN_UNIFIED_PATCH:06-reclamation-dirty-worktree-disk-safety.patch",
+    "touchedFiles": [
+      "src/config/manager.ts",
+      "src/core/reclamation.ts",
+      "src/core/reclamation-evidence.ts",
+      "src/core/dependency-watcher.ts",
+      "test/reclamation.test.js",
+      "test/dependency-watcher-config.test.js"
+    ],
+    "applyOrder": [
+      "Apply config defaults and new reclamation/evidence/reporting settings in src/config/manager.ts.",
+      "Apply evidence fingerprint, managed manifest validation, duplicate prune support, and fingerprint-stable archive ID changes in src/core/reclamation-evidence.ts.",
+      "Apply effective dirty decision logic, reusable evidence, completed-integrated retention, safety-gate, prune, and JSONL rotation changes in src/core/reclamation.ts.",
+      "Apply ordinary disk-pressure dirty terminal override in src/core/dependency-watcher.ts.",
+      "Apply focused reclamation and dependency watcher tests."
+    ],
+    "testCommands": [
+      "git apply --check docs/ralph-prds/artifacts/06-reclamation-dirty-worktree-disk-safety.patch",
+      "npm run build",
+      "node --test test/reclamation.test.js test/dependency-watcher-config.test.js",
+      "npm test -- --test-name-pattern=reclamation",
+      "npm test -- --test-name-pattern=dependency-watcher"
+    ],
+    "assumptions": [
+      "ConfigManager default config is the authoritative default source for reclamation settings.",
+      "Task.worktreeReclaimEvidenceManifestPath is a hint only; reusable evidence is trusted only after manifest, managed-path, candidate, decision, and fingerprint validation.",
+      "Dirty completed+integrated targetSync=disabled worktrees are safe to reclaim after the 24h default retention because target branch publication is intentionally disabled by policy.",
+      "Manual cleanup with explicit dirtyTerminalModeOverride remains an operator-intent path and is not made more restrictive by the normal automation safeguards."
+    ],
+    "knownRisks": [
+      "Fingerprinting untracked files reads small files up to maxSingleUntrackedFileBytes and uses metadata for larger files, so extremely large untracked files may rely on size/time metadata rather than full content hashes.",
+      "If live code has diverged from the attached snippets, Ralph/Codex must adapt hunks while preserving acceptance criteria.",
+      "A task whose dirty evidence manifest path was never recorded cannot reuse prior archives until a new complete manifest is recorded in task state.",
+      "Tests use fake evidence archivers for decision behavior; real git evidence coverage remains in the existing real archive test and should be expanded if live code supports more fixture time."
+    ],
+    "dependencyRechecks": [
+      "Confirm resolveTaskTargetSyncStatus still returns synced, disabled, deferred_dirty_checkout, failed, and not_requested with the same semantics.",
+      "Confirm ReclamationDecision.action names are unchanged: skip, retain, remove_clean, archive_only, archive_then_reclaim.",
+      "Confirm WorktreeManager methods used by computeDirtyFingerprint exist and preserve current signatures.",
+      "Confirm dependency watcher disk-pressure tests still inject statfs and reclamationService in the same constructor dependency shape."
+    ],
+    "rollbackNotes": [
+      "git apply -R docs/ralph-prds/artifacts/06-reclamation-dirty-worktree-disk-safety.patch",
+      "If only runtime rollback is needed, set reclamation.worktrees.reclaimDirtyCompletedIntegratedUnderPressure=false and reclamation.evidence.pruneDuplicateArchives=false, then restart the manager.",
+      "Restore previous reclamation.reporting.maxJsonlBytes/maxJsonlFiles behavior by removing those keys or setting maxJsonlBytes=0 if rotation causes operational surprise.",
+      "Do not manually delete dirty failed/manual_review worktrees during rollback unless an operator has inspected evidence and intentionally abandons them."
+    ],
+    "artifactSha256": "43751cd8c59484623dfad93802373375a2ef1a130e52635330418a729742e8e4"
+  },
+  "patchArtifactSha256": "43751cd8c59484623dfad93802373375a2ef1a130e52635330418a729742e8e4"
+}

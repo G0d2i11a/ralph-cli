@@ -19,6 +19,7 @@ import { StateManager } from './state';
 import { resolveTaskIntegrationStatus } from './task-delivery';
 import { WorktreeInspection, WorktreeManager } from './worktree';
 import { getManagerStatus } from './manager-state';
+import { readManagerControl } from './manager-control';
 import {
   cleanupWorktreeProcesses,
   readWorktreeProcessInfo,
@@ -26,6 +27,8 @@ import {
   WorktreeCleanupResult,
   WorktreeProcessInfo,
 } from './worktree-process-cleanup';
+import { comparePendingTaskScheduleOrder } from './scheduler-priority';
+import { buildDependencyRepairIdentityUpdates } from './dependency-identity';
 
 const DEFAULT_MAX_CONCURRENT = 3;
 const LOCK_RETRY_MS = 50;
@@ -76,6 +79,7 @@ export interface PendingTaskState {
   dependencyBlockers?: DependencyBlocker[];
   failedDependencies?: string[];
   recoveringDependencies?: string[];
+  repairTaskIds?: string[];
   missingDependencies?: string[];
   blockers: string[];
   failedBlockers?: string[];
@@ -669,6 +673,7 @@ export class TaskScheduler {
         dependencyBlockers: dependencyState.blockers,
         failedDependencies: dependencyState.failed,
         recoveringDependencies: dependencyState.recovering,
+        repairTaskIds: dependencyState.repairTaskIds,
         missingDependencies: dependencyState.missing,
         blockers: [],
         maxConcurrent,
@@ -756,6 +761,10 @@ export class TaskScheduler {
   async schedulePendingTasks(): Promise<Task[]> {
     return this.withLock(async () => {
       const startedTasks: Task[] = [];
+      if (this.isSchedulingPaused()) {
+        return startedTasks;
+      }
+
       if (this.shouldDeferSchedulingToActiveManager()) {
         return startedTasks;
       }
@@ -768,9 +777,19 @@ export class TaskScheduler {
         return startedTasks;
       }
 
-      const pendingTasks = (await this.stateManager.listTasks('pending'))
-        .slice()
-        .sort((a, b) => a.startTime - b.startTime);
+      const tasksForScheduling = await this.stateManager.listTasks();
+      const pendingTasks = tasksForScheduling
+        .filter((task) => task.status === 'pending')
+        .sort((left, right) => comparePendingTaskScheduleOrder(
+          {
+            ...left,
+            ...buildDependencyRepairIdentityUpdates(left, tasksForScheduling),
+          },
+          {
+            ...right,
+            ...buildDependencyRepairIdentityUpdates(right, tasksForScheduling),
+          },
+        ));
 
       for (const task of pendingTasks) {
         if (runningCount >= maxConcurrent) {
@@ -778,6 +797,12 @@ export class TaskScheduler {
         }
 
         try {
+          const repairIdentityUpdates = buildDependencyRepairIdentityUpdates(task, await this.stateManager.listTasks());
+          if (repairIdentityUpdates) {
+            await this.stateManager.updateTask(task.id, repairIdentityUpdates);
+            Object.assign(task, repairIdentityUpdates);
+          }
+
           const prd = this.getDependencyPRD(task);
           const dependencyState = await this.checkDependenciesFn(prd, this.stateManager, {
             repoPath: task.repoPath,
@@ -843,6 +868,10 @@ export class TaskScheduler {
     });
 
     return manager.active && manager.state?.pid !== process.pid;
+  }
+
+  private isSchedulingPaused(): boolean {
+    return readManagerControl({ ralphHome: this.ralphHome }).schedulingPaused;
   }
 
   private async inspectTaskWorktree(task: Task): Promise<WorktreeInspection | undefined> {
@@ -1070,16 +1099,21 @@ export class TaskScheduler {
   private isLockStale(): boolean {
     try {
       if (fs.existsSync(this.lockInfoPath)) {
-        const content = fs.readFileSync(this.lockInfoPath, 'utf-8');
-        const lockInfo = JSON.parse(content) as { pid?: number };
+        try {
+          const content = fs.readFileSync(this.lockInfoPath, 'utf-8');
+          const lockInfo = JSON.parse(content) as { pid?: number };
 
-        if (typeof lockInfo.pid === 'number') {
-          try {
-            process.kill(lockInfo.pid, 0);
-            return false;
-          } catch {
-            return true;
+          if (typeof lockInfo.pid === 'number') {
+            try {
+              process.kill(lockInfo.pid, 0);
+              return false;
+            } catch {
+              return true;
+            }
           }
+        } catch {
+          // Empty/corrupt owner files can be left behind by interrupted lock acquisition.
+          // Fall through to the directory mtime stale check instead of wedging forever.
         }
       }
 

@@ -1,9 +1,12 @@
 import AppKit
 import Combine
+import Darwin
 import SwiftUI
 
+private var instanceLockFileDescriptor: CInt = -1
+
 final class RalphMenuBarAppDelegate: NSObject, NSApplicationDelegate {
-  private let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+  private var statusItem: NSStatusItem?
   private let store = SnapshotStore()
   private let popover = NSPopover()
   private var refreshTimer: Timer?
@@ -12,7 +15,8 @@ final class RalphMenuBarAppDelegate: NSObject, NSApplicationDelegate {
   func applicationDidFinishLaunching(_ notification: Notification) {
     NSApp.setActivationPolicy(.accessory)
 
-    if let button = statusItem.button {
+    statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+    if let button = statusItem?.button {
       button.target = self
       button.action = #selector(togglePopover(_:))
       button.imagePosition = .imageLeading
@@ -23,7 +27,7 @@ final class RalphMenuBarAppDelegate: NSObject, NSApplicationDelegate {
 
     popover.behavior = .transient
     popover.animates = true
-    popover.contentSize = NSSize(width: 468, height: 620)
+    popover.contentSize = NSSize(width: 540, height: 720)
     popover.contentViewController = NSHostingController(rootView: RalphMenuBarView(store: store))
 
     store.$snapshot
@@ -52,10 +56,11 @@ final class RalphMenuBarAppDelegate: NSObject, NSApplicationDelegate {
 
   func applicationWillTerminate(_ notification: Notification) {
     refreshTimer?.invalidate()
+    releaseSingleInstanceLock()
   }
 
   @objc private func togglePopover(_ sender: Any?) {
-    guard let button = statusItem.button else { return }
+    guard let button = statusItem?.button else { return }
 
     if popover.isShown {
       popover.performClose(sender)
@@ -78,11 +83,11 @@ final class RalphMenuBarAppDelegate: NSObject, NSApplicationDelegate {
   }
 
   private func updateStatusButton() {
-    guard let button = statusItem.button else { return }
+    guard let button = statusItem?.button else { return }
 
-    let actions = store.totalActionCount
-    let executing = store.totalExecutionCount
-    let hasStaleManager = store.projectSnapshots.contains { $0.snapshot.managerIsStale }
+    let actions = store.snapshot.actionCount
+    let executing = store.snapshot.executionCount
+    let hasStaleManager = store.snapshot.managerIsStale
     let title: String
 
     if hasStaleManager {
@@ -102,16 +107,24 @@ final class RalphMenuBarAppDelegate: NSObject, NSApplicationDelegate {
   }
 
   private func tooltip() -> String {
+    let selectedSnapshot = store.snapshot
+    let selectedManagerLabel = selectedSnapshot.managerState
+      .map { "\($0.status ?? "unknown") / \(shortRepoName($0.repo))" }
+      ?? "missing"
+
     var lines = [
-      "Ralph projects: \(store.projectSnapshots.count)",
-      "Executing: \(store.totalExecutionCount)",
-      "Repairing: \(store.totalRecoveringCount)",
-      "Planning: \(store.totalPlanningCount)",
-      "Waiting: \(store.totalWaitingRecoveryCount)",
-      "Queued: \(store.totalQueuedCount)",
-      "Approval/blocked: \(store.totalActionCount)",
-      "Recent completed: \(store.totalRecentCompletedCount)",
-      "Total completed: \(store.totalCompletedCount)"
+      "Selected: \(store.selectedProjectName)",
+      "Executing: \(selectedSnapshot.executionCount)",
+      "Repairing: \(selectedSnapshot.recoveringCount)",
+      "Planning: \(selectedSnapshot.planningCount)",
+      "Waiting: \(selectedSnapshot.waitingRecoveryCount)",
+      "Queued: \(selectedSnapshot.queuedCount)",
+      "Approval/blocked: \(selectedSnapshot.actionCount)",
+      "Recent completed: \(selectedSnapshot.recentCompletedCount)",
+      "Total completed: \(selectedSnapshot.totalCompletedCount)",
+      "Manager: \(selectedManagerLabel)",
+      "",
+      "All registered projects: \(store.projectSnapshots.count)"
     ]
 
     for projectSnapshot in store.projectSnapshots {
@@ -127,7 +140,66 @@ final class RalphMenuBarAppDelegate: NSObject, NSApplicationDelegate {
   }
 }
 
+func shouldTerminateDuplicateInstance() -> Bool {
+  let currentPID = ProcessInfo.processInfo.processIdentifier
+  let bundleIdentifier = Bundle.main.bundleIdentifier ?? "com.g0d2i11a.ralph.menubar"
+  let earlierInstance = NSRunningApplication
+    .runningApplications(withBundleIdentifier: bundleIdentifier)
+    .first { !$0.isTerminated && $0.processIdentifier < currentPID }
+
+  if let earlierInstance {
+    earlierInstance.activate(options: [])
+    return true
+  }
+
+  return false
+}
+
+func acquireSingleInstanceLock() -> Bool {
+  let supportDirectory = FileManager.default.homeDirectoryForCurrentUser
+    .appendingPathComponent("Library/Application Support/RalphMenuBar", isDirectory: true)
+
+  do {
+    try FileManager.default.createDirectory(at: supportDirectory, withIntermediateDirectories: true)
+  } catch {
+    return true
+  }
+
+  let lockPath = supportDirectory.appendingPathComponent("RalphMenuBar.lock").path
+  let descriptor = Darwin.open(lockPath, O_CREAT | O_RDWR, S_IRUSR | S_IWUSR)
+  guard descriptor >= 0 else {
+    return true
+  }
+
+  if flock(descriptor, LOCK_EX | LOCK_NB) != 0 {
+    Darwin.close(descriptor)
+    return false
+  }
+
+  instanceLockFileDescriptor = descriptor
+  let pid = "\(ProcessInfo.processInfo.processIdentifier)\n"
+  _ = ftruncate(descriptor, 0)
+  pid.withCString { pointer in
+    _ = write(descriptor, pointer, strlen(pointer))
+  }
+  return true
+}
+
+func releaseSingleInstanceLock() {
+  guard instanceLockFileDescriptor >= 0 else { return }
+  _ = flock(instanceLockFileDescriptor, LOCK_UN)
+  Darwin.close(instanceLockFileDescriptor)
+  instanceLockFileDescriptor = -1
+}
+
 let app = NSApplication.shared
-let delegate = RalphMenuBarAppDelegate()
-app.delegate = delegate
-app.run()
+var delegate: RalphMenuBarAppDelegate?
+
+if !acquireSingleInstanceLock() || shouldTerminateDuplicateInstance() {
+  exit(EXIT_SUCCESS)
+} else {
+  let appDelegate = RalphMenuBarAppDelegate()
+  delegate = appDelegate
+  app.delegate = appDelegate
+  app.run()
+}

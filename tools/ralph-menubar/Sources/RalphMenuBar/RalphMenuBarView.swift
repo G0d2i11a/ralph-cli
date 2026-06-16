@@ -5,14 +5,11 @@ final class SnapshotStore: ObservableObject {
   @Published private(set) var config: RalphMenuBarConfig
   @Published private(set) var snapshot: Snapshot
   @Published private(set) var projectSnapshots: [ProjectSnapshot]
-  @Published var selectedProjectId: String {
-    didSet {
-      updateSelectedSnapshot()
-      persistSelectedProjectSelection()
-    }
-  }
+  @Published private(set) var selectedProjectId: String
   @Published var flashMessage: String?
   @Published var isRefreshing = false
+  @Published var isStoppingTasks = false
+  @Published var isTogglingPause = false
 
   private let configStore = ConfigStore()
   private let loaderQueue = DispatchQueue(label: "ralph.menubar.loader", qos: .userInitiated)
@@ -92,18 +89,17 @@ final class SnapshotStore: ObservableObject {
 
   var visibleRepoPaths: [String] {
     let paths = snapshot.repoPaths
-    if paths.count == 1, repoNameMatchesSelectedProject(paths[0]) {
-      return []
-    }
-    return paths
+    return paths.count > 1 ? paths : []
   }
 
   func shouldShowRepoBadge(for repoPath: String?) -> Bool {
     guard let repoPath, !repoPath.isEmpty else { return false }
-    if snapshot.repoPaths.count > 1 {
-      return true
-    }
-    return !repoNameMatchesSelectedProject(repoPath)
+    return snapshot.repoPaths.count > 1
+  }
+
+  func selectProject(_ projectId: String) {
+    guard projectSnapshots.contains(where: { $0.id == projectId }) else { return }
+    applySelectedProjectId(projectId, persist: true)
   }
 
   func refresh() {
@@ -123,15 +119,20 @@ final class SnapshotStore: ObservableObject {
           $0.snapshot.actionCount > 0 || $0.snapshot.executionCount > 0 || $0.snapshot.waitingRecoveryCount > 0
         }?.id
 
-        if let savedProjectId, self.selectedProjectId != savedProjectId {
-          self.selectedProjectId = savedProjectId
-        } else if savedProjectId == nil, let activeProjectId, self.selectedProjectId != activeProjectId {
-          self.selectedProjectId = activeProjectId
-        } else if !projectIds.contains(self.selectedProjectId), let firstProject = projects.first {
-          self.selectedProjectId = firstProject.id
-        }
         self.projectSnapshots = snapshots
-        self.updateSelectedSnapshot()
+
+        if let savedProjectId, self.selectedProjectId != savedProjectId {
+          self.applySelectedProjectId(savedProjectId, persist: false)
+        } else if projectIds.contains(self.selectedProjectId) {
+          self.updateSelectedSnapshot()
+        } else if let activeProjectId {
+          self.applySelectedProjectId(activeProjectId, persist: false)
+        } else if let firstProject = projects.first {
+          self.applySelectedProjectId(firstProject.id, persist: true)
+        } else {
+          self.updateSelectedSnapshot()
+        }
+
         self.isRefreshing = false
       }
     }
@@ -167,6 +168,83 @@ final class SnapshotStore: ObservableObject {
     }
   }
 
+  func stop(_ task: TaskState) {
+    stopTasks([task])
+  }
+
+  func stopRunningTasks() {
+    stopTasks(snapshot.stoppableRunningTasks)
+  }
+
+  private func stopTasks(_ tasks: [TaskState]) {
+    let stoppableTasks = tasks.filter { isStoppableTask($0) }
+    guard !stoppableTasks.isEmpty else {
+      flash("No running tasks to stop")
+      return
+    }
+
+    let homePath = snapshot.homePath
+    isStoppingTasks = true
+    loaderQueue.async {
+      var failedTaskIds: [String] = []
+
+      for task in stoppableTasks {
+        guard let process = makeRalphProcess(homePath: homePath, commandArguments: ["stop", task.id]) else {
+          failedTaskIds.append(task.id)
+          continue
+        }
+
+        do {
+          try process.run()
+          process.waitUntilExit()
+          if process.terminationStatus != 0 {
+            failedTaskIds.append(task.id)
+          }
+        } catch {
+          failedTaskIds.append(task.id)
+        }
+      }
+
+      DispatchQueue.main.async {
+        self.isStoppingTasks = false
+        if failedTaskIds.isEmpty {
+          self.flash("Stop requested for \(stoppableTasks.count) running task\(stoppableTasks.count == 1 ? "" : "s")")
+        } else {
+          self.flash("Stop failed for \(failedTaskIds.count) task\(failedTaskIds.count == 1 ? "" : "s")")
+        }
+        self.refresh()
+      }
+    }
+  }
+
+  func toggleSchedulingPause() {
+    let homePath = snapshot.homePath
+    let shouldResume = snapshot.isSchedulingPaused
+    let command = shouldResume ? "resume" : "pause"
+    isTogglingPause = true
+
+    loaderQueue.async {
+      var succeeded = false
+      if let process = makeRalphProcess(homePath: homePath, commandArguments: [command]) {
+        do {
+          try process.run()
+          process.waitUntilExit()
+          succeeded = process.terminationStatus == 0
+        } catch {
+          succeeded = false
+        }
+      }
+
+      DispatchQueue.main.async {
+        self.isTogglingPause = false
+        self.flash(succeeded
+          ? (shouldResume ? "Queue resumed" : "Queue paused")
+          : (shouldResume ? "Resume failed" : "Pause failed"))
+        self.refresh()
+      }
+    }
+  }
+
   private func flash(_ message: String) {
     flashMessage = message
     DispatchQueue.main.asyncAfter(deadline: .now() + 3.0) {
@@ -190,6 +268,16 @@ final class SnapshotStore: ObservableObject {
     snapshot = Snapshot.empty(homePath: expandPath(config.ralphHome))
   }
 
+  private func applySelectedProjectId(_ projectId: String, persist: Bool) {
+    if selectedProjectId != projectId {
+      selectedProjectId = projectId
+    }
+    updateSelectedSnapshot()
+    if persist {
+      persistSelectedProjectSelection()
+    }
+  }
+
   private func persistSelectedProjectSelection() {
     guard config.selectedProjectId != selectedProjectId else { return }
     var nextConfig = config
@@ -198,9 +286,6 @@ final class SnapshotStore: ObservableObject {
     configStore.save(nextConfig)
   }
 
-  private func repoNameMatchesSelectedProject(_ repoPath: String) -> Bool {
-    shortRepoName(repoPath).caseInsensitiveCompare(selectedProjectName) == .orderedSame
-  }
 }
 
 struct RalphMenuBarView: View {
@@ -225,11 +310,11 @@ struct RalphMenuBarView: View {
         }
         .padding(16)
       }
-      .scrollIndicators(.never)
+      .scrollIndicators(.visible)
 
       footer
     }
-    .frame(width: 468, height: 620)
+    .frame(width: 540, height: 720)
     .background(
       ZStack {
         Color(nsColor: NSColor.windowBackgroundColor)
@@ -398,9 +483,12 @@ struct RalphMenuBarView: View {
             VStack(alignment: .leading, spacing: 2) {
               Text(healthHeadline)
                 .font(.system(size: 17, weight: .semibold))
+                .lineLimit(1)
               Text(healthDetail)
                 .font(.system(size: 12, weight: .medium))
                 .foregroundStyle(.secondary)
+                .lineLimit(1)
+                .truncationMode(.tail)
             }
           }
         }
@@ -411,21 +499,17 @@ struct RalphMenuBarView: View {
           Text(store.isRefreshing ? "Refreshing" : "Updated \(relativeTimestamp(store.snapshot.generatedAt.timeIntervalSince1970 * 1000))")
             .font(.system(size: 11, weight: .medium))
             .foregroundStyle(.secondary)
+            .lineLimit(1)
           Text(abbreviatedPath(store.snapshot.homePath))
             .font(.system(size: 11, weight: .medium, design: .monospaced))
             .foregroundStyle(.secondary)
+            .lineLimit(1)
+            .truncationMode(.middle)
         }
       }
 
       if store.projectSnapshots.count > 1 {
-        Picker("Project", selection: $store.selectedProjectId) {
-          ForEach(store.projectSnapshots) { projectSnapshot in
-            Text(projectSnapshot.project.name)
-              .tag(projectSnapshot.id)
-          }
-        }
-        .pickerStyle(.segmented)
-        .labelsHidden()
+        projectSelector
       }
 
       summaryPills
@@ -445,6 +529,40 @@ struct RalphMenuBarView: View {
         }
       }
     }
+  }
+
+  private var projectSelector: some View {
+    ScrollView(.horizontal) {
+      HStack(spacing: 8) {
+        ForEach(store.projectSnapshots) { projectSnapshot in
+          Button {
+            store.selectProject(projectSnapshot.id)
+          } label: {
+            HStack(spacing: 6) {
+              if projectSnapshot.id == store.selectedProjectId {
+                Image(systemName: "checkmark.circle.fill")
+                  .font(.system(size: 11, weight: .semibold))
+              }
+              Text(projectSnapshot.project.name)
+                .font(.system(size: 12, weight: .semibold))
+                .lineLimit(1)
+                .truncationMode(.tail)
+            }
+            .padding(.horizontal, 10)
+            .padding(.vertical, 7)
+            .foregroundStyle(projectSnapshot.id == store.selectedProjectId ? .white : .primary)
+            .background(
+              Capsule(style: .continuous)
+                .fill(projectSnapshot.id == store.selectedProjectId ? Color.accentColor : Color.primary.opacity(0.07))
+            )
+          }
+          .buttonStyle(.plain)
+          .help(projectSnapshot.project.ralphHome)
+        }
+      }
+      .padding(.vertical, 1)
+    }
+    .scrollIndicators(.hidden)
   }
 
   private var summaryPills: some View {
@@ -467,8 +585,24 @@ struct RalphMenuBarView: View {
 
   private var footer: some View {
     HStack(spacing: 10) {
-      ToolbarButton(label: "Open Home", systemImage: "folder") {
+      ToolbarButton(label: "Home", systemImage: "folder") {
         store.openPath(store.snapshot.homePath)
+      }
+      ToolbarButton(
+        label: store.isTogglingPause
+          ? (store.snapshot.isSchedulingPaused ? "Resuming" : "Pausing")
+          : (store.snapshot.isSchedulingPaused ? "Resume" : "Pause"),
+        systemImage: store.snapshot.isSchedulingPaused ? "play.fill" : "pause.fill",
+        disabled: store.isTogglingPause
+      ) {
+        store.toggleSchedulingPause()
+      }
+      ToolbarButton(
+        label: store.isStoppingTasks ? "Stopping" : "Stop",
+        systemImage: "stop.fill",
+        disabled: store.snapshot.stoppableRunningTasks.isEmpty || store.isStoppingTasks
+      ) {
+        store.stopRunningTasks()
       }
       ToolbarButton(label: "Refresh", systemImage: "arrow.clockwise") {
         store.refresh()
@@ -490,7 +624,7 @@ struct RalphMenuBarView: View {
     if !store.snapshot.loadErrors.isEmpty {
       return store.snapshot.loadErrors.first
     }
-    if store.snapshot.managerCodeDriftDetected {
+    if managerNeedsRestart {
       return store.snapshot.managerMessage ?? "Manager is running older Ralph code than what is on disk."
     }
     if store.snapshot.managerIsStale {
@@ -501,6 +635,9 @@ struct RalphMenuBarView: View {
     }
     if store.snapshot.managerState == nil {
       return "Manager state is missing for this Ralph home."
+    }
+    if store.snapshot.isSchedulingPaused {
+      return "Manager scheduling is paused for this Ralph home."
     }
     if store.snapshot.awaitingApprovalCount > 0 {
       return "\(store.snapshot.awaitingApprovalCount) task\(store.snapshot.awaitingApprovalCount == 1 ? "" : "s") awaiting approval."
@@ -514,18 +651,22 @@ struct RalphMenuBarView: View {
   private var criticalTone: Color {
     if !store.snapshot.loadErrors.isEmpty
       || store.snapshot.managerState == nil
-      || store.snapshot.managerCodeDriftDetected
+      || managerNeedsRestart
       || (store.snapshot.managerState != nil && !store.snapshot.managerIsActive) {
       return .red
     }
     return .orange
   }
 
+  private var managerNeedsRestart: Bool {
+    store.snapshot.managerIsActive && store.snapshot.managerCodeDriftDetected
+  }
+
   private var healthHeadline: String {
     if !store.snapshot.loadErrors.isEmpty {
       return "Load issues detected"
     }
-    if store.snapshot.managerCodeDriftDetected {
+    if managerNeedsRestart {
       return "Manager restart required"
     }
     if store.snapshot.managerIsStale {
@@ -533,6 +674,9 @@ struct RalphMenuBarView: View {
     }
     if store.snapshot.managerState != nil && !store.snapshot.managerIsActive {
       return "Manager inactive"
+    }
+    if store.snapshot.isSchedulingPaused {
+      return "Queue paused"
     }
     if store.snapshot.awaitingApprovalCount > 0 {
       return "\(store.snapshot.awaitingApprovalCount) awaiting approval"
@@ -567,7 +711,11 @@ struct RalphMenuBarView: View {
   }
 
   private var healthDetail: String {
-    if store.snapshot.managerCodeDriftDetected, let message = store.snapshot.managerMessage {
+    if store.snapshot.isSchedulingPaused {
+      return store.snapshot.managerControl?.pauseReason
+        ?? "\(store.selectedProjectName) · scheduling paused"
+    }
+    if managerNeedsRestart, let message = store.snapshot.managerMessage {
       return message
     }
     if let manager = store.snapshot.managerState, let heartbeat = manager.lastHeartbeatAt {
@@ -579,9 +727,12 @@ struct RalphMenuBarView: View {
   private var healthSymbol: String {
     if !store.snapshot.loadErrors.isEmpty
       || store.snapshot.managerState == nil
-      || store.snapshot.managerCodeDriftDetected
+      || managerNeedsRestart
       || (store.snapshot.managerState != nil && !store.snapshot.managerIsActive) {
       return "exclamationmark.octagon.fill"
+    }
+    if store.snapshot.isSchedulingPaused {
+      return "pause.circle.fill"
     }
     if store.snapshot.managerIsStale || store.snapshot.actionCount > 0 {
       return "exclamationmark.triangle.fill"
@@ -598,7 +749,7 @@ struct RalphMenuBarView: View {
   private var healthTint: Color {
     if !store.snapshot.loadErrors.isEmpty
       || store.snapshot.managerState == nil
-      || store.snapshot.managerCodeDriftDetected
+      || managerNeedsRestart
       || (store.snapshot.managerState != nil && !store.snapshot.managerIsActive) {
       return .red
     }
@@ -647,16 +798,25 @@ func isBlockStyle(_ style: TaskSectionStyle) -> Bool {
 struct ToolbarButton: View {
   let label: String
   let systemImage: String
+  var disabled = false
   let action: () -> Void
 
   var body: some View {
     Button(action: action) {
-      Label(label, systemImage: systemImage)
+      HStack(spacing: 5) {
+        Image(systemName: systemImage)
+        Text(label)
+          .lineLimit(1)
+          .fixedSize(horizontal: true, vertical: false)
+      }
         .font(.system(size: 12, weight: .medium))
-        .frame(minWidth: 0)
+        .frame(minWidth: 68)
     }
     .buttonStyle(.bordered)
     .controlSize(.small)
+    .disabled(disabled)
+    .opacity(disabled ? 0.55 : 1)
+    .help(label)
   }
 }
 
@@ -1221,6 +1381,7 @@ struct TaskRowView: View {
         Button(action: primaryAction.action) {
           Label(primaryAction.title, systemImage: primaryAction.systemImage)
             .font(.system(size: 12, weight: .medium))
+            .lineLimit(1)
         }
         .buttonStyle(.borderedProminent)
         .controlSize(.small)
@@ -1335,6 +1496,10 @@ struct TaskRowView: View {
   }
 
   private var primaryAction: (title: String, systemImage: String, action: () -> Void)? {
+    if isStoppableTask(task) {
+      return ("Stop", "stop.fill", { store.stop(task) })
+    }
+
     if isRecoveryPlanningTask(task) {
       if task.prdPath != nil {
         return ("Open PRD", "doc.text", { store.openPath(task.prdPath) })

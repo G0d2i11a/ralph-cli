@@ -69,7 +69,7 @@ function normalizeTaskStatus(status: TaskStatus): PrdInventoryStatus {
     return 'queued';
   }
 
-  if (status === 'failed' || status === 'failed_finalize' || status === 'stagnant') {
+  if (status === 'failed' || status === 'failed_finalize' || status === 'stagnant' || status === 'archived') {
     return 'failed';
   }
 

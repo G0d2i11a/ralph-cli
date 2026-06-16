@@ -32,6 +32,8 @@ export interface RalphConfig {
     transientRecoveryDeadlineSeconds: number;
     maxTransientRecoverySameSignature: number;
     transientRecoveryProgressAwareSameSignature: boolean;
+    transientRateLimitCircuitBreakerEnabled: boolean;
+    transientRateLimitCircuitBreakerSameSignatureLimit: number;
     autoRecoveryHardCap: number;
     autoRemediateFailedBlockers: boolean;
     maxFailedBlockerStoryRequeues: number;
@@ -41,6 +43,7 @@ export interface RalphConfig {
     maxStoryRepairRequeues: number;
     storyRepairRecoveryDeadlineSeconds: number;
     storyRepairRecoveryHardCap: number;
+    maxGeneratedFollowupDepth: number;
     autoRemediateAgentContextFailures: boolean;
     maxAgentContextRecoveryRequeues: number;
     agentContextRecoveryDeadlineSeconds: number;
@@ -98,6 +101,8 @@ export interface RalphConfig {
     };
     worktrees: {
       enabled: boolean;
+      cleanTerminalRetentionHours: number;
+      cleanTerminalSweepIntervalSeconds: number;
       completedRetentionHours: number;
       failedRetentionHours: number;
       failedFinalizeRetentionHours: number;
@@ -105,8 +110,12 @@ export interface RalphConfig {
       targetSyncDeferredRetentionHours: number;
       orphanRetentionHours: number;
       cleanupOrphans: boolean;
+      keepNewestCleanPerRepo: number;
+      keepNewestDirtyPerRepo: number;
       keepNewestPerRepo: number;
       maxRemovalsPerRun: number;
+      pressureMaxRemovalsPerRun: number;
+      pressureEmergencyMaxRemovalsPerRun: number;
       removeDirtyFailedWorktrees: boolean;
       dirtyTerminalMode: DirtyWorktreeReclamationMode;
       dirtyOrphanMode: DirtyWorktreeReclamationMode;
@@ -195,19 +204,19 @@ const DEFAULT_CONFIG: RalphConfig = {
     path: 'codex',
     agentRunnersPath: process.env.RALPH_AGENT_RUNNERS_CLI || process.env.RALPH_SDK_RUNNER_CLI || '',
     sdkRunnerPath: process.env.RALPH_SDK_RUNNER_CLI || '',
-    timeout: 600,
+    timeout: 0,
     extendIdleTimeoutForLongRunningCommands: true,
     longRunningCommandPatterns: ['next build', 'pnpm run build', 'npm run build', 'yarn build', 'turbo build', 'tsc'],
-    model: 'claude-opus-4-6-thinking-xchai',
+    model: '',
     codexConversationScope: 'story',
   },
   runner: {
     maxConcurrent: 3,
-    stagnationTimeout: 1800,
+    stagnationTimeout: 0,
     pollInterval: 10,
     leaseTimeout: 300,
-    maxStoryAttempts: 2,
-    maxTransientRetriesPerStory: 3,
+    maxStoryAttempts: 0,
+    maxTransientRetriesPerStory: 0,
     transientRetryBaseDelaySeconds: 15,
     transientRetryMaxDelaySeconds: 180,
     maxTransientRecoveryRequeues: 5,
@@ -216,6 +225,8 @@ const DEFAULT_CONFIG: RalphConfig = {
     transientRecoveryDeadlineSeconds: 7200,
     maxTransientRecoverySameSignature: 3,
     transientRecoveryProgressAwareSameSignature: true,
+    transientRateLimitCircuitBreakerEnabled: true,
+    transientRateLimitCircuitBreakerSameSignatureLimit: 2,
     autoRecoveryHardCap: 20,
     autoRemediateFailedBlockers: true,
     maxFailedBlockerStoryRequeues: 1,
@@ -225,6 +236,7 @@ const DEFAULT_CONFIG: RalphConfig = {
     maxStoryRepairRequeues: 1,
     storyRepairRecoveryDeadlineSeconds: 7200,
     storyRepairRecoveryHardCap: 2,
+    maxGeneratedFollowupDepth: 1,
     autoRemediateAgentContextFailures: true,
     maxAgentContextRecoveryRequeues: 1,
     agentContextRecoveryDeadlineSeconds: 7200,
@@ -282,6 +294,8 @@ const DEFAULT_CONFIG: RalphConfig = {
     },
     worktrees: {
       enabled: true,
+      cleanTerminalRetentionHours: 0,
+      cleanTerminalSweepIntervalSeconds: 30,
       completedRetentionHours: 24,
       failedRetentionHours: 168,
       failedFinalizeRetentionHours: 168,
@@ -289,8 +303,12 @@ const DEFAULT_CONFIG: RalphConfig = {
       targetSyncDeferredRetentionHours: 72,
       orphanRetentionHours: 24,
       cleanupOrphans: true,
-      keepNewestPerRepo: 5,
+      keepNewestCleanPerRepo: 0,
+      keepNewestDirtyPerRepo: 5,
+      keepNewestPerRepo: 0,
       maxRemovalsPerRun: 25,
+      pressureMaxRemovalsPerRun: 100,
+      pressureEmergencyMaxRemovalsPerRun: 250,
       removeDirtyFailedWorktrees: false,
       dirtyTerminalMode: 'archive_only',
       dirtyOrphanMode: 'retain',

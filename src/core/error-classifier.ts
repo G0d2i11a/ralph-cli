@@ -46,7 +46,12 @@ export function classifyAgentFailureOutput(output: string): ErrorClassification 
     };
   }
 
-  if (/rate limit|too many requests|retry after/i.test(normalized)) {
+  if (
+    /rate limit|too many requests|retry after/i.test(normalized)
+    || /(?:you(?:'|’)ve|you have) hit your usage limit/i.test(normalized)
+    || /try again at \d{1,2}:\d{2}\s*(?:am|pm)?/i.test(normalized)
+    || /\b429\b/.test(normalized)
+  ) {
     return {
       kind: 'backend_rate_limited',
       class: 'transient_backend',
@@ -122,7 +127,7 @@ export function classifyAgentFailureOutput(output: string): ErrorClassification 
     };
   }
 
-  if (/unauthorized|forbidden|permission|api key|authentication|login required/i.test(normalized)) {
+  if (/unauthorized|forbidden|permission|api key|authentication|login required|auth[_ -]?unavailable|no auth available/i.test(normalized)) {
     return {
       kind: 'auth_or_config_error',
       class: 'unknown',

@@ -1,0 +1,1335 @@
+diff --git a/src/config/manager.ts b/src/config/manager.ts
+--- a/src/config/manager.ts
++++ b/src/config/manager.ts
+@@ -95,6 +95,8 @@ export interface RalphConfig {
+       skipUnmerged: boolean;
+       skipStatusErrors: boolean;
+       skipSubmoduleChanges: boolean;
++      pruneDuplicateArchives: boolean;
++      maxArchivesPerTask: number;
+     };
+     worktrees: {
+       enabled: boolean;
+@@ -105,6 +107,11 @@ export interface RalphConfig {
+       failedFinalizeRetentionHours: number;
+       stagnantRetentionHours: number;
+       targetSyncDeferredRetentionHours: number;
++      dirtyCompletedIntegratedSyncedRetentionHours: number;
++      dirtyCompletedIntegratedDisabledRetentionHours: number;
++      dirtyCompletedIntegratedDeferredRetentionHours: number;
++      reclaimDirtyCompletedIntegratedUnderPressure: boolean;
++      protectNewestDirtyAttentionOnly: boolean;
+       orphanRetentionHours: number;
+       cleanupOrphans: boolean;
+       keepNewestCleanPerRepo: number;
+@@ -145,6 +152,8 @@ export interface RalphConfig {
+       logPath: string;
+       writeLastRun: boolean;
+       emitTaskEvents: boolean;
++      maxJsonlBytes: number;
++      maxJsonlFiles: number;
+     };
+   };
+   ingestion: {
+@@ -285,6 +294,8 @@ const DEFAULT_CONFIG: RalphConfig = {
+       skipUnmerged: true,
+       skipStatusErrors: true,
+       skipSubmoduleChanges: true,
++      pruneDuplicateArchives: true,
++      maxArchivesPerTask: 1,
+     },
+     worktrees: {
+       enabled: true,
+@@ -295,6 +306,11 @@ const DEFAULT_CONFIG: RalphConfig = {
+       failedFinalizeRetentionHours: 168,
+       stagnantRetentionHours: 168,
+       targetSyncDeferredRetentionHours: 72,
++      dirtyCompletedIntegratedSyncedRetentionHours: 0,
++      dirtyCompletedIntegratedDisabledRetentionHours: 24,
++      dirtyCompletedIntegratedDeferredRetentionHours: 72,
++      reclaimDirtyCompletedIntegratedUnderPressure: true,
++      protectNewestDirtyAttentionOnly: true,
+       orphanRetentionHours: 24,
+       cleanupOrphans: true,
+       keepNewestCleanPerRepo: 0,
+@@ -335,6 +351,8 @@ const DEFAULT_CONFIG: RalphConfig = {
+       logPath: '',
+       writeLastRun: true,
+       emitTaskEvents: true,
++      maxJsonlBytes: 50 * 1024 * 1024,
++      maxJsonlFiles: 5,
+     },
+   },
+   ingestion: {
+diff --git a/src/core/reclamation-evidence.ts b/src/core/reclamation-evidence.ts
+--- a/src/core/reclamation-evidence.ts
++++ b/src/core/reclamation-evidence.ts
+@@ -55,6 +55,10 @@ export interface ReclamationEvidenceManifest {
+     head?: string;
+     baseCommitSha?: string;
+   };
++  fingerprint?: {
++    algorithm: 'ralph-worktree-dirty-v1';
++    sha256: string;
++  };
+   decision: ReclamationDecision;
+   taskSnapshot?: Task;
+   inspection?: WorktreeInspection;
+@@ -140,6 +144,33 @@ function isPathInside(parentPath: string, candidatePath: string): boolean {
+   return relative === '' || (!relative.startsWith('..') && !path.isAbsolute(relative));
+ }
+
++function readJsonFile<T = unknown>(filePath: string): T | undefined {
++  try {
++    return JSON.parse(fs.readFileSync(filePath, 'utf-8')) as T;
++  } catch {
++    return undefined;
++  }
++}
++
++function safeRealPath(filePath: string): string | undefined {
++  try {
++    return fs.realpathSync(filePath);
++  } catch {
++    return undefined;
++  }
++}
++
++function manifestMatchesCandidate(
++  manifest: ReclamationEvidenceManifest,
++  candidate: ReclamationEvidenceCandidate,
++): boolean {
++  return manifest.complete === true
++    && manifest.candidate?.kind === candidate.kind
++    && manifest.candidate?.taskId === candidate.taskId
++    && path.resolve(manifest.candidate?.repoPath || '') === path.resolve(candidate.repoPath)
++    && path.resolve(manifest.candidate?.worktree || '') === path.resolve(candidate.worktree);
++}
++
+ export class WorktreeEvidenceArchiver {
+   private readonly ralphHome: string;
+   private readonly configManager: Pick<ConfigManager, 'get'>;
+@@ -153,6 +184,152 @@ export class WorktreeEvidenceArchiver {
+     this.now = deps.now ?? (() => Date.now());
+   }
+
++  getEvidenceRoot(): string {
++    return resolveEvidenceRoot(this.ralphHome, this.configManager.get('reclamation.evidence.dir'));
++  }
++
++  isManagedManifestPath(manifestPath: string): boolean {
++    const evidenceRoot = this.getEvidenceRoot();
++    const resolvedRoot = safeRealPath(evidenceRoot) ?? path.resolve(evidenceRoot);
++    const resolvedManifest = safeRealPath(manifestPath) ?? path.resolve(manifestPath);
++    return isPathInside(resolvedRoot, resolvedManifest)
++      && path.basename(resolvedManifest) === 'manifest.json'
++      && !path.relative(resolvedRoot, resolvedManifest).split(path.sep).includes('.tmp');
++  }
++
++  measureDirectoryBytesBestEffort(dir: string): number | undefined {
++    try {
++      return this.measureDirectoryBytes(dir);
++    } catch {
++      return undefined;
++    }
++  }
++
++  async computeDirtyFingerprint(candidate: ReclamationEvidenceCandidate): Promise<string> {
++    const status = await this.worktreeManager.getWorktreeStatusPorcelainV2(candidate.worktree);
++    const diff = await this.worktreeManager.getWorktreeDiffPatch(candidate.worktree);
++    const cachedDiff = await this.worktreeManager.getWorktreeCachedDiffPatch(candidate.worktree);
++    const untrackedFiles = await this.worktreeManager.listUntrackedFiles(candidate.worktree);
++    const maxSingleUntrackedFileBytes = getNumber(
++      this.configManager.get('reclamation.evidence.maxSingleUntrackedFileBytes'),
++      10 * 1024 * 1024,
++    );
++    const worktreeRealPath = safeRealPath(candidate.worktree) ?? path.resolve(candidate.worktree);
++    const untrackedFingerprints = untrackedFiles.slice().sort().map((relativeFile) => {
++      const absoluteFile = path.resolve(candidate.worktree, relativeFile);
++      const realParent = safeRealPath(path.dirname(absoluteFile)) ?? path.resolve(path.dirname(absoluteFile));
++      if (!isPathInside(worktreeRealPath, realParent) || !fs.existsSync(absoluteFile)) {
++        return { path: relativeFile, missing: true };
++      }
++
++      const stat = fs.lstatSync(absoluteFile);
++      if (!stat.isFile()) {
++        return {
++          path: relativeFile,
++          type: stat.isDirectory() ? 'directory' : stat.isSymbolicLink() ? 'symlink' : 'other',
++          size: stat.size,
++          mtimeMs: stat.mtimeMs,
++          ctimeMs: stat.ctimeMs,
++        };
++      }
++
++      if (stat.size <= Math.max(0, maxSingleUntrackedFileBytes)) {
++        return {
++          path: relativeFile,
++          type: 'file',
++          size: stat.size,
++          sha256: sha256(fs.readFileSync(absoluteFile)),
++        };
++      }
++
++      return {
++        path: relativeFile,
++        type: 'large_file',
++        size: stat.size,
++        mtimeMs: stat.mtimeMs,
++        ctimeMs: stat.ctimeMs,
++      };
++    });
++
++    const payload = {
++      algorithm: 'ralph-worktree-dirty-v1',
++      taskId: candidate.taskId,
++      status: candidate.status,
++      repoPath: path.resolve(candidate.repoPath),
++      worktree: path.resolve(candidate.worktree),
++      branch: candidate.inspection?.branch,
++      head: candidate.inspection?.head,
++      statusSha256: sha256(Buffer.from(status, 'utf-8')),
++      diffSha256: sha256(Buffer.from(diff, 'utf-8')),
++      cachedDiffSha256: sha256(Buffer.from(cachedDiff, 'utf-8')),
++      untrackedFingerprints,
++    };
++
++    return sha256(Buffer.from(JSON.stringify(payload), 'utf-8'));
++  }
++
++  pruneTaskEvidenceArchives(
++    candidate: ReclamationEvidenceCandidate,
++    options: { keepManifestPath: string; keepNewest: number },
++  ): void {
++    const evidenceRoot = this.getEvidenceRoot();
++    const resolvedRoot = safeRealPath(evidenceRoot) ?? path.resolve(evidenceRoot);
++    const keepManifestPath = path.resolve(options.keepManifestPath);
++    const keepCount = Math.max(1, Math.floor(getNumber(options.keepNewest, 1)));
++    const manifests: Array<{ manifestPath: string; dir: string; createdAt: number }> = [];
++
++    const visit = (dir: string) => {
++      if (!fs.existsSync(dir)) {
++        return;
++      }
++
++      for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
++        const absolutePath = path.join(dir, entry.name);
++        if (!entry.isDirectory()) {
++          continue;
++        }
++
++        if (entry.name === '.tmp') {
++          continue;
++        }
++
++        const manifestPath = path.join(absolutePath, 'manifest.json');
++        if (fs.existsSync(manifestPath)) {
++          const manifest = readJsonFile<ReclamationEvidenceManifest>(manifestPath);
++          const resolvedDir = safeRealPath(absolutePath) ?? path.resolve(absolutePath);
++          if (
++            manifest
++            && manifestMatchesCandidate(manifest, candidate)
++            && isPathInside(resolvedRoot, resolvedDir)
++            && resolvedDir !== resolvedRoot
++          ) {
++            const createdAt = Date.parse(manifest.createdAt || '') || fs.statSync(manifestPath).mtimeMs;
++            manifests.push({ manifestPath: path.resolve(manifestPath), dir: absolutePath, createdAt });
++          }
++          continue;
++        }
++
++        visit(absolutePath);
++      }
++    };
++
++    visit(evidenceRoot);
++
++    const deletable = manifests
++      .filter((entry) => path.resolve(entry.manifestPath) !== keepManifestPath)
++      .sort((a, b) => b.createdAt - a.createdAt)
++      .slice(Math.max(0, keepCount - 1));
++
++    for (const entry of deletable) {
++      const resolvedDir = safeRealPath(entry.dir) ?? path.resolve(entry.dir);
++      if (!isPathInside(resolvedRoot, resolvedDir) || resolvedDir === resolvedRoot) {
++        continue;
++      }
++
++      fs.rmSync(entry.dir, { recursive: true, force: true });
++    }
++  }
++
+   async archive(
+     candidate: ReclamationEvidenceCandidate,
+     decision: ReclamationDecision,
+@@ -164,18 +340,21 @@ export class WorktreeEvidenceArchiver {
+
+     const createdAt = new Date(this.now()).toISOString();
+     const dateSegment = createdAt.slice(0, 10);
+-    const id = this.buildArchiveId(candidate);
+-    const evidenceRoot = resolveEvidenceRoot(this.ralphHome, this.configManager.get('reclamation.evidence.dir'));
+-    const tempDir = this.uniqueFinalDir(path.join(evidenceRoot, '.tmp', id));
+-    const finalDir = this.uniqueFinalDir(path.join(evidenceRoot, dateSegment, id));
++    const evidenceRoot = this.getEvidenceRoot();
+     const artifacts: ReclamationEvidenceArtifact[] = [];
+     const maxBytesPerCandidate = getNumber(this.configManager.get('reclamation.evidence.maxBytesPerCandidate'), 100 * 1024 * 1024);
+     const maxUntrackedFiles = getNumber(this.configManager.get('reclamation.evidence.maxUntrackedFiles'), 500);
+     const maxUntrackedBytes = getNumber(this.configManager.get('reclamation.evidence.maxUntrackedBytes'), 50 * 1024 * 1024);
+     const maxSingleUntrackedFileBytes = getNumber(this.configManager.get('reclamation.evidence.maxSingleUntrackedFileBytes'), 10 * 1024 * 1024);
+     const logTailBytes = getNumber(this.configManager.get('reclamation.evidence.logTailBytes'), 256 * 1024);
++    let tempDir = '';
+
+     try {
++      const fingerprintSha = await this.computeDirtyFingerprint(candidate);
++      const id = this.buildArchiveId(candidate, fingerprintSha);
++      tempDir = this.uniqueFinalDir(path.join(evidenceRoot, '.tmp', id));
++      const finalDir = this.uniqueFinalDir(path.join(evidenceRoot, dateSegment, id));
++
+       fs.mkdirSync(tempDir, { recursive: true });
+
+       const writeBuffer = (
+@@ -314,6 +492,6 @@ export class WorktreeEvidenceArchiver {
+       if (bytes > maxBytesPerCandidate) {
+         const manifestPath = path.join(tempDir, 'manifest.json');
+-        const manifest = this.buildManifest(id, candidate, decision, options.mode ?? 'manual', createdAt, false, artifacts, {
++        const manifest = this.buildManifest(id, candidate, decision, options.mode ?? 'manual', createdAt, false, artifacts, fingerprintSha, {
+           maxBytesPerCandidate,
+           maxUntrackedFiles,
+           maxUntrackedBytes,
+@@ -333,7 +511,7 @@ export class WorktreeEvidenceArchiver {
+         };
+       }
+
+-      const manifest = this.buildManifest(id, candidate, decision, options.mode ?? 'manual', createdAt, true, artifacts, {
++      const manifest = this.buildManifest(id, candidate, decision, options.mode ?? 'manual', createdAt, true, artifacts, fingerprintSha, {
+         maxBytesPerCandidate,
+         maxUntrackedFiles,
+         maxUntrackedBytes,
+@@ -365,11 +543,11 @@ export class WorktreeEvidenceArchiver {
+     }
+   }
+
+-  private buildArchiveId(candidate: ReclamationEvidenceCandidate): string {
++  private buildArchiveId(candidate: ReclamationEvidenceCandidate, fingerprintSha: string): string {
+     const status = sanitizePathSegment(String(candidate.status ?? 'unknown'));
+     const identity = sanitizePathSegment(candidate.taskId ?? path.basename(candidate.worktree));
+     const head = candidate.inspection?.head ? `-${candidate.inspection.head.slice(0, 12)}` : '';
+-    return `${identity}-${status}-${this.now()}${head}`;
++    return `${identity}-${status}${head}-${fingerprintSha.slice(0, 16)}`;
+   }
+
+   private uniqueFinalDir(baseDir: string): string {
+@@ -411,6 +589,7 @@ export class WorktreeEvidenceArchiver {
+     createdAt: string,
+     complete: boolean,
+     artifacts: ReclamationEvidenceArtifact[],
++    fingerprintSha: string,
+     limits: ReclamationEvidenceManifest['limits'],
+   ): ReclamationEvidenceManifest {
+     return {
+@@ -429,6 +608,10 @@ export class WorktreeEvidenceArchiver {
+         head: candidate.inspection?.head,
+         baseCommitSha: candidate.task?.baseCommitSha,
+       },
++      fingerprint: {
++        algorithm: 'ralph-worktree-dirty-v1',
++        sha256: fingerprintSha,
++      },
+       decision,
+       taskSnapshot: candidate.task,
+       inspection: candidate.inspection,
+diff --git a/src/core/reclamation.ts b/src/core/reclamation.ts
+--- a/src/core/reclamation.ts
++++ b/src/core/reclamation.ts
+@@ -4,8 +4,8 @@ import { ConfigManager, DirtyWorktreeReclamationMode } from '../config/manager';
+ import { Task, TaskErrorClass, TaskStatus } from '../types/task';
+ import { appendTaskEvent } from './events';
+ import { withDirectoryLock } from './locks';
+ import { getRalphPaths, RalphHomeOptions, resolveRalphHome } from './paths';
+-import { EvidenceArchiveResult, WorktreeEvidenceArchiver } from './reclamation-evidence';
++import { EvidenceArchiveResult, ReclamationEvidenceManifest, WorktreeEvidenceArchiver } from './reclamation-evidence';
+ import {
+   ReclamationAttentionState,
+   ReclamationDecision,
+@@ -188,6 +188,14 @@ function isPathInside(parentPath: string, candidatePath: string): boolean {
+   return relative === '' || (!relative.startsWith('..') && !path.isAbsolute(relative));
+ }
+
++function readJsonFile<T = unknown>(filePath: string): T | undefined {
++  try {
++    return JSON.parse(fs.readFileSync(filePath, 'utf-8')) as T;
++  } catch {
++    return undefined;
++  }
++}
++
+ function getTaskFinishedAt(task: Task): number {
+   return task.endTime ?? task.updatedAt ?? task.startTime;
+ }
+@@ -435,6 +443,9 @@ export class ReclamationService {
+         );
+         this.retainNewest(
+-          repoCandidates.filter((candidate) => candidate.inspection?.dirty),
++          repoCandidates.filter((candidate) =>
++            candidate.inspection?.dirty
++            && this.shouldProtectByNewestDirtyRetention(candidate, options)
++          ),
+           keepNewestDirtyPerRepo,
+           'keep_newest_dirty_per_repo',
+         );
+@@ -538,13 +549,5 @@ export class ReclamationService {
+
+     if (decision.action === 'archive_only' || decision.action === 'archive_then_reclaim') {
+-      const archiveLimit = Math.max(0, getNumber(this.configManager.get('reclamation.worktrees.maxDirtyArchivesPerRun'), 10));
+-      if (!options.dryRun && this.countDirtyArchived(report) >= archiveLimit) {
+-        result.reason = 'dirty_archive_limit_reached';
+-        report.skipped.push(result);
+-        report.worktrees.skipped++;
+-        return;
+-      }
+-
+       if (options.dryRun) {
+         if (decision.action === 'archive_only') {
+           result.reason = 'dirty_worktree_would_archive';
+@@ -548,8 +556,23 @@ export class ReclamationService {
+           report.worktrees.skipped++;
+           return;
+         }
+       } else {
+-        const evidence = await this.evidenceArchiver.archive(candidate, decision, { mode: options.mode });
++        let evidence = await this.findReusableDirtyEvidence(candidate, decision);
++        const reusedEvidence = Boolean(evidence);
++
++        if (!evidence) {
++          const archiveLimit = Math.max(0, getNumber(this.configManager.get('reclamation.worktrees.maxDirtyArchivesPerRun'), 10));
++          if (this.countDirtyArchived(report) >= archiveLimit) {
++            result.reason = 'dirty_archive_limit_reached';
++            report.skipped.push(result);
++            report.worktrees.skipped++;
++            return;
++          }
++
++          evidence = await this.evidenceArchiver.archive(candidate, decision, { mode: options.mode });
++          report.worktrees.archived++;
++        }
++
+         candidate.evidence = evidence;
+         result.evidencePath = evidence.dir;
+         result.evidenceManifestPath = evidence.manifestPath;
+@@ -569,13 +588,19 @@ export class ReclamationService {
+           return;
+         }
+
+-        report.worktrees.archived++;
++        if (!reusedEvidence && decision.action === 'archive_then_reclaim') {
++          await this.recordTaskWorktreeArchived(candidate, evidence, report, decision);
++        }
+
+         if (decision.action === 'archive_only') {
+-          result.reason = this.getArchiveOnlyReason(decision);
++          result.reason = reusedEvidence
++            ? 'dirty_worktree_evidence_already_archived'
++            : this.getArchiveOnlyReason(decision);
+           report.skipped.push(result);
+           report.worktrees.skipped++;
+-          await this.recordTaskWorktreeArchived(candidate, evidence, report, decision);
++          if (!reusedEvidence) {
++            await this.recordTaskWorktreeArchived(candidate, evidence, report, decision);
++          }
+           return;
+         }
+       }
+@@ -633,6 +651,7 @@ export class ReclamationService {
+     report.removed++;
+     report.worktrees.removed++;
+     await this.recordTaskWorktreeReclaimed(candidate, report);
++    await this.pruneDuplicateEvidenceArchives(candidate, decision, report);
+   }
+
+   private decideWorktreeReclamation(
+@@ -660,10 +679,21 @@ export class ReclamationService {
+       };
+     }
+
+-    const mode = this.getDirtyReclamationMode(candidate, options);
++    let mode = this.getDirtyReclamationMode(candidate, options);
+     const attentionState = this.classifyWorktreeAttention(candidate, options);
+     const safetyGates = this.getDirtySafetyGates(candidate, attentionState, options);
+
++    if (
++      mode === 'archive_only'
++      && this.shouldAutoReclaimDirtyCompletedIntegrated(candidate, attentionState, options)
++    ) {
++      mode = 'archive_then_reclaim';
++    }
++
++    if (mode === 'archive_then_reclaim' && this.shouldDowngradeDiskPressureDirtyTerminal(candidate, attentionState, options)) {
++      mode = 'archive_only';
++    }
++
+     if (mode === 'retain') {
+       return {
+         attentionState,
+@@ -776,6 +806,111 @@ export class ReclamationService {
+       : fallback;
+   }
+
++  private shouldAutoReclaimDirtyCompletedIntegrated(
++    candidate: WorktreeCandidate,
++    attentionState: ReclamationAttentionState,
++    options: ReclamationRunOptions,
++  ): boolean {
++    const task = candidate.task;
++    if (!task || candidate.kind !== 'task_worktree') {
++      return false;
++    }
++
++    if (options.mode === 'manual') {
++      return false;
++    }
++
++    if (task.status !== 'completed') {
++      return false;
++    }
++
++    if (resolveTaskIntegrationStatus(task) !== 'integrated') {
++      return false;
++    }
++
++    if (!candidate.inspection?.dirty || !candidate.reclaimable) {
++      return false;
++    }
++
++    const targetSyncStatus = resolveTaskTargetSyncStatus(task);
++    if (targetSyncStatus === 'synced' || targetSyncStatus === 'disabled') {
++      return attentionState === 'reclamation';
++    }
++
++    if (targetSyncStatus === 'deferred_dirty_checkout' || targetSyncStatus === 'failed') {
++      return options.mode === 'disk_pressure'
++        && getBoolean(
++          this.configManager.get('reclamation.worktrees.reclaimDirtyCompletedIntegratedUnderPressure'),
++          true,
++        );
++    }
++
++    return false;
++  }
++
++  private shouldDowngradeDiskPressureDirtyTerminal(
++    candidate: WorktreeCandidate,
++    attentionState: ReclamationAttentionState,
++    options: ReclamationRunOptions,
++  ): boolean {
++    return options.mode === 'disk_pressure'
++      && candidate.kind === 'task_worktree'
++      && Boolean(candidate.task)
++      && candidate.inspection?.dirty === true
++      && !this.shouldAutoReclaimDirtyCompletedIntegrated(candidate, attentionState, options);
++  }
++
++  private shouldAllowTargetSyncAttentionReclaim(
++    candidate: WorktreeCandidate,
++    options: ReclamationRunOptions,
++  ): boolean {
++    const task = candidate.task;
++    if (!task || task.status !== 'completed') {
++      return false;
++    }
++
++    if (resolveTaskIntegrationStatus(task) !== 'integrated') {
++      return false;
++    }
++
++    const targetSyncStatus = resolveTaskTargetSyncStatus(task);
++    if (targetSyncStatus !== 'deferred_dirty_checkout' && targetSyncStatus !== 'failed') {
++      return false;
++    }
++
++    return options.mode === 'disk_pressure'
++      && candidate.reclaimable
++      && getBoolean(
++        this.configManager.get('reclamation.worktrees.reclaimDirtyCompletedIntegratedUnderPressure'),
++        true,
++      );
++  }
++
++  private shouldProtectByNewestDirtyRetention(
++    candidate: WorktreeCandidate,
++    options: ReclamationRunOptions,
++  ): boolean {
++    if (!getBoolean(this.configManager.get('reclamation.worktrees.protectNewestDirtyAttentionOnly'), true)) {
++      return true;
++    }
++
++    const attention = this.classifyWorktreeAttention(candidate, options);
++    if (attention === 'retry' || attention === 'manual_review' || attention === 'target_sync') {
++      return true;
++    }
++
++    if (!candidate.task || candidate.task.status !== 'completed') {
++      return true;
++    }
++
++    if (resolveTaskIntegrationStatus(candidate.task) !== 'integrated') {
++      return true;
++    }
++
++    const targetSyncStatus = resolveTaskTargetSyncStatus(candidate.task);
++    return targetSyncStatus !== 'synced' && targetSyncStatus !== 'disabled';
++  }
++
+   private classifyWorktreeAttention(
+     candidate: WorktreeCandidate,
+     options: ReclamationRunOptions,
+@@ -885,7 +998,8 @@ export class ReclamationService {
+     }
+
+     if (getBoolean(this.configManager.get('reclamation.worktrees.skipDirtyIfTargetSyncAttention'), true)) {
+-      addGate('no_target_sync_attention', attentionState !== 'target_sync', 'dirty_target_sync_attention');
++      const allowTargetSyncReclaim = this.shouldAllowTargetSyncAttentionReclaim(candidate, options);
++      addGate('no_target_sync_attention', attentionState !== 'target_sync' || allowTargetSyncReclaim, 'dirty_target_sync_attention');
+     }
+
+     if (getBoolean(this.configManager.get('reclamation.worktrees.skipDirtyIfIntegrationBlocked'), true)) {
+@@ -911,9 +1025,132 @@ export class ReclamationService {
+     return 'dirty_worktree_archived_retained';
+   }
+
++  private evidenceManifestMatchesCandidate(
++    manifest: ReclamationEvidenceManifest | undefined,
++    candidate: WorktreeCandidate,
++  ): manifest is ReclamationEvidenceManifest {
++    return Boolean(
++      manifest
++      && manifest.complete === true
++      && manifest.candidate?.kind === candidate.kind
++      && manifest.candidate?.taskId === candidate.taskId
++      && path.resolve(manifest.candidate?.repoPath || '') === path.resolve(candidate.repoPath)
++      && path.resolve(manifest.candidate?.worktree || '') === path.resolve(candidate.worktree),
++    );
++  }
++
++  private isEvidenceDecisionCompatible(
++    manifest: ReclamationEvidenceManifest,
++    decision: ReclamationDecision,
++  ): boolean {
++    const previousAction = manifest.decision?.action;
++    return previousAction === decision.action
++      || (previousAction === 'archive_only' && decision.action === 'archive_then_reclaim');
++  }
++
++  private async computeCandidateDirtyFingerprint(candidate: WorktreeCandidate): Promise<string | undefined> {
++    const archiver = this.evidenceArchiver as unknown as {
++      computeDirtyFingerprint?: (candidate: WorktreeCandidate) => Promise<string>;
++    };
++
++    if (typeof archiver.computeDirtyFingerprint !== 'function') {
++      return undefined;
++    }
++
++    return archiver.computeDirtyFingerprint.call(this.evidenceArchiver, candidate);
++  }
++
++  private async findReusableDirtyEvidence(
++    candidate: WorktreeCandidate,
++    decision: ReclamationDecision,
++  ): Promise<EvidenceArchiveResult | undefined> {
++    const manifestPath = candidate.task?.worktreeReclaimEvidenceManifestPath;
++    if (!manifestPath || !fs.existsSync(manifestPath)) {
++      return undefined;
++    }
++
++    const archiver = this.evidenceArchiver as unknown as {
++      isManagedManifestPath?: (manifestPath: string) => boolean;
++      measureDirectoryBytesBestEffort?: (dir: string) => number | undefined;
++    };
++
++    if (typeof archiver.isManagedManifestPath !== 'function' || !archiver.isManagedManifestPath.call(this.evidenceArchiver, manifestPath)) {
++      return undefined;
++    }
++
++    const manifest = readJsonFile<ReclamationEvidenceManifest>(manifestPath);
++    if (!this.evidenceManifestMatchesCandidate(manifest, candidate)) {
++      return undefined;
++    }
++
++    if (!this.isEvidenceDecisionCompatible(manifest, decision)) {
++      return undefined;
++    }
++
++    try {
++      const currentFingerprint = await this.computeCandidateDirtyFingerprint(candidate);
++      if (!currentFingerprint || manifest.fingerprint?.algorithm !== 'ralph-worktree-dirty-v1') {
++        return undefined;
++      }
++
++      if (manifest.fingerprint.sha256 !== currentFingerprint) {
++        return undefined;
++      }
++    } catch {
++      return undefined;
++    }
++
++    const dir = path.dirname(manifestPath);
++    return {
++      ok: true,
++      complete: true,
++      dir,
++      manifestPath,
++      bytes: typeof archiver.measureDirectoryBytesBestEffort === 'function'
++        ? archiver.measureDirectoryBytesBestEffort.call(this.evidenceArchiver, dir)
++        : undefined,
++    };
++  }
++
++  private async validateDirtyEvidenceBeforeRemoval(
++    candidate: WorktreeCandidate,
++    decision: ReclamationDecision,
++  ): Promise<PreRemovalValidationResult> {
++    const manifestPath = candidate.evidence?.manifestPath;
++    if (!manifestPath || !fs.existsSync(manifestPath)) {
++      return { ok: false, reason: 'dirty_evidence_manifest_missing_before_removal' };
++    }
++
++    const archiver = this.evidenceArchiver as unknown as {
++      isManagedManifestPath?: (manifestPath: string) => boolean;
++    };
++    if (typeof archiver.isManagedManifestPath !== 'function' || !archiver.isManagedManifestPath.call(this.evidenceArchiver, manifestPath)) {
++      return { ok: false, reason: 'dirty_evidence_manifest_unmanaged_before_removal' };
++    }
++
++    const manifest = readJsonFile<ReclamationEvidenceManifest>(manifestPath);
++    if (!this.evidenceManifestMatchesCandidate(manifest, candidate)) {
++      return { ok: false, reason: 'dirty_evidence_manifest_mismatch_before_removal' };
++    }
++
++    if (!this.isEvidenceDecisionCompatible(manifest, decision)) {
++      return { ok: false, reason: 'dirty_evidence_decision_mismatch_before_removal' };
++    }
++
++    try {
++      const currentFingerprint = await this.computeCandidateDirtyFingerprint(candidate);
++      if (!currentFingerprint || manifest.fingerprint?.sha256 !== currentFingerprint) {
++        return { ok: false, reason: 'dirty_evidence_fingerprint_mismatch_before_removal' };
++      }
++    } catch {
++      return { ok: false, reason: 'dirty_evidence_fingerprint_check_failed_before_removal' };
++    }
++
++    return { ok: true };
++  }
++
+   private countDirtyArchived(report: ReclamationReport): number {
+-    return report.skipped.filter((candidate) => candidate.dirty && candidate.evidenceComplete).length
+-      + report.candidates.filter((candidate) => candidate.dirty && candidate.evidenceComplete).length;
++    return report.worktrees.archived;
+   }
+
+   private countDirtyRemoved(report: ReclamationReport): number {
+@@ -995,6 +1219,45 @@ export class ReclamationService {
+     }
+   }
+
++  private async pruneDuplicateEvidenceArchives(
++    candidate: WorktreeCandidate,
++    decision: ReclamationDecision,
++    report: ReclamationReport,
++  ): Promise<void> {
++    if (
++      decision.action !== 'archive_then_reclaim'
++      || !candidate.evidence?.manifestPath
++      || !getBoolean(this.configManager.get('reclamation.evidence.pruneDuplicateArchives'), true)
++    ) {
++      return;
++    }
++
++    const archiver = this.evidenceArchiver as unknown as {
++      pruneTaskEvidenceArchives?: (
++        candidate: WorktreeCandidate,
++        options: { keepManifestPath: string; keepNewest: number },
++      ) => void;
++    };
++
++    if (typeof archiver.pruneTaskEvidenceArchives !== 'function') {
++      return;
++    }
++
++    try {
++      archiver.pruneTaskEvidenceArchives.call(this.evidenceArchiver, candidate, {
++        keepManifestPath: candidate.evidence.manifestPath,
++        keepNewest: getNonNegativeNumber(this.configManager.get('reclamation.evidence.maxArchivesPerTask'), 1),
++      });
++    } catch (error) {
++      report.errors.push({
++        kind: 'worktree_evidence_prune_failed',
++        path: candidate.evidence.manifestPath,
++        taskId: candidate.taskId,
++        message: error instanceof Error ? error.message : String(error),
++      });
++    }
++  }
++
+   private toReportCandidate(candidate: WorktreeCandidate): ReclamationCandidateReport {
+     return {
+       kind: candidate.kind,
+@@ -1113,6 +1368,16 @@ export class ReclamationService {
+           inspection,
+         };
+       }
++
++      const evidenceValidation = await this.validateDirtyEvidenceBeforeRemoval(candidate, decision);
++      if (!evidenceValidation.ok) {
++        return {
++          ok: false,
++          reason: evidenceValidation.reason,
++          safetyGates,
++          inspection,
++        };
++      }
+
+       return { ok: true, safetyGates, inspection };
+     }
+@@ -1142,21 +1406,42 @@ export class ReclamationService {
+     }
+
+     if (task.status === 'completed') {
+-      const targetSyncStatus = resolveTaskTargetSyncStatus(task);
+-      if (targetSyncStatus === 'deferred_dirty_checkout' || targetSyncStatus === 'failed') {
+-        return getNumber(this.configManager.get('reclamation.worktrees.targetSyncDeferredRetentionHours'), 72);
+-      }
+-
+       if (!dirty) {
+         return getNonNegativeNumber(
+           this.configManager.get('reclamation.worktrees.cleanTerminalRetentionHours'),
+           0,
+         );
+       }
+
+-      return getNumber(this.configManager.get('reclamation.worktrees.completedRetentionHours'), 24);
++      const integrationStatus = resolveTaskIntegrationStatus(task);
++      const targetSyncStatus = resolveTaskTargetSyncStatus(task);
++
++      if (integrationStatus === 'integrated') {
++        if (targetSyncStatus === 'synced') {
++          return getNonNegativeNumber(
++            this.configManager.get('reclamation.worktrees.dirtyCompletedIntegratedSyncedRetentionHours'),
++            0,
++          );
++        }
++
++        if (targetSyncStatus === 'disabled') {
++          return getNonNegativeNumber(
++            this.configManager.get('reclamation.worktrees.dirtyCompletedIntegratedDisabledRetentionHours'),
++            24,
++          );
++        }
++
++        if (targetSyncStatus === 'deferred_dirty_checkout' || targetSyncStatus === 'failed') {
++          return getNonNegativeNumber(
++            this.configManager.get('reclamation.worktrees.dirtyCompletedIntegratedDeferredRetentionHours'),
++            getNumber(this.configManager.get('reclamation.worktrees.targetSyncDeferredRetentionHours'), 72),
++          );
++        }
++      }
++
++      return getNonNegativeNumber(this.configManager.get('reclamation.worktrees.completedRetentionHours'), 24);
+     }
+
+     if (!dirty) {
+       return getNonNegativeNumber(
+         this.configManager.get('reclamation.worktrees.cleanTerminalRetentionHours'),
+@@ -1198,9 +1480,14 @@ export class ReclamationService {
+     }
+
+     if (task.status === 'completed') {
++      const integrationStatus = resolveTaskIntegrationStatus(task);
+       const targetSyncStatus = resolveTaskTargetSyncStatus(task);
++      if (integrationStatus === 'integrated' && (targetSyncStatus === 'synced' || targetSyncStatus === 'disabled')) {
++        return `safe_completed_integrated_${targetSyncStatus}`;
++      }
++
+       if (targetSyncStatus === 'deferred_dirty_checkout' || targetSyncStatus === 'failed') {
+         return 'safe_completed_target_sync_deferred';
+       }
+
+       return 'safe_completed';
+@@ -1239,6 +1517,7 @@ export class ReclamationService {
+     if (getBoolean(this.configManager.get('reclamation.reporting.logJsonl'), true)) {
+       try {
+         fs.mkdirSync(path.dirname(logPath), { recursive: true });
++        this.rotateJsonlIfNeeded(logPath);
+         fs.appendFileSync(logPath, `${JSON.stringify(report)}\n`);
+       } catch (error) {
+         report.errors.push({
+@@ -1250,6 +1529,41 @@ export class ReclamationService {
+       }
+     }
+   }
++
++  private rotateJsonlIfNeeded(logPath: string): void {
++    const maxBytes = getNonNegativeNumber(
++      this.configManager.get('reclamation.reporting.maxJsonlBytes'),
++      50 * 1024 * 1024,
++    );
++    const maxFiles = Math.max(
++      1,
++      Math.floor(getNonNegativeNumber(this.configManager.get('reclamation.reporting.maxJsonlFiles'), 5)),
++    );
++
++    if (maxBytes <= 0 || !fs.existsSync(logPath)) {
++      return;
++    }
++
++    const stat = fs.statSync(logPath);
++    if (!stat.isFile() || stat.size < maxBytes) {
++      return;
++    }
++
++    const oldest = `${logPath}.${maxFiles}`;
++    if (fs.existsSync(oldest)) {
++      fs.rmSync(oldest, { force: true });
++    }
++
++    for (let index = maxFiles - 1; index >= 1; index -= 1) {
++      const from = `${logPath}.${index}`;
++      const to = `${logPath}.${index + 1}`;
++      if (fs.existsSync(from)) {
++        fs.renameSync(from, to);
++      }
++    }
++
++    fs.renameSync(logPath, `${logPath}.1`);
++  }
+ }
+
+ export function isLegacyTempDirName(name: string, patterns: string[]): boolean {
+diff --git a/src/core/dependency-watcher.ts b/src/core/dependency-watcher.ts
+--- a/src/core/dependency-watcher.ts
++++ b/src/core/dependency-watcher.ts
+@@ -1447,6 +1447,13 @@ export class DependencyWatcher {
+       ),
+     };
+
++    if (resolveConfigBoolean(
++      this.configManager.get('reclamation.worktrees.reclaimDirtyCompletedIntegratedUnderPressure'),
++      true,
++    )) {
++      options.dirtyTerminalModeOverride = 'archive_then_reclaim';
++    }
++
+     if (status.emergency) {
+       options.dirtyTerminalModeOverride = 'archive_then_reclaim';
+       options.dirtyOrphanModeOverride = 'archive_then_reclaim';
+diff --git a/test/reclamation.test.js b/test/reclamation.test.js
+--- a/test/reclamation.test.js
++++ b/test/reclamation.test.js
+@@ -47,6 +47,65 @@ function makeInspection(worktree, overrides = {}) {
+   };
+ }
+
++function makeEvidenceArchiver(home, options = {}) {
++  const archiveCalls = [];
++  const pruneCalls = [];
++  const fingerprint = options.fingerprint || 'fingerprint-1';
++  const evidenceRoot = path.join(home, 'evidence');
++  const archiver = {
++    archiveCalls,
++    pruneCalls,
++    archive: async (candidate, decision) => {
++      archiveCalls.push({ candidate, decision });
++      if (options.onArchive) {
++        options.onArchive(candidate, decision);
++      }
++
++      const dir = path.join(
++        evidenceRoot,
++        `${candidate.taskId || 'orphan'}-${archiveCalls.length}`,
++      );
++      fs.mkdirSync(dir, { recursive: true });
++      const manifestPath = path.join(dir, 'manifest.json');
++      fs.writeFileSync(manifestPath, `${JSON.stringify({
++        schemaVersion: 1,
++        id: `${candidate.taskId || 'orphan'}-${archiveCalls.length}`,
++        createdAt: new Date(0).toISOString(),
++        mode: 'test',
++        complete: true,
++        candidate: {
++          kind: candidate.kind,
++          taskId: candidate.taskId,
++          status: candidate.status,
++          repoPath: candidate.repoPath,
++          worktree: candidate.worktree,
++          branch: candidate.inspection && candidate.inspection.branch,
++          head: candidate.inspection && candidate.inspection.head,
++        },
++        fingerprint: {
++          algorithm: 'ralph-worktree-dirty-v1',
++          sha256: fingerprint,
++        },
++        decision,
++        limits: {},
++        artifacts: [],
++        restore: {
++          notes: 'test evidence',
++        },
++      }, null, 2)}\n`);
++
++      return { ok: true, complete: true, dir, manifestPath, bytes: 42 };
++    },
++    computeDirtyFingerprint: async () => fingerprint,
++    isManagedManifestPath: (manifestPath) => path.resolve(manifestPath).startsWith(path.resolve(evidenceRoot)),
++    measureDirectoryBytesBestEffort: () => 42,
++    pruneTaskEvidenceArchives: (candidate, pruneOptions) => {
++      pruneCalls.push({ candidate, options: pruneOptions });
++    },
++  };
++  return archiver;
++}
++
+ function makeStateManager(home, tasks, updates = []) {
+   return {
+     getRalphHome: () => home,
+@@ -251,6 +305,55 @@ test('ReclamationService archives dirty failed worktrees in automatic archive-on
+   }
+ });
+
++test('ReclamationService reuses complete matching dirty evidence for archive-only sweeps', async () => {
++  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-reclaim-home-'));
++  const repo = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-reclaim-repo-'));
++  const worktree = path.join(repo, '.ralph-worktrees', 'failed-task');
++  const now = Date.now();
++  const updates = [];
++  const task = makeTask({
++    id: 'failed-task',
++    status: 'failed',
++    repoPath: repo,
++    worktree,
++    endTime: now - 400 * HOUR,
++  });
++  const evidenceArchiver = makeEvidenceArchiver(home);
++
++  try {
++    fs.mkdirSync(worktree, { recursive: true });
++    const service = new ReclamationService({
++      stateManager: makeStateManager(home, [task], updates),
++      configManager: makeConfig({
++        'reclamation.worktrees.dirtyTerminalMode': 'archive_only',
++        'reclamation.reporting.emitTaskEvents': false,
++      }),
++      now: () => now,
++      worktreeManager: {
++        inspectWorktree: async () => makeInspection(worktree, { dirty: true }),
++        removeWorktreeSafe: async () => ({ removed: true, dryRun: false }),
++        pruneWorktreeMetadata: async () => undefined,
++        listWorktrees: async () => [],
++      },
++      evidenceArchiver,
++    });
++
++    const first = await service.run({ mode: 'manager_periodic' });
++    task.worktreeReclaimEvidenceManifestPath = first.skipped[0].evidenceManifestPath;
++
++    const second = await service.run({ mode: 'manager_periodic' });
++
++    assert.equal(first.worktrees.archived, 1);
++    assert.equal(second.worktrees.archived, 0);
++    assert.equal(evidenceArchiver.archiveCalls.length, 1);
++    assert.equal(second.skipped[0].reason, 'dirty_worktree_evidence_already_archived');
++    assert.equal(updates.length, 1);
++  } finally {
++    fs.rmSync(home, { recursive: true, force: true });
++    fs.rmSync(repo, { recursive: true, force: true });
++  }
++});
++
+ test('ReclamationService disk pressure dirty reclaim keeps retry-attention worktrees archive-only', async () => {
+   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-reclaim-home-'));
+   const repo = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-reclaim-repo-'));
+@@ -374,5 +493,6 @@ test('ReclamationService archive-then-reclaims dirty failed worktrees when expli
+   });
+   const order = [];
++  const evidenceArchiver = makeEvidenceArchiver(home, { onArchive: () => order.push('archive') });
+
+   try {
+     fs.mkdirSync(worktree, { recursive: true });
+@@ -393,18 +513,7 @@ test('ReclamationService archive-then-reclaims dirty failed worktrees when expli
+         pruneWorktreeMetadata: async () => undefined,
+         listWorktrees: async () => [],
+       },
+-      evidenceArchiver: {
+-        archive: async () => {
+-          order.push('archive');
+-          return {
+-            ok: true,
+-            complete: true,
+-            dir: path.join(home, 'reclamation', 'evidence', 'failed-task'),
+-            manifestPath: path.join(home, 'reclamation', 'evidence', 'failed-task', 'manifest.json'),
+-            bytes: 42,
+-          };
+-        },
+-      },
++      evidenceArchiver,
+     });
+
+     const report = await service.run({
+@@ -419,8 +528,9 @@ test('ReclamationService archive-then-reclaims dirty failed worktrees when expli
+     assert.equal(report.candidates[0].decisionAction, 'archive_then_reclaim');
+     assert.equal(report.candidates[0].evidenceComplete, true);
+     assert.deepEqual(order, ['archive', 'remove']);
+-    assert.equal(updates.length, 1);
+-    assert.equal(updates[0].update.worktreeReclaimDecision, 'archive_then_reclaim');
++    assert.equal(updates.length, 2);
++    assert.equal(updates[0].update.worktreeReclaimDecision, 'archive_then_reclaim');
++    assert.equal(updates[1].update.worktreeReclaimDecision, 'archive_then_reclaim');
+   } finally {
+     fs.rmSync(home, { recursive: true, force: true });
+     fs.rmSync(repo, { recursive: true, force: true });
+@@ -428,5 +538,107 @@ test('ReclamationService archive-then-reclaims dirty failed worktrees when expli
+ });
+
++test('ReclamationService archive-then-reclaims completed integrated disabled dirty worktrees after retention', async () => {
++  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-reclaim-home-'));
++  const repo = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-reclaim-repo-'));
++  const worktree = path.join(repo, '.ralph-worktrees', 'completed-disabled-task');
++  const now = Date.now();
++  const updates = [];
++  const task = makeTask({
++    id: 'completed-disabled-task',
++    status: 'completed',
++    repoPath: repo,
++    worktree,
++    endTime: now - 25 * HOUR,
++    integrationStatus: 'integrated',
++    targetSyncStatus: 'disabled',
++  });
++  const evidenceArchiver = makeEvidenceArchiver(home);
++  let removeForce;
++
++  try {
++    fs.mkdirSync(worktree, { recursive: true });
++    const service = new ReclamationService({
++      stateManager: makeStateManager(home, [task], updates),
++      configManager: makeConfig({
++        'reclamation.worktrees.dirtyTerminalMode': 'archive_only',
++        'reclamation.worktrees.dirtyCompletedIntegratedDisabledRetentionHours': 24,
++        'reclamation.reporting.emitTaskEvents': false,
++      }),
++      now: () => now,
++      worktreeManager: {
++        inspectWorktree: async () => makeInspection(worktree, { dirty: true }),
++        removeWorktreeSafe: async (_repoPath, _worktreePath, options) => {
++          removeForce = options.force;
++          return { removed: true, dryRun: false };
++        },
++        pruneWorktreeMetadata: async () => undefined,
++        listWorktrees: async () => [],
++      },
++      evidenceArchiver,
++    });
++
++    const report = await service.run({ mode: 'manager_periodic' });
++
++    assert.equal(report.removed, 1);
++    assert.equal(report.worktrees.archived, 1);
++    assert.equal(report.candidates[0].decisionAction, 'archive_then_reclaim');
++    assert.equal(report.candidates[0].retentionHours, 24);
++    assert.equal(report.candidates[0].tier, 'safe_completed_integrated_disabled');
++    assert.equal(removeForce, true);
++    assert.equal(evidenceArchiver.pruneCalls.length, 1);
++    assert.equal(updates.length, 2);
++    assert.equal(updates[1].update.worktreeReclaimDecision, 'archive_then_reclaim');
++  } finally {
++    fs.rmSync(home, { recursive: true, force: true });
++    fs.rmSync(repo, { recursive: true, force: true });
++  }
++});
++
++test('ReclamationService retains completed integrated disabled dirty worktrees before retention', async () => {
++  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-reclaim-home-'));
++  const repo = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-reclaim-repo-'));
++  const worktree = path.join(repo, '.ralph-worktrees', 'completed-disabled-task');
++  const now = Date.now();
++  const task = makeTask({
++    id: 'completed-disabled-task',
++    status: 'completed',
++    repoPath: repo,
++    worktree,
++    endTime: now - 2 * HOUR,
++    integrationStatus: 'integrated',
++    targetSyncStatus: 'disabled',
++  });
++
++  try {
++    fs.mkdirSync(worktree, { recursive: true });
++    const service = new ReclamationService({
++      stateManager: makeStateManager(home, [task]),
++      configManager: makeConfig({
++        'reclamation.worktrees.dirtyTerminalMode': 'archive_only',
++        'reclamation.worktrees.dirtyCompletedIntegratedDisabledRetentionHours': 24,
++        'reclamation.reporting.emitTaskEvents': false,
++      }),
++      now: () => now,
++      worktreeManager: {
++        inspectWorktree: async () => makeInspection(worktree, { dirty: true }),
++        removeWorktreeSafe: async () => ({ removed: true, dryRun: false }),
++        pruneWorktreeMetadata: async () => undefined,
++        listWorktrees: async () => [],
++      },
++      evidenceArchiver: makeEvidenceArchiver(home),
++    });
++
++    const report = await service.run({ mode: 'manager_periodic' });
++
++    assert.equal(report.removed, 0);
++    assert.equal(report.skipped[0].reason, 'retained_until_24h');
++    assert.equal(report.skipped[0].retentionHours, 24);
++  } finally {
++    fs.rmSync(home, { recursive: true, force: true });
++    fs.rmSync(repo, { recursive: true, force: true });
++  }
++});
++
+ test('ReclamationService keeps retry-attention dirty failures archive-only', async () => {
+   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-reclaim-home-'));
+   const repo = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-reclaim-repo-'));
+@@ -562,6 +742,43 @@ test('ReclamationService real evidence archive captures patches and untracked fi
+   }
+ });
+
++test('ReclamationService rotates reclamation jsonl before append', async () => {
++  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-reclaim-home-'));
++  const logPath = path.join(home, 'logs', 'reclamation.jsonl');
++  const now = Date.now();
++
++  try {
++    fs.mkdirSync(path.dirname(logPath), { recursive: true });
++    fs.writeFileSync(logPath, 'x'.repeat(32));
++    const service = new ReclamationService({
++      stateManager: makeStateManager(home, []),
++      configManager: makeConfig({
++        'reclamation.reporting.logPath': logPath,
++        'reclamation.reporting.logJsonl': true,
++        'reclamation.reporting.writeLastRun': false,
++        'reclamation.reporting.maxJsonlBytes': 1,
++        'reclamation.reporting.maxJsonlFiles': 2,
++      }),
++      now: () => now,
++      worktreeManager: {
++        inspectWorktree: async () => makeInspection('/tmp/unused'),
++        removeWorktreeSafe: async () => ({ removed: true, dryRun: false }),
++        pruneWorktreeMetadata: async () => undefined,
++        listWorktrees: async () => [],
++      },
++    });
++
++    const report = await service.run({ mode: 'manager_periodic', includeWorktrees: false });
++
++    assert.equal(report.ok, true);
++    assert.equal(fs.existsSync(`${logPath}.1`), true);
++    assert.equal(fs.readFileSync(`${logPath}.1`, 'utf-8'), 'x'.repeat(32));
++    assert.match(fs.readFileSync(logPath, 'utf-8'), /"mode":"manager_periodic"/);
++  } finally {
++    fs.rmSync(home, { recursive: true, force: true });
++  }
++});
++
+ test('ReclamationService can reclaim clean orphan worktrees when requested', async () => {
+   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-reclaim-home-'));
+   const repo = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-reclaim-repo-'));
+diff --git a/test/dependency-watcher-config.test.js b/test/dependency-watcher-config.test.js
+--- a/test/dependency-watcher-config.test.js
++++ b/test/dependency-watcher-config.test.js
+@@ -163,6 +163,92 @@ test('DependencyWatcher runs frequent clean terminal reclamation between full sw
+   assert.deepEqual(sleeps, [1000]);
+ });
+
++test('DependencyWatcher enables safe dirty terminal reclaim during ordinary disk pressure', async () => {
++  const sleeps = [];
++  const logs = [];
++  const reclamationRuns = [];
++  const gib = 1024 * 1024 * 1024;
++  let watcher;
++
++  watcher = new DependencyWatcher(
++    { repo: '/tmp/ralph-disk-pressure-repo' },
++    {
++      stateManager: new FakeStateManager(),
++      scheduler: {
++        recoverStaleTasks: async () => undefined,
++        schedulePendingTasks: async () => [],
++      },
++      configManager: {
++        get: (key) => {
++          const values = {
++            'runner.pollInterval': 1,
++            'reclamation.diskPressure.enabled': true,
++            'reclamation.diskPressure.checkIntervalSeconds': 60,
++            'reclamation.diskPressure.minFreeBytes': 10 * gib,
++            'reclamation.diskPressure.minFreePercent': 10,
++            'reclamation.diskPressure.targetFreeBytes': 30 * gib,
++            'reclamation.diskPressure.emergencyFreeBytes': 5 * gib,
++            'reclamation.worktrees.pressureMaxRemovalsPerRun': 100,
++            'reclamation.worktrees.reclaimDirtyCompletedIntegratedUnderPressure': true,
++          };
++          return values[key];
++        },
++      },
++      autoIngestor: {
++        initialize: async () => undefined,
++        scan: async () => [],
++      },
++      reclamationService: {
++        isAutomaticReclamationEnabled: () => true,
++        getStartupDelayMs: () => 60 * 1000,
++        getIntervalMs: () => 15 * 60 * 1000,
++        getCleanTerminalSweepIntervalMs: () => 30 * 1000,
++        run: async (options) => {
++          reclamationRuns.push(options);
++          return {
++            removed: 2,
++            errors: [],
++            worktrees: { skipped: 1 },
++          };
++        },
++      },
++      statfs: () => reclamationRuns.length > 0
++        ? {
++            bavail: 31,
++            blocks: 100,
++            bsize: gib,
++          }
++        : {
++            bavail: 6,
++            blocks: 100,
++            bsize: gib,
++          },
++      sleep: async (ms) => {
++        sleeps.push(ms);
++        watcher.stop();
++      },
++      logger: {
++        log: (message) => logs.push(String(message)),
++        error: (message) => logs.push(`ERR:${String(message)}`),
++      },
++    }
++  );
++
++  await watcher.start();
++
++  assert.deepEqual(reclamationRuns, [{
++    mode: 'disk_pressure',
++    includeOrphanWorktrees: true,
++    cleanTerminalRetentionHoursOverride: 0,
++    cleanOrphanRetentionHoursOverride: 0,
++    skipKeepNewestPerRepo: true,
++    maxRemovals: 100,
++    dirtyTerminalModeOverride: 'archive_then_reclaim',
++  }]);
++  assert.deepEqual(sleeps, [1000]);
++  assert.ok(logs.some((line) => line.includes('Reclamation disk_pressure removed 2 worktree(s)')));
++});
++
+ test('DependencyWatcher runs emergency disk pressure reclamation immediately', async () => {
+   const sleeps = [];
+   const logs = [];

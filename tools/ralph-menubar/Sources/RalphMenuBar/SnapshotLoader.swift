@@ -327,6 +327,14 @@ func isExecutingQueueTask(_ task: TaskState) -> Bool {
   return isAutoRecovering(task) || isDeliveryPending(task)
 }
 
+func isStoppableTask(_ task: TaskState) -> Bool {
+  guard task.status == "running" else { return false }
+  if let phase = queuePhase(task) {
+    return phase == "running"
+  }
+  return true
+}
+
 func isSupersededBaselineRepairTask(_ task: TaskState) -> Bool {
   let nextAction = task.nextAction?.lowercased() ?? ""
   let stopReason = task.autoRecovery?.stopReason?.lowercased() ?? ""
@@ -805,6 +813,7 @@ final class SnapshotLoader {
         totalCompletedCount: fallback.totalCompletedCount,
         repoPaths: fallback.repoPaths,
         managerState: fallback.managerState,
+        managerControl: fallback.managerControl,
         managerIsStale: fallback.managerIsStale,
         managerIsActive: fallback.managerIsActive,
         managerCodeDriftDetected: fallback.managerCodeDriftDetected,
@@ -887,6 +896,7 @@ final class SnapshotLoader {
       totalCompletedCount: totalCompletedCount,
       repoPaths: payload.repoPaths,
       managerState: payload.manager?.state,
+      managerControl: payload.control,
       managerIsStale: payload.manager?.heartbeatStale ?? false,
       managerIsActive: payload.manager?.active ?? false,
       managerCodeDriftDetected: payload.manager?.codeDriftDetected ?? false,
@@ -901,6 +911,7 @@ final class SnapshotLoader {
   private func loadDirectTaskSnapshot(homePath: String) -> Snapshot {
     let tasksDirectory = URL(fileURLWithPath: homePath).appendingPathComponent("tasks", isDirectory: true)
     let managerURL = URL(fileURLWithPath: homePath).appendingPathComponent("manager/state.json")
+    let controlURL = URL(fileURLWithPath: homePath).appendingPathComponent("manager/control.json")
     let decoder = JSONDecoder()
     var tasks: [TaskState] = []
     var loadErrors: [String] = []
@@ -944,6 +955,7 @@ final class SnapshotLoader {
     let repoPaths = Array(Set(tasks.compactMap { $0.repoPath }.filter { !$0.isEmpty })).sorted()
 
     var managerState: ManagerState?
+    var managerControl: ManagerControlSnapshot?
     var managerIsStale = false
     if FileManager.default.fileExists(atPath: managerURL.path) {
       do {
@@ -955,6 +967,14 @@ final class SnapshotLoader {
         }
       } catch {
         loadErrors.append("Failed to load manager state: \(error.localizedDescription)")
+      }
+    }
+    if FileManager.default.fileExists(atPath: controlURL.path) {
+      do {
+        let data = try Data(contentsOf: controlURL)
+        managerControl = try decoder.decode(ManagerControlSnapshot.self, from: data)
+      } catch {
+        loadErrors.append("Failed to load manager control state: \(error.localizedDescription)")
       }
     }
 
@@ -970,6 +990,7 @@ final class SnapshotLoader {
       totalCompletedCount: totalCompletedCount,
       repoPaths: repoPaths,
       managerState: managerState,
+      managerControl: managerControl,
       managerIsStale: managerIsStale,
       managerIsActive: managerState != nil,
       managerCodeDriftDetected: false,

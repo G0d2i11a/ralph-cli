@@ -12,6 +12,7 @@ import { assertPrdHasExplicitTitle, generateTaskId, parsePRD, saveTaskPRD } from
 import { Task, TaskStatus } from '../types/task';
 import { appendTaskEvent } from './events';
 import { getRalphPaths, RalphHomeOptions } from './paths';
+import { resolveEffectiveDependencyPrdIdFromPrd } from './dependency-identity';
 
 type TaskStateStore = Pick<StateManager, 'saveTask' | 'loadTask' | 'listTasks'> & Partial<Pick<StateManager, 'getTaskDirPath'>>;
 
@@ -19,6 +20,7 @@ export interface EnqueueTaskOptions extends RalphHomeOptions {
   repoPath?: string;
   agent?: string;
   backend?: string;
+  baseRef?: string;
   allowMixedHome?: boolean;
   dedupeByPrdPath?: boolean;
   allowDuplicate?: boolean;
@@ -59,7 +61,25 @@ function runGit(repoPath: string, args: string[]): string | undefined {
   }
 }
 
-function resolveBaseRef(repoPath: string): { baseRef?: string; baseCommitSha?: string } {
+function resolveBaseRef(repoPath: string, requestedBaseRef?: string): { baseRef?: string; baseCommitSha?: string } {
+  const normalizedRequestedBaseRef = requestedBaseRef?.trim();
+  if (normalizedRequestedBaseRef) {
+    const requestedCommitSha = runGit(repoPath, [
+      'rev-parse',
+      '--verify',
+      `${normalizedRequestedBaseRef}^{commit}`,
+    ]);
+
+    if (!requestedCommitSha) {
+      throw new Error(`Could not resolve requested base ref '${normalizedRequestedBaseRef}'`);
+    }
+
+    return {
+      baseRef: normalizedRequestedBaseRef,
+      baseCommitSha: requestedCommitSha,
+    };
+  }
+
   const currentBranch = runGit(repoPath, ['rev-parse', '--abbrev-ref', 'HEAD']);
   const baseCommitSha = runGit(repoPath, ['rev-parse', 'HEAD']);
 
@@ -137,8 +157,9 @@ export async function enqueueTaskFromPrd(
   assertPrdHasExplicitTitle(resolvedPrdPath);
   const prd = parsePRD(resolvedPrdPath);
   const declaredCoordination = extractDeclaredCoordination(prd);
+  const effectiveDependencyPrdId = resolveEffectiveDependencyPrdIdFromPrd(prd);
   const sourceHash = hashFile(resolvedPrdPath);
-  const base = resolveBaseRef(repoPath);
+  const base = resolveBaseRef(repoPath, options.baseRef);
   const enqueuedAt = now();
 
   if (!options.allowDuplicate) {
@@ -182,6 +203,13 @@ export async function enqueueTaskFromPrd(
     declaredWriteSurface: declaredCoordination.declaredWriteSurface,
     declaredConflictDomains: declaredCoordination.declaredConflictDomains,
     integrationLane: declaredCoordination.integrationLane,
+    priorityClass: prd.priorityClass,
+    repairOf: prd.repairOf,
+    releasesDependenciesFor: prd.releasesDependenciesFor,
+    schedulerHints: prd.schedulerHints,
+    effectiveDependencyPrdId: effectiveDependencyPrdId !== prd.id
+      ? effectiveDependencyPrdId
+      : undefined,
     enqueuedAt,
     baseRef: base.baseRef,
     baseCommitSha: base.baseCommitSha,

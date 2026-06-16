@@ -155,6 +155,218 @@ test('ReclamationService removes clean task worktrees and annotates task state',
   }
 });
 
+test('ReclamationService automatic run removes clean terminal worktrees immediately', async () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-reclaim-home-'));
+  const repo = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-reclaim-repo-'));
+  const worktree = path.join(repo, '.ralph-worktrees', 'completed-task');
+  const now = Date.now();
+  const updates = [];
+  const task = makeTask({
+    id: 'completed-task',
+    repoPath: repo,
+    worktree,
+    endTime: now,
+    logPath: path.join(home, 'tasks', 'completed-task', 'agent.log'),
+  });
+  let removeCalls = 0;
+
+  try {
+    fs.mkdirSync(worktree, { recursive: true });
+    const service = new ReclamationService({
+      stateManager: makeStateManager(home, [task], updates),
+      configManager: makeConfig({
+        'reclamation.worktrees.cleanTerminalRetentionHours': 0,
+        'reclamation.worktrees.completedRetentionHours': 24,
+        'reclamation.worktrees.keepNewestCleanPerRepo': 0,
+        'reclamation.reporting.emitTaskEvents': false,
+      }),
+      now: () => now,
+      worktreeManager: {
+        inspectWorktree: async () => makeInspection(worktree),
+        removeWorktreeSafe: async (_repoPath, worktreePath, options) => {
+          removeCalls += 1;
+          assert.equal(worktreePath, worktree);
+          assert.equal(options.force, false);
+          return { removed: true, dryRun: false };
+        },
+        pruneWorktreeMetadata: async () => undefined,
+        listWorktrees: async () => [],
+      },
+    });
+
+    const report = await service.run({ mode: 'manager_periodic' });
+
+    assert.equal(report.removed, 1);
+    assert.equal(report.candidates[0].taskId, 'completed-task');
+    assert.equal(report.candidates[0].retentionHours, 0);
+    assert.equal(report.candidates[0].decisionAction, 'remove_clean');
+    assert.equal(removeCalls, 1);
+    assert.equal(updates[0].update.worktreeReclaimDecision, 'remove_clean');
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+    fs.rmSync(repo, { recursive: true, force: true });
+  }
+});
+
+test('ReclamationService keep-newest retention does not protect clean terminal worktrees by default', async () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-reclaim-home-'));
+  const repo = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-reclaim-repo-'));
+  const now = Date.now();
+  const oldWorktree = path.join(repo, '.ralph-worktrees', 'old-task');
+  const newWorktree = path.join(repo, '.ralph-worktrees', 'new-task');
+  const oldTask = makeTask({
+    id: 'old-task',
+    repoPath: repo,
+    worktree: oldWorktree,
+    endTime: now - HOUR,
+  });
+  const newTask = makeTask({
+    id: 'new-task',
+    repoPath: repo,
+    worktree: newWorktree,
+    endTime: now,
+  });
+  const removed = [];
+
+  try {
+    fs.mkdirSync(oldWorktree, { recursive: true });
+    fs.mkdirSync(newWorktree, { recursive: true });
+    const service = new ReclamationService({
+      stateManager: makeStateManager(home, [oldTask, newTask]),
+      configManager: makeConfig({
+        'reclamation.worktrees.cleanTerminalRetentionHours': 0,
+        'reclamation.worktrees.keepNewestPerRepo': 5,
+        'reclamation.reporting.emitTaskEvents': false,
+      }),
+      now: () => now,
+      worktreeManager: {
+        inspectWorktree: async (_repoPath, worktreePath) => makeInspection(worktreePath),
+        removeWorktreeSafe: async (_repoPath, worktreePath) => {
+          removed.push(worktreePath);
+          return { removed: true, dryRun: false };
+        },
+        pruneWorktreeMetadata: async () => undefined,
+        listWorktrees: async () => [],
+      },
+    });
+
+    const report = await service.run({ mode: 'manager_periodic' });
+
+    assert.equal(report.removed, 2);
+    assert.deepEqual(removed, [oldWorktree, newWorktree]);
+    assert.equal(report.skipped.length, 0);
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+    fs.rmSync(repo, { recursive: true, force: true });
+  }
+});
+
+test('ReclamationService can explicitly keep newest clean terminal worktrees', async () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-reclaim-home-'));
+  const repo = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-reclaim-repo-'));
+  const now = Date.now();
+  const oldWorktree = path.join(repo, '.ralph-worktrees', 'old-task');
+  const newWorktree = path.join(repo, '.ralph-worktrees', 'new-task');
+  const oldTask = makeTask({
+    id: 'old-task',
+    repoPath: repo,
+    worktree: oldWorktree,
+    endTime: now - HOUR,
+  });
+  const newTask = makeTask({
+    id: 'new-task',
+    repoPath: repo,
+    worktree: newWorktree,
+    endTime: now,
+  });
+  const removed = [];
+
+  try {
+    fs.mkdirSync(oldWorktree, { recursive: true });
+    fs.mkdirSync(newWorktree, { recursive: true });
+    const service = new ReclamationService({
+      stateManager: makeStateManager(home, [oldTask, newTask]),
+      configManager: makeConfig({
+        'reclamation.worktrees.cleanTerminalRetentionHours': 0,
+        'reclamation.worktrees.keepNewestCleanPerRepo': 1,
+        'reclamation.reporting.emitTaskEvents': false,
+      }),
+      now: () => now,
+      worktreeManager: {
+        inspectWorktree: async (_repoPath, worktreePath) => makeInspection(worktreePath),
+        removeWorktreeSafe: async (_repoPath, worktreePath) => {
+          removed.push(worktreePath);
+          return { removed: true, dryRun: false };
+        },
+        pruneWorktreeMetadata: async () => undefined,
+        listWorktrees: async () => [],
+      },
+    });
+
+    const report = await service.run({ mode: 'manager_periodic' });
+
+    assert.deepEqual(removed, [oldWorktree]);
+    assert.equal(report.removed, 1);
+    assert.equal(report.skipped.length, 1);
+    assert.equal(report.skipped[0].taskId, 'new-task');
+    assert.equal(report.skipped[0].reason, 'keep_newest_clean_per_repo');
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+    fs.rmSync(repo, { recursive: true, force: true });
+  }
+});
+
+test('ReclamationService re-inspects before clean removal and refuses if worktree became dirty', async () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-reclaim-home-'));
+  const repo = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-reclaim-repo-'));
+  const worktree = path.join(repo, '.ralph-worktrees', 'completed-task');
+  const now = Date.now();
+  const task = makeTask({
+    id: 'completed-task',
+    repoPath: repo,
+    worktree,
+    endTime: now,
+  });
+  let inspections = 0;
+  let removeCalls = 0;
+
+  try {
+    fs.mkdirSync(worktree, { recursive: true });
+    const service = new ReclamationService({
+      stateManager: {
+        ...makeStateManager(home, [task]),
+        loadTask: async () => task,
+      },
+      configManager: makeConfig({
+        'reclamation.worktrees.cleanTerminalRetentionHours': 0,
+        'reclamation.reporting.emitTaskEvents': false,
+      }),
+      now: () => now,
+      worktreeManager: {
+        inspectWorktree: async () => {
+          inspections += 1;
+          return makeInspection(worktree, { dirty: inspections > 1 });
+        },
+        removeWorktreeSafe: async () => {
+          removeCalls += 1;
+          return { removed: true, dryRun: false };
+        },
+        pruneWorktreeMetadata: async () => undefined,
+        listWorktrees: async () => [],
+      },
+    });
+
+    const report = await service.run({ mode: 'manager_periodic' });
+
+    assert.equal(report.removed, 0);
+    assert.equal(report.skipped[0].reason, 'became_dirty_before_clean_removal');
+    assert.equal(removeCalls, 0);
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+    fs.rmSync(repo, { recursive: true, force: true });
+  }
+});
+
 test('ReclamationService retains dirty failed worktrees by default', async () => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-reclaim-home-'));
   const repo = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-reclaim-repo-'));
@@ -263,6 +475,70 @@ test('ReclamationService archives dirty failed worktrees in automatic archive-on
     assert.equal(updates.length, 1);
     assert.equal(updates[0].update.worktreeReclaimDecision, 'archive_only');
     assert.match(updates[0].update.worktreeReclaimEvidenceManifestPath, /manifest\.json$/);
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+    fs.rmSync(repo, { recursive: true, force: true });
+  }
+});
+
+test('ReclamationService disk pressure dirty reclaim keeps retry-attention worktrees archive-only', async () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-reclaim-home-'));
+  const repo = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-reclaim-repo-'));
+  const worktree = path.join(repo, '.ralph-worktrees', 'failed-task');
+  const now = Date.now();
+  const task = makeTask({
+    id: 'failed-task',
+    status: 'failed',
+    repoPath: repo,
+    worktree,
+    endTime: now,
+    lastErrorClass: 'transport',
+    lastErrorRetryable: true,
+  });
+  let removeCalls = 0;
+
+  try {
+    fs.mkdirSync(worktree, { recursive: true });
+    const service = new ReclamationService({
+      stateManager: makeStateManager(home, [task]),
+      configManager: makeConfig({
+        'reclamation.evidence.requireForDirtyReclaim': true,
+        'reclamation.worktrees.skipDirtyIfRetryableFailure': true,
+        'reclamation.reporting.emitTaskEvents': false,
+      }),
+      now: () => now,
+      worktreeManager: {
+        inspectWorktree: async () => makeInspection(worktree, { dirty: true }),
+        removeWorktreeSafe: async () => {
+          removeCalls += 1;
+          return { removed: true, dryRun: false };
+        },
+        pruneWorktreeMetadata: async () => undefined,
+        listWorktrees: async () => [],
+      },
+      evidenceArchiver: {
+        archive: async () => ({
+          ok: true,
+          complete: true,
+          dir: path.join(home, 'evidence', 'failed-task'),
+          manifestPath: path.join(home, 'evidence', 'failed-task', 'manifest.json'),
+          bytes: 42,
+        }),
+      },
+    });
+
+    const report = await service.run({
+      mode: 'disk_pressure',
+      dirtyTerminalModeOverride: 'archive_then_reclaim',
+      dirtyTerminalRetentionHoursOverride: 0,
+    });
+
+    assert.equal(report.worktrees.archived, 1);
+    assert.equal(report.removed, 0);
+    assert.equal(report.skipped[0].attentionState, 'retry');
+    assert.equal(report.skipped[0].decisionAction, 'archive_only');
+    assert.equal(report.skipped[0].reason, 'dirty_worktree_archived_retry_attention');
+    assert.equal(removeCalls, 0);
   } finally {
     fs.rmSync(home, { recursive: true, force: true });
     fs.rmSync(repo, { recursive: true, force: true });

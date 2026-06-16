@@ -33,6 +33,53 @@ export async function updateCommand(taskId: string, options: UpdateOptions) {
     }
 
     const completedUS = new Set(task.completedUS);
+    const updatedAt = Date.now();
+    const progressEvidence = options.notes || 'Marked passing via ralph update';
+    const storyProgress = task.storyProgress?.map((progress) => {
+      if (progress.id !== options.storyId) {
+        return progress;
+      }
+
+      if (options.passes === true) {
+        return {
+          ...progress,
+          status: 'passed' as const,
+          lastEvidence: progressEvidence,
+          updatedAt,
+          history: [
+            ...(progress.history || []),
+            {
+              attempt: progress.attempts,
+              status: 'passed' as const,
+              message: progressEvidence,
+              evidence: progressEvidence,
+              updatedAt,
+            },
+          ],
+        };
+      }
+
+      if (options.passes === false) {
+        return {
+          ...progress,
+          status: 'pending' as const,
+          lastEvidence: undefined,
+          updatedAt,
+          history: [
+            ...(progress.history || []),
+            {
+              attempt: progress.attempts,
+              status: 'pending' as const,
+              message: options.notes || 'Marked not passing via ralph update',
+              updatedAt,
+            },
+          ],
+        };
+      }
+
+      return progress;
+    });
+
     if (options.passes === true) {
       completedUS.add(options.storyId);
     } else if (options.passes === false) {
@@ -41,6 +88,7 @@ export async function updateCommand(taskId: string, options: UpdateOptions) {
 
     await stateManager.updateTask(taskId, {
       completedUS: [...completedUS],
+      storyProgress,
     });
 
     console.log(JSON.stringify({

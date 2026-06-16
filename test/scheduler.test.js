@@ -242,6 +242,39 @@ test('schedulePendingTasks passes RALPH_HOME to worker processes', async () => {
   assert.equal(capturedEnv.RALPH_HOME, ralphHome);
 });
 
+test('schedulePendingTasks does not start workers while manager scheduling is paused', async () => {
+  const ralphHome = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-scheduler-paused-'));
+  const prdPath = '/paused.json';
+
+  try {
+    fs.mkdirSync(path.join(ralphHome, 'manager'), { recursive: true });
+    fs.writeFileSync(path.join(ralphHome, 'manager', 'control.json'), JSON.stringify({
+      schemaVersion: 1,
+      schedulingPaused: true,
+      pausedAt: Date.now(),
+      pauseReason: 'operator_paused',
+    }, null, 2));
+
+    const { scheduler, stateManager, forkCalls } = createScheduler(
+      [createTask({ id: 'paused-task', prdPath })],
+      { [prdPath]: { id: 'paused-prd' } },
+      {
+        ralphHome,
+        stateManagerRalphHome: ralphHome,
+      },
+    );
+
+    const startedTasks = await scheduler.schedulePendingTasks();
+    const task = await stateManager.loadTask('paused-task');
+
+    assert.deepEqual(startedTasks, []);
+    assert.deepEqual(forkCalls, []);
+    assert.equal(task.status, 'pending');
+  } finally {
+    fs.rmSync(ralphHome, { recursive: true, force: true });
+  }
+});
+
 test('schedulePendingTasks cleans worktree lock holders before worker fork', async () => {
   const order = [];
   const pendingTask = createTask({
@@ -547,6 +580,51 @@ test('schedulePendingTasks skips dependency-blocked tasks and starts later ready
   assert.equal(ready.status, 'running');
 });
 
+test('schedulePendingTasks does not start dependency repair whose own dependencies are unsatisfied', async () => {
+  const blockedRepair = createTask({
+    id: 'blocked-dependency-repair',
+    prdId: 'followup:upstream-prd:blocked',
+    prdPath: '/blocked-dependency-repair.json',
+    priorityClass: 'dependency_repair',
+    repairOf: {
+      prdId: 'upstream-prd',
+      taskId: 'failed-upstream-task',
+      reason: 'story_repair_hard_cap_reached',
+    },
+    releasesDependenciesFor: ['upstream-prd'],
+    effectiveDependencyPrdId: 'upstream-prd',
+    prdDependencies: ['repair-prerequisite'],
+    startTime: 100,
+    enqueuedAt: 100,
+  });
+  const readyTask = createTask({
+    id: 'ready-after-blocked-repair',
+    prdId: 'ready-after-blocked-repair',
+    prdPath: '/ready-after-blocked-repair.json',
+    startTime: 200,
+    enqueuedAt: 200,
+  });
+
+  const { scheduler, stateManager, forkCalls } = createScheduler(
+    [blockedRepair, readyTask],
+    {
+      '/blocked-dependency-repair.json': { id: 'followup:upstream-prd:blocked', dependencies: [] },
+      '/ready-after-blocked-repair.json': { id: 'ready-after-blocked-repair', dependencies: [] },
+    },
+    { maxConcurrent: 1 }
+  );
+
+  const startedTasks = await scheduler.schedulePendingTasks();
+  const persistedRepair = await stateManager.loadTask('blocked-dependency-repair');
+  const persistedReady = await stateManager.loadTask('ready-after-blocked-repair');
+
+  assert.equal(startedTasks.length, 1);
+  assert.equal(startedTasks[0].id, 'ready-after-blocked-repair');
+  assert.equal(persistedRepair.status, 'pending');
+  assert.equal(persistedReady.status, 'running');
+  assert.deepEqual(forkCalls, ['ready-after-blocked-repair']);
+});
+
 test('schedulePendingTasks blocks later same-repo tasks that overlap on declared conflict domains', async () => {
   const firstTask = createTask({
     id: 'first-task',
@@ -622,6 +700,209 @@ test('schedulePendingTasks starts dependency predecessors before earlier pending
   assert.equal(persistedDownstreamTask.coordinationStatus, undefined);
   assert.equal(persistedUpstreamTask.status, 'running');
   assert.deepEqual(forkCalls, ['upstream-task']);
+});
+
+test('schedulePendingTasks starts later dependency repair before earlier pending ordinary overlap', async () => {
+  const ordinaryTask = createTask({
+    id: 'ordinary-overlap',
+    prdId: 'ordinary-overlap',
+    prdPath: '/ordinary-overlap.json',
+    declaredWriteSurface: ['packages/contracts/src/index.ts'],
+    declaredConflictDomains: ['contracts-index'],
+    startTime: 100,
+    enqueuedAt: 100,
+  });
+  const repairTask = createTask({
+    id: 'dependency-repair-overlap',
+    prdId: 'followup:failed-dependency:repair',
+    prdPath: '/dependency-repair-overlap.json',
+    priorityClass: 'dependency_repair',
+    repairOf: {
+      prdId: 'failed-dependency',
+      taskId: 'failed-dependency-task',
+      reason: 'story_repair_hard_cap_reached',
+    },
+    releasesDependenciesFor: ['failed-dependency'],
+    effectiveDependencyPrdId: 'failed-dependency',
+    declaredWriteSurface: ['packages/contracts/src/index.ts'],
+    declaredConflictDomains: ['contracts-index'],
+    startTime: 200,
+    enqueuedAt: 200,
+  });
+
+  const { scheduler, stateManager, forkCalls } = createScheduler(
+    [ordinaryTask, repairTask],
+    {
+      '/ordinary-overlap.json': { id: 'ordinary-overlap', dependencies: [] },
+      '/dependency-repair-overlap.json': { id: 'followup:failed-dependency:repair', dependencies: [] },
+    },
+    { maxConcurrent: 1 }
+  );
+
+  const startedTasks = await scheduler.schedulePendingTasks();
+  const persistedOrdinary = await stateManager.loadTask('ordinary-overlap');
+  const persistedRepair = await stateManager.loadTask('dependency-repair-overlap');
+
+  assert.equal(startedTasks.length, 1);
+  assert.equal(startedTasks[0].id, 'dependency-repair-overlap');
+  assert.equal(persistedRepair.status, 'running');
+  assert.equal(persistedOrdinary.status, 'pending');
+  assert.equal(persistedOrdinary.coordinationStatus, undefined);
+  assert.deepEqual(forkCalls, ['dependency-repair-overlap']);
+});
+
+test('schedulePendingTasks prioritizes legacy hard-cap follow-up and persists repair identity', async () => {
+  const sourceTask = createTask({
+    id: 'failed-source-task',
+    prdId: 'failed-dependency',
+    status: 'failed',
+    followupTaskIds: ['legacy-dependency-repair'],
+    followupPrdIds: ['followup:failed-dependency:legacy'],
+    followupReason: 'story_repair_hard_cap_reached',
+    startTime: 50,
+    enqueuedAt: 50,
+  });
+  const ordinaryTask = createTask({
+    id: 'ordinary-overlap',
+    prdId: 'ordinary-overlap',
+    prdPath: '/ordinary-overlap.json',
+    declaredConflictDomains: ['contracts-index'],
+    startTime: 100,
+    enqueuedAt: 100,
+  });
+  const repairTask = createTask({
+    id: 'legacy-dependency-repair',
+    prdId: 'followup:failed-dependency:legacy',
+    prdPath: '/legacy-dependency-repair.json',
+    declaredConflictDomains: ['contracts-index'],
+    startTime: 200,
+    enqueuedAt: 200,
+  });
+
+  const { scheduler, stateManager, forkCalls } = createScheduler(
+    [sourceTask, ordinaryTask, repairTask],
+    {
+      '/ordinary-overlap.json': { id: 'ordinary-overlap', dependencies: [] },
+      '/legacy-dependency-repair.json': { id: 'followup:failed-dependency:legacy', dependencies: [] },
+    },
+    { maxConcurrent: 1 }
+  );
+
+  const startedTasks = await scheduler.schedulePendingTasks();
+  const persistedRepair = await stateManager.loadTask('legacy-dependency-repair');
+  const persistedOrdinary = await stateManager.loadTask('ordinary-overlap');
+
+  assert.equal(startedTasks.length, 1);
+  assert.equal(startedTasks[0].id, 'legacy-dependency-repair');
+  assert.equal(persistedRepair.status, 'running');
+  assert.equal(persistedRepair.priorityClass, 'dependency_repair');
+  assert.deepEqual(persistedRepair.repairOf, {
+    prdId: 'failed-dependency',
+    taskId: 'failed-source-task',
+    reason: 'story_repair_hard_cap_reached',
+  });
+  assert.deepEqual(persistedRepair.releasesDependenciesFor, ['failed-dependency']);
+  assert.equal(persistedRepair.effectiveDependencyPrdId, 'failed-dependency');
+  assert.equal(persistedOrdinary.status, 'pending');
+  assert.deepEqual(forkCalls, ['legacy-dependency-repair']);
+});
+
+test('schedulePendingTasks leaves dependency repair queued when running workers exhaust capacity', async () => {
+  const runningTask = createTask({
+    id: 'running-capacity-task',
+    prdId: 'running-capacity-task',
+    status: 'running',
+    startTime: 100,
+    enqueuedAt: 100,
+    worktree: '/worktrees/running-capacity-task',
+    pid: 3200,
+  });
+  const repairTask = createTask({
+    id: 'capacity-blocked-dependency-repair',
+    prdId: 'followup:capacity-dependency:repair',
+    prdPath: '/capacity-blocked-dependency-repair.json',
+    priorityClass: 'dependency_repair',
+    repairOf: {
+      prdId: 'capacity-dependency',
+      taskId: 'capacity-dependency-task',
+      reason: 'story_repair_hard_cap_reached',
+    },
+    releasesDependenciesFor: ['capacity-dependency'],
+    effectiveDependencyPrdId: 'capacity-dependency',
+    startTime: 200,
+    enqueuedAt: 200,
+  });
+
+  const { scheduler, stateManager, forkCalls } = createScheduler(
+    [runningTask, repairTask],
+    {
+      '/capacity-blocked-dependency-repair.json': { id: 'followup:capacity-dependency:repair', dependencies: [] },
+    },
+    { maxConcurrent: 1 }
+  );
+
+  const startedTasks = await scheduler.schedulePendingTasks();
+  const persistedRepair = await stateManager.loadTask('capacity-blocked-dependency-repair');
+  const pendingState = await scheduler.describePendingTask(persistedRepair, { readOnly: true });
+
+  assert.equal(startedTasks.length, 0);
+  assert.equal(persistedRepair.status, 'pending');
+  assert.deepEqual(forkCalls, []);
+  assert.equal(pendingState.reason, 'queued');
+  assert.equal(pendingState.running, 1);
+  assert.equal(pendingState.maxConcurrent, 1);
+});
+
+test('schedulePendingTasks records running overlap blocker for dependency repair', async () => {
+  const runningTask = createTask({
+    id: 'running-overlap',
+    prdId: 'running-overlap',
+    status: 'running',
+    declaredWriteSurface: ['packages/contracts/src/index.ts'],
+    declaredConflictDomains: ['contracts-index'],
+    startTime: 300,
+    enqueuedAt: 300,
+    worktree: '/worktrees/running-overlap',
+    pid: 3300,
+  });
+  const repairTask = createTask({
+    id: 'blocked-running-dependency-repair',
+    prdId: 'followup:running-dependency:repair',
+    prdPath: '/blocked-running-dependency-repair.json',
+    priorityClass: 'dependency_repair',
+    repairOf: {
+      prdId: 'running-dependency',
+      taskId: 'running-dependency-task',
+      reason: 'story_repair_hard_cap_reached',
+    },
+    releasesDependenciesFor: ['running-dependency'],
+    effectiveDependencyPrdId: 'running-dependency',
+    declaredWriteSurface: ['packages/contracts/src/index.ts'],
+    declaredConflictDomains: ['contracts-index'],
+    startTime: 200,
+    enqueuedAt: 200,
+  });
+
+  const { scheduler, stateManager, forkCalls } = createScheduler(
+    [runningTask, repairTask],
+    {
+      '/blocked-running-dependency-repair.json': { id: 'followup:running-dependency:repair', dependencies: [] },
+    },
+    { maxConcurrent: 2 }
+  );
+
+  const startedTasks = await scheduler.schedulePendingTasks();
+  const persistedRepair = await stateManager.loadTask('blocked-running-dependency-repair');
+  const pendingState = await scheduler.describePendingTask(persistedRepair, { readOnly: true });
+
+  assert.equal(startedTasks.length, 0);
+  assert.equal(persistedRepair.status, 'pending');
+  assert.equal(persistedRepair.coordinationStatus, 'blocked_predicted_overlap');
+  assert.deepEqual(persistedRepair.coordinationBlockers, ['running-overlap']);
+  assert.equal(pendingState.reason, 'coordination');
+  assert.deepEqual(pendingState.blockers, ['running-overlap']);
+  assert.equal(pendingState.running, 1);
+  assert.deepEqual(forkCalls, []);
 });
 
 test('schedulePendingTasks keeps later overlap pending while an earlier failed merge repair still owns the conflict surface', async () => {

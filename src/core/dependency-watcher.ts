@@ -15,7 +15,7 @@ import {
   shouldAttemptAutomaticIntegration,
 } from './integration-policy';
 import { withIntegrationLaneLock, withTaskFinalizeLock } from './locks';
-import { mergeBranch, MergeStrategy } from './merge';
+import { mergeBranch, MergeStrategy, syncTargetBranchIfSafe } from './merge';
 import {
   buildMergeFailureUpdates,
   createMergeFailureError,
@@ -88,7 +88,9 @@ import {
   resolveConfiguredWorktreeCleanupLockGlobs,
   WorktreeCleanupResult,
 } from './worktree-process-cleanup';
-import { ReclamationMode, ReclamationService } from './reclamation';
+import { ReclamationMode, ReclamationReport, ReclamationRunOptions, ReclamationService } from './reclamation';
+import { readManagerControl } from './manager-control';
+import { resolveRalphHome } from './paths';
 
 export interface WatchCommandOptions {
   interval?: number;
@@ -99,6 +101,12 @@ export interface WatchCommandOptions {
   autoIngestEz4ielts?: boolean;
   ingestExistingEz4ielts?: boolean;
   ez4ieltsDir?: string;
+}
+
+interface DiskStatFs {
+  bavail: number | bigint;
+  blocks: number | bigint;
+  bsize: number | bigint;
 }
 
 interface DependencyWatcherDeps {
@@ -118,7 +126,8 @@ interface DependencyWatcherDeps {
   repairTaskWorktreeDependencyBootstrap?: typeof repairTaskWorktreeDependencyBootstrap;
   cleanupWorktreeProcesses?: typeof cleanupWorktreeProcesses;
   resolveIntegrationSyncConflict?: typeof resolveIntegrationSyncConflict;
-  reclamationService?: Pick<ReclamationService, 'run' | 'isAutomaticReclamationEnabled' | 'getIntervalMs' | 'getStartupDelayMs'>;
+  reclamationService?: Pick<ReclamationService, 'run' | 'isAutomaticReclamationEnabled' | 'getIntervalMs' | 'getStartupDelayMs' | 'getCleanTerminalSweepIntervalMs'>;
+  statfs?: (path: string) => DiskStatFs;
   lifecycle?: DependencyWatcherLifecycleHooks;
 }
 
@@ -148,6 +157,30 @@ function resolveAutoMergeDelayMs(value: unknown): number {
   }
 
   return numericValue >= 1000 ? numericValue : numericValue * 1000;
+}
+
+function resolveConfigNumber(value: unknown, fallback: number): number {
+  const numericValue = Number(value);
+
+  return Number.isFinite(numericValue) ? numericValue : fallback;
+}
+
+function resolveConfigBoolean(value: unknown, fallback: boolean): boolean {
+  return typeof value === 'boolean' ? value : fallback;
+}
+
+function formatGiB(bytes: number): string {
+  return `${(bytes / (1024 * 1024 * 1024)).toFixed(1)}GiB`;
+}
+
+interface DiskPressureStatus {
+  path: string;
+  availableBytes: number;
+  totalBytes: number;
+  freePercent: number;
+  targetFreeBytes: number;
+  underPressure: boolean;
+  emergency: boolean;
 }
 
 function resolveFinalizerLeaseTimeoutMs(value: unknown): number {
@@ -249,7 +282,11 @@ function buildRetryableFailureSignature(
   task: Pick<Task, 'lastErrorSignature' | 'lastErrorKind' | 'lastErrorClass' | 'lastError' | 'mergeError'>,
   classification?: Pick<ErrorClassification, 'signature'>,
 ): string {
-  return task.lastErrorSignature
+  const existingSignature = task.lastErrorSignature && task.lastErrorSignature !== 'unknown_no_progress'
+    ? task.lastErrorSignature
+    : undefined;
+
+  return existingSignature
     || classification?.signature
     || (task.lastErrorKind && task.lastErrorClass
       ? `${task.lastErrorClass}:${task.lastErrorKind}`
@@ -443,7 +480,7 @@ function isRetryableTargetSyncFailure(
   }
 
   const message = `${task.targetSyncDeferredReason || ''}\n${task.mergeMessage || ''}`.toLowerCase();
-  return /git fetch|operation timed out|connection timed out|ssh_dispatch_run_fatal|econnreset|enotfound|network is unreachable|temporary failure/.test(message)
+  return /git fetch|operation timed out|connection timed out|ssh_dispatch_run_fatal|econnreset|enotfound|enoent|network is unreachable|temporary failure/.test(message)
     || /sync deferred/.test(message);
 }
 
@@ -615,6 +652,49 @@ function hasStoryRepairUnsafeDeliveryMarker(
 function isTimeoutLikeTransient(kind: string): boolean {
   return kind === 'transport_timeout'
     || kind === 'transport_reconnecting';
+}
+
+function isRateLimitTransientFailure(
+  failure: Pick<NonNullable<ReturnType<typeof resolveRetryableTransientFailure>>, 'kind' | 'class'>,
+): boolean {
+  return failure.kind === 'backend_rate_limited'
+    && failure.class === 'transient_backend';
+}
+
+function isTransientRateLimitCircuitOpenReason(reason?: string): boolean {
+  return reason === 'transient_rate_limit_circuit_open';
+}
+
+function countGeneratedFollowupDepth(task: Pick<Task, 'prdId' | 'prdPath'>): number {
+  const prdIdDepth = (task.prdId?.match(/followup:/g) ?? []).length;
+  if (prdIdDepth > 0) {
+    return prdIdDepth;
+  }
+
+  return task.prdPath?.split(/[\\/]/).includes('generated-prds') ? 1 : 0;
+}
+
+function shouldSuppressStoppedRecoveryFollowup(
+  task: Task,
+  reason: string,
+): boolean {
+  if (reason === 'operator_stopped' || isTransientRateLimitCircuitOpenReason(reason)) {
+    return true;
+  }
+
+  if (countGeneratedFollowupDepth(task) > 0) {
+    return true;
+  }
+
+  return [
+    'transient_same_signature_no_progress',
+    'transient_budget_exhausted',
+    'auto_recovery_hard_cap_reached',
+    'transient_deadline_exhausted',
+  ].includes(reason)
+    && task.lastErrorKind === 'backend_rate_limited'
+    && task.lastErrorClass === 'transient_backend'
+    && task.lastErrorHadObjectiveProgress !== true;
 }
 
 function hasTransientProgressEvidence(
@@ -1151,6 +1231,7 @@ export class DependencyWatcher {
   private readonly detectAlreadyIntegratedTask: (task: Task, targetBranch: string) => boolean;
   private readonly finalizer: typeof finalizeTaskOutput;
   private readonly mergeTask: typeof mergeBranch;
+  private readonly mergeTaskIsDefault: boolean;
   private readonly probeMergeability: typeof probeTaskMergeability;
   private readonly probeWorktreeMergeability: typeof probeTaskWorktreeMergeability;
   private readonly classifyBaselineQualityGateFailureFn: typeof classifyBaselineQualityGateFailure;
@@ -1158,12 +1239,19 @@ export class DependencyWatcher {
   private readonly repairTaskWorktreeDependencyBootstrapFn: typeof repairTaskWorktreeDependencyBootstrap;
   private readonly cleanupWorktreeProcessesFn: typeof cleanupWorktreeProcesses;
   private readonly resolveIntegrationSyncConflictFn: typeof resolveIntegrationSyncConflict;
-  private readonly reclamationService: Pick<ReclamationService, 'run' | 'isAutomaticReclamationEnabled' | 'getIntervalMs' | 'getStartupDelayMs'>;
+  private readonly reclamationService: Pick<ReclamationService, 'run' | 'isAutomaticReclamationEnabled' | 'getIntervalMs' | 'getStartupDelayMs' | 'getCleanTerminalSweepIntervalMs'>;
+  private readonly statfs: (path: string) => DiskStatFs;
+  private readonly ralphHome: string;
+  private readonly repoPath?: string;
   private readonly lifecycle?: DependencyWatcherLifecycleHooks;
   private readonly autoIngestEnabled: boolean;
   private readonly autoIngestExistingOnStartupEnabled: boolean;
+  private autoIngestorInitialized = false;
   private nextReclamationAtMs: number;
+  private nextCleanTerminalReclamationAtMs: number;
+  private nextDiskPressureCheckAtMs = 0;
   private hasRunStartupReclamation = false;
+  private pauseNoticeLogged = false;
   private isRunning = false;
 
   constructor(
@@ -1174,10 +1262,14 @@ export class DependencyWatcher {
     const configManager = deps.configManager ?? new ConfigManager();
 
     this.stateManager = stateManager;
+    this.ralphHome = typeof (stateManager as { getRalphHome?: () => string }).getRalphHome === 'function'
+      ? (stateManager as { getRalphHome: () => string }).getRalphHome()
+      : resolveRalphHome();
     this.configManager = configManager;
     this.detectAlreadyIntegratedTask = deps.detectAlreadyIntegratedTask ?? isTaskAlreadyIntegrated;
     this.finalizer = deps.finalizer ?? finalizeTaskOutput;
     this.mergeTask = deps.mergeTask ?? mergeBranch;
+    this.mergeTaskIsDefault = deps.mergeTask === undefined;
     this.probeMergeability = deps.probeMergeability ?? probeTaskMergeability;
     this.probeWorktreeMergeability = deps.probeWorktreeMergeability ?? probeTaskWorktreeMergeability;
     this.classifyBaselineQualityGateFailureFn = deps.classifyBaselineQualityGateFailure ?? classifyBaselineQualityGateFailure;
@@ -1186,7 +1278,10 @@ export class DependencyWatcher {
     this.cleanupWorktreeProcessesFn = deps.cleanupWorktreeProcesses ?? cleanupWorktreeProcesses;
     this.resolveIntegrationSyncConflictFn = deps.resolveIntegrationSyncConflict ?? resolveIntegrationSyncConflict;
     this.reclamationService = deps.reclamationService ?? new ReclamationService({ stateManager, configManager });
+    this.statfs = deps.statfs ?? fs.statfsSync;
+    this.repoPath = options.repo ? path.resolve(options.repo) : undefined;
     this.nextReclamationAtMs = Date.now() + this.reclamationService.getStartupDelayMs();
+    this.nextCleanTerminalReclamationAtMs = Date.now() + this.reclamationService.getCleanTerminalSweepIntervalMs();
     this.scheduler = deps.scheduler ?? new TaskScheduler({ stateManager, managerOwnedScheduling: true });
     this.pollInterval = Number.isFinite(options.interval) && Number(options.interval) > 0
       ? Number(options.interval)
@@ -1243,41 +1338,45 @@ export class DependencyWatcher {
     }
 
     this.isRunning = true;
-    await this.autoIngestor?.initialize();
     this.logger.log(`Dependency watcher started (polling every ${this.pollInterval / 1000}s)`);
     await this.invokeLifecycleHook('onStarted');
 
     while (this.isRunning) {
       await this.invokeLifecycleHook('onLoopStarted');
       try {
-        await this.autoIngestor?.scan();
-        await this.scheduler.recoverStaleTasks();
-        await this.auditStoryCompletionInvariants();
-        await this.recoverSoftFailedTasks();
-        await this.recoverFailedWorkerMergeRepairTasks();
-        await this.recoverFailedAgentContextTasks();
-        await this.recoverFailedTransientTasks();
-        await this.recoverStagnantTasks();
-        await this.classifyBaselineQualityGateFailures();
-        await this.coalesceBaselineRepairGraph();
-        await this.recoverBaselineBlockedFinalizeTasks();
-        await this.normalizeIntegratedProductTasks();
-        await this.recoverBlockedAutonomyTasks();
-        await this.recoverStoppedTransientTasks();
-        await this.recoverStoppedAgentContextTasks();
-        await this.recoverStoppedStoryRepairTasks();
-        await this.recoverStoppedFinalizeRepairTasks();
-        await this.recoverStoppedGenericRecoveryTasks();
-        await this.recoverFailedFinalizeTasks();
-        await this.recoverCompletedConflictTasks();
-        await this.integrateCompletedTasks();
-        await this.finalizeReadyTasks();
-        await this.reconcileDeferredTargetSyncs();
-        await this.recoverFailedStoryRepairTasks();
-        await this.recoverFailedBlockers();
-        await this.checkPendingTasks();
-        await this.maybeRunReclamation();
-        await this.invokeLifecycleHook('onLoopCompleted');
+        if (this.isSchedulingPaused()) {
+          await this.invokeLifecycleHook('onLoopCompleted');
+        } else {
+          await this.initializeAutoIngestorIfNeeded();
+          await this.autoIngestor?.scan();
+          await this.scheduler.recoverStaleTasks();
+          await this.auditStoryCompletionInvariants();
+          await this.recoverSoftFailedTasks();
+          await this.recoverFailedWorkerMergeRepairTasks();
+          await this.recoverFailedAgentContextTasks();
+          await this.recoverFailedTransientTasks();
+          await this.recoverStagnantTasks();
+          await this.classifyBaselineQualityGateFailures();
+          await this.coalesceBaselineRepairGraph();
+          await this.recoverBaselineBlockedFinalizeTasks();
+          await this.normalizeIntegratedProductTasks();
+          await this.recoverBlockedAutonomyTasks();
+          await this.recoverStoppedTransientTasks();
+          await this.recoverStoppedAgentContextTasks();
+          await this.recoverStoppedStoryRepairTasks();
+          await this.recoverStoppedFinalizeRepairTasks();
+          await this.recoverStoppedGenericRecoveryTasks();
+          await this.recoverFailedFinalizeTasks();
+          await this.recoverCompletedConflictTasks();
+          await this.integrateCompletedTasks();
+          await this.finalizeReadyTasks();
+          await this.reconcileDeferredTargetSyncs();
+          await this.recoverFailedStoryRepairTasks();
+          await this.recoverFailedBlockers();
+          await this.checkPendingTasks();
+          await this.maybeRunReclamation();
+          await this.invokeLifecycleHook('onLoopCompleted');
+        }
       } catch (error) {
         await this.invokeLoopErrorHook(error);
         this.logger.error('Error checking pending tasks:', error);
@@ -1298,29 +1397,197 @@ export class DependencyWatcher {
     return this.pollInterval;
   }
 
+  private async initializeAutoIngestorIfNeeded(): Promise<void> {
+    if (this.autoIngestorInitialized) {
+      return;
+    }
+
+    await this.autoIngestor?.initialize();
+    this.autoIngestorInitialized = true;
+  }
+
+  private isSchedulingPaused(): boolean {
+    const control = readManagerControl({ ralphHome: this.ralphHome });
+    if (control.schedulingPaused) {
+      if (!this.pauseNoticeLogged) {
+        const reason = control.pauseReason ? ` (${control.pauseReason})` : '';
+        this.logger.log(`Ralph manager scheduling paused${reason}; skipping auto-ingest, recovery, finalization, and new task starts`);
+        this.pauseNoticeLogged = true;
+      }
+      return true;
+    }
+
+    if (this.pauseNoticeLogged) {
+      this.logger.log('Ralph manager scheduling resumed');
+      this.pauseNoticeLogged = false;
+    }
+    return false;
+  }
+
   private async maybeRunReclamation(): Promise<void> {
     if (!this.reclamationService.isAutomaticReclamationEnabled()) {
       return;
     }
 
     const now = Date.now();
-    if (now < this.nextReclamationAtMs) {
+    const diskPressure = this.inspectDiskPressure(now);
+    if (diskPressure?.underPressure) {
+      await this.runDiskPressureReclamation(diskPressure);
+      this.nextReclamationAtMs = now + this.reclamationService.getIntervalMs();
+      this.nextCleanTerminalReclamationAtMs = now + this.reclamationService.getCleanTerminalSweepIntervalMs();
+      this.hasRunStartupReclamation = true;
       return;
     }
 
-    const mode: ReclamationMode = this.hasRunStartupReclamation
-      ? 'manager_periodic'
-      : 'manager_startup';
-    this.nextReclamationAtMs = now + this.reclamationService.getIntervalMs();
-    this.hasRunStartupReclamation = true;
+    if (now >= this.nextReclamationAtMs) {
+      const mode: ReclamationMode = this.hasRunStartupReclamation
+        ? 'manager_periodic'
+        : 'manager_startup';
+      this.nextReclamationAtMs = now + this.reclamationService.getIntervalMs();
+      this.nextCleanTerminalReclamationAtMs = now + this.reclamationService.getCleanTerminalSweepIntervalMs();
+      this.hasRunStartupReclamation = true;
+
+      await this.runReclamation({ mode });
+      return;
+    }
+
+    if (now >= this.nextCleanTerminalReclamationAtMs) {
+      this.nextCleanTerminalReclamationAtMs = now + this.reclamationService.getCleanTerminalSweepIntervalMs();
+
+      await this.runReclamation({
+        mode: 'manager_clean_terminal',
+        cleanTerminalOnly: true,
+        cleanTerminalRetentionHoursOverride: 0,
+        skipKeepNewestPerRepo: true,
+      });
+    }
+  }
+
+  private inspectDiskPressure(now: number, force = false): DiskPressureStatus | undefined {
+    if (!resolveConfigBoolean(this.configManager.get('reclamation.diskPressure.enabled'), false)) {
+      return undefined;
+    }
+
+    if (!force && now < this.nextDiskPressureCheckAtMs) {
+      return undefined;
+    }
+
+    const checkIntervalMs = Math.max(
+      1,
+      resolveConfigNumber(this.configManager.get('reclamation.diskPressure.checkIntervalSeconds'), 60),
+    ) * 1000;
+    this.nextDiskPressureCheckAtMs = now + checkIntervalMs;
+
+    const pressurePath = this.repoPath ?? process.cwd();
 
     try {
-      const report = await this.reclamationService.run({ mode });
-      if (report.removed > 0 || report.errors.length > 0) {
-        this.logger.log(`Reclamation ${mode} removed ${report.removed} worktree(s), skipped ${report.worktrees.skipped}, errors ${report.errors.length}`);
+      const stats = this.statfs(pressurePath);
+      const blockSize = Math.max(1, Number(stats.bsize));
+      const availableBytes = Math.max(0, Number(stats.bavail)) * blockSize;
+      const totalBytes = Math.max(1, Number(stats.blocks)) * blockSize;
+      const freePercent = (availableBytes / totalBytes) * 100;
+      const minFreeBytes = Math.max(
+        0,
+        resolveConfigNumber(this.configManager.get('reclamation.diskPressure.minFreeBytes'), 10 * 1024 * 1024 * 1024),
+      );
+      const minFreePercent = Math.max(
+        0,
+        resolveConfigNumber(this.configManager.get('reclamation.diskPressure.minFreePercent'), 10),
+      );
+      const emergencyFreeBytes = Math.max(
+        0,
+        resolveConfigNumber(this.configManager.get('reclamation.diskPressure.emergencyFreeBytes'), 5 * 1024 * 1024 * 1024),
+      );
+      const targetFreeBytes = Math.max(
+        minFreeBytes,
+        resolveConfigNumber(this.configManager.get('reclamation.diskPressure.targetFreeBytes'), 30 * 1024 * 1024 * 1024),
+      );
+
+      return {
+        path: pressurePath,
+        availableBytes,
+        totalBytes,
+        freePercent,
+        targetFreeBytes,
+        underPressure: availableBytes < minFreeBytes || freePercent < minFreePercent,
+        emergency: availableBytes < emergencyFreeBytes,
+      };
+    } catch (error) {
+      this.logger.error(`Error checking disk pressure for ${pressurePath}:`, error);
+      return undefined;
+    }
+  }
+
+  private buildDiskPressureReclamationOptions(status: DiskPressureStatus): ReclamationRunOptions {
+    const options: ReclamationRunOptions = {
+      mode: 'disk_pressure',
+      includeOrphanWorktrees: true,
+      cleanTerminalRetentionHoursOverride: 0,
+      cleanOrphanRetentionHoursOverride: 0,
+      skipKeepNewestPerRepo: true,
+      maxRemovals: Math.max(
+        1,
+        resolveConfigNumber(this.configManager.get('reclamation.worktrees.pressureMaxRemovalsPerRun'), 100),
+      ),
+    };
+
+    if (status.emergency) {
+      options.dirtyTerminalModeOverride = 'archive_then_reclaim';
+      options.dirtyOrphanModeOverride = 'archive_then_reclaim';
+      options.includeDirtyOrphanWorktrees = true;
+      options.dirtyTerminalRetentionHoursOverride = 0;
+      options.dirtyOrphanRetentionHoursOverride = 0;
+      options.maxRemovals = Math.max(
+        1,
+        resolveConfigNumber(this.configManager.get('reclamation.worktrees.pressureEmergencyMaxRemovalsPerRun'), 250),
+      );
+    }
+
+    return options;
+  }
+
+  private async runDiskPressureReclamation(initialStatus: DiskPressureStatus): Promise<void> {
+    let status: DiskPressureStatus | undefined = initialStatus;
+    let attempts = 0;
+    const maxAttempts = 3;
+
+    while (status && attempts < maxAttempts) {
+      attempts += 1;
+      const report = await this.runReclamation(
+        this.buildDiskPressureReclamationOptions(status),
+        status,
+      );
+      if (!report || report.removed <= 0) {
+        return;
       }
+
+      const nextStatus = this.inspectDiskPressure(Date.now(), true);
+      if (!nextStatus || nextStatus.availableBytes >= status.targetFreeBytes) {
+        return;
+      }
+
+      status = nextStatus;
+    }
+  }
+
+  private async runReclamation(
+    options: ReclamationRunOptions,
+    diskPressure?: DiskPressureStatus,
+  ): Promise<ReclamationReport | undefined> {
+    const mode = options.mode ?? 'manual';
+
+    try {
+      const report = await this.reclamationService.run(options);
+      if (diskPressure || report.removed > 0 || report.errors.length > 0) {
+        const pressureSuffix = diskPressure
+          ? `; disk free ${formatGiB(diskPressure.availableBytes)} (${diskPressure.freePercent.toFixed(1)}%) at ${diskPressure.path}`
+          : '';
+        this.logger.log(`Reclamation ${mode} removed ${report.removed} worktree(s), skipped ${report.worktrees.skipped}, errors ${report.errors.length}${pressureSuffix}`);
+      }
+      return report;
     } catch (error) {
       this.logger.error('Error running Ralph reclamation:', error);
+      return undefined;
     }
   }
 
@@ -2425,7 +2692,14 @@ export class DependencyWatcher {
         && (hadObjectiveProgress || storyChanged)
         && !hasTransientRecoveryUnsafeDeliveryMarker(task)
       );
-      const openedFreshRevivalWindow = canReviveStoppedSameSignature && deadlineAt <= now;
+      const canRefreshExpiredNeverRequeuedWindow = Boolean(
+        deadlineAt <= now
+        && currentTotalRequeues === 0
+        && currentAutoRequeues < recoveryConfig.autoRecoveryHardCap
+        && (!stoppedAt || stoppedReason === 'transient_deadline_exhausted')
+        && !hasTransientRecoveryUnsafeDeliveryMarker(task)
+      );
+      const openedFreshRevivalWindow = (canReviveStoppedSameSignature || canRefreshExpiredNeverRequeuedWindow) && deadlineAt <= now;
       if (openedFreshRevivalWindow) {
         startedAt = now;
         deadlineAt = now + (recoveryConfig.transientRecoveryDeadlineSeconds * 1000);
@@ -2458,18 +2732,28 @@ export class DependencyWatcher {
 
       let stopReason: string | undefined;
       let stopMessage: string | undefined;
+      const shouldOpenRateLimitCircuit = Boolean(
+        recoveryConfig.transientRateLimitCircuitBreakerEnabled
+        && isRateLimitTransientFailure(transientFailure)
+        && !hadObjectiveProgress
+        && !storyChanged
+        && nextConsecutiveSameSignature >= recoveryConfig.transientRateLimitCircuitBreakerSameSignatureLimit
+      );
       if (deadlineAt <= now) {
         stopReason = 'transient_deadline_exhausted';
         stopMessage = 'Transient recovery deadline exhausted';
+      } else if (hasTransientRecoveryUnsafeDeliveryMarker(task)) {
+        stopReason = 'transient_unsafe_delivery_marker';
+        stopMessage = 'Transient recovery is blocked by delivery/finalizer markers';
+      } else if (shouldOpenRateLimitCircuit) {
+        stopReason = 'transient_rate_limit_circuit_open';
+        stopMessage = 'Backend rate limit circuit opened after repeated 429/usage-limit failures without objective progress';
       } else if (currentTotalRequeues >= recoveryConfig.maxTransientRecoveryRequeues) {
         stopReason = 'transient_budget_exhausted';
         stopMessage = 'Transient recovery requeue budget exhausted';
       } else if (currentAutoRequeues >= recoveryConfig.autoRecoveryHardCap) {
         stopReason = 'auto_recovery_hard_cap_reached';
         stopMessage = 'Auto-recovery hard cap reached';
-      } else if (hasTransientRecoveryUnsafeDeliveryMarker(task)) {
-        stopReason = 'transient_unsafe_delivery_marker';
-        stopMessage = 'Transient recovery is blocked by delivery/finalizer markers';
       } else if (
         nextConsecutiveSameSignature >= recoveryConfig.maxTransientRecoverySameSignature
         && (
@@ -2484,8 +2768,10 @@ export class DependencyWatcher {
       if (stopReason && !stoppedAt) {
         await this.stateManager.updateTask(task.id, {
           ...commonUpdates,
+          transientRecoveryNextEligibleAt: undefined,
           transientRecoveryStoppedAt: now,
           transientRecoveryStopReason: stopReason,
+          autoRecoveryNextEligibleAt: undefined,
           autoRecoveryStoppedAt: now,
           autoRecoveryStopReason: stopReason,
           autoRecoveryLastReason: stopMessage,
@@ -2502,6 +2788,7 @@ export class DependencyWatcher {
             failureSignature: transientFailure.signature,
             consecutiveSameSignature: nextConsecutiveSameSignature,
             totalRequeues: currentTotalRequeues,
+            rateLimitCircuitOpen: isTransientRateLimitCircuitOpenReason(stopReason),
             deadlineAt,
           },
         });
@@ -2509,11 +2796,11 @@ export class DependencyWatcher {
         continue;
       }
 
-      if (stoppedAt && !canReviveStoppedSameSignature) {
+      if (stoppedAt && !canReviveStoppedSameSignature && !canRefreshExpiredNeverRequeuedWindow) {
         continue;
       }
 
-      if (!canReviveStoppedSameSignature && !task.transientRecoveryNextEligibleAt) {
+      if (!canReviveStoppedSameSignature && !canRefreshExpiredNeverRequeuedWindow && !task.transientRecoveryNextEligibleAt) {
         const delayMs = resolveTransientRecoveryDelayMs(currentTotalRequeues + 1, recoveryConfig);
         const nextEligibleAt = now + delayMs;
         await this.stateManager.updateTask(task.id, {
@@ -3138,6 +3425,7 @@ export class DependencyWatcher {
     const tasks = (await this.stateManager.listTasks())
       .filter(input.isCandidate)
       .filter((task) => !task.followupTaskIds?.length)
+      .filter((task) => !shouldSuppressStoppedRecoveryFollowup(task, input.reason(task)))
       .sort((a: Task, b: Task) => a.startTime - b.startTime);
 
     for (const task of tasks) {
@@ -4543,6 +4831,31 @@ export class DependencyWatcher {
     );
   }
 
+  private buildTargetSyncOnlyRetryUpdates(
+    targetBranch: string,
+    strategy: MergeStrategy,
+    commitSha: string,
+    task: Task,
+  ): Partial<Task> {
+    const result = syncTargetBranchIfSafe(task.repoPath, targetBranch, commitSha);
+    const targetSyncStatus: Task['targetSyncStatus'] = result.synced
+      ? 'synced'
+      : /sync deferred/i.test(result.message)
+        ? 'deferred_dirty_checkout'
+        : /target sync disabled|sync disabled/i.test(result.message)
+          ? 'disabled'
+          : 'failed';
+
+    return {
+      mergeTargetBranch: targetBranch,
+      mergeStrategy: strategy,
+      mergeMessage: result.message,
+      targetSyncStatus,
+      targetSyncedAt: result.synced ? Date.now() : undefined,
+      targetSyncDeferredReason: result.synced ? undefined : result.message,
+    };
+  }
+
   private async markCompletedTaskIntegrationFailure(
     task: Task,
     failureUpdates: Partial<Task>,
@@ -4745,7 +5058,13 @@ export class DependencyWatcher {
         }
 
         try {
-          const mergeUpdates = await this.autoMergeTaskIfEnabled(latestTask);
+          const commitSha = latestTask.integrationCommitSha || latestTask.mergeCommitSha;
+          const mergeUpdates = this.mergeTaskIsDefault
+            && commitSha
+            && latestTask.worktree
+            && !fs.existsSync(latestTask.worktree)
+            ? this.buildTargetSyncOnlyRetryUpdates(policy.targetBranch, policy.strategy, commitSha, latestTask)
+            : await this.autoMergeTaskIfEnabled(latestTask);
           if (Object.keys(mergeUpdates).length === 0) {
             return;
           }

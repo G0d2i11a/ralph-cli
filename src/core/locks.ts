@@ -77,16 +77,21 @@ function isDirectoryLockStale(
 ): boolean {
   try {
     if (fs.existsSync(lockInfoPath)) {
-      const content = fs.readFileSync(lockInfoPath, 'utf-8');
-      const lockInfo = JSON.parse(content) as { pid?: number };
+      try {
+        const content = fs.readFileSync(lockInfoPath, 'utf-8');
+        const lockInfo = JSON.parse(content) as { pid?: number };
 
-      if (typeof lockInfo.pid === 'number') {
-        try {
-          process.kill(lockInfo.pid, 0);
-          return false;
-        } catch {
-          return true;
+        if (typeof lockInfo.pid === 'number') {
+          try {
+            process.kill(lockInfo.pid, 0);
+            return false;
+          } catch {
+            return true;
+          }
         }
+      } catch {
+        // Empty/corrupt owner files can be left behind by interrupted lock acquisition.
+        // Fall through to the directory mtime stale check instead of wedging forever.
       }
     }
 

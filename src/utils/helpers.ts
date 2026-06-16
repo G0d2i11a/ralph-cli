@@ -1,11 +1,12 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import matter from 'gray-matter';
-import type { PRD, UserStory } from '../types/prd';
+import type { PRD, PRDReferenceImplementation, PRDRepairOf, PRDSchedulerHints, UserStory } from '../types/prd';
 import type { Task } from '../types/task';
 import type { StateManager } from '../core/state';
 import { deriveTaskDeliveryStatus, resolveTaskIntegrationStatus } from '../core/task-delivery';
 import { evaluateAutoRecovery } from '../core/auto-recovery-state';
+import { inferDependencyRepairIdentityFromTask, sameRepoPath } from '../core/dependency-identity';
 
 // Stagnation detection thresholds
 export const STAGNATION_THRESHOLDS = {
@@ -36,6 +37,58 @@ function normalizeStringArray(value: unknown): string[] {
 function normalizeOptionalStringArray(value: unknown): string[] | undefined {
   const normalized = normalizeStringArray(value);
   return normalized.length > 0 ? normalized : undefined;
+}
+
+function normalizeOptionalRecord<T extends Record<string, unknown>>(value: unknown): T | undefined {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    return undefined;
+  }
+
+  return value as T;
+}
+
+function normalizeRepairOf(value: unknown): PRDRepairOf | undefined {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    return undefined;
+  }
+
+  const raw = value as Partial<PRDRepairOf>;
+  const prdId = normalizeString(raw.prdId);
+  if (!prdId) {
+    return undefined;
+  }
+
+  return {
+    prdId,
+    taskId: normalizeString(raw.taskId) || undefined,
+    reason: normalizeString(raw.reason) || undefined,
+  };
+}
+
+function normalizeSchedulerHints(value: unknown): PRDSchedulerHints | undefined {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    return undefined;
+  }
+
+  const raw = value as Record<string, unknown>;
+  const hints: PRDSchedulerHints = { ...raw };
+  const priorityClass = normalizeString(raw.priorityClass);
+  const effectiveDependencyPrdId = normalizeString(raw.effectiveDependencyPrdId);
+  const releasesDependenciesFor = normalizeOptionalStringArray(raw.releasesDependenciesFor);
+
+  if (priorityClass) {
+    hints.priorityClass = priorityClass;
+  }
+
+  if (effectiveDependencyPrdId) {
+    hints.effectiveDependencyPrdId = effectiveDependencyPrdId;
+  }
+
+  if (releasesDependenciesFor) {
+    hints.releasesDependenciesFor = releasesDependenciesFor;
+  }
+
+  return hints;
 }
 
 function resolvePrdTitle(prd: Partial<PRD> & Record<string, unknown>, fallbackId: string): string {
@@ -82,10 +135,20 @@ function normalizePrd(prd: Partial<PRD> & Record<string, unknown>, fallbackId: s
     title: resolvePrdTitle(prd, fallbackId),
     description: normalizeString(prd.description),
     userStories,
+    acceptanceCriteria: normalizeOptionalStringArray(prd.acceptanceCriteria),
+    nonGoals: normalizeOptionalStringArray(prd.nonGoals),
+    safetyBoundaries: normalizeOptionalStringArray(prd.safetyBoundaries),
+    forbiddenWriteSurface: normalizeOptionalStringArray(prd.forbiddenWriteSurface),
+    verificationCommands: normalizeOptionalStringArray(prd.verificationCommands),
     dependencies: normalizeStringArray(prd.dependencies),
     writeSurface: normalizeOptionalStringArray(prd.writeSurface),
     conflictDomains: normalizeOptionalStringArray(prd.conflictDomains),
     integrationLane: normalizeString(prd.integrationLane) || undefined,
+    priorityClass: normalizeString(prd.priorityClass) || undefined,
+    repairOf: normalizeRepairOf(prd.repairOf),
+    releasesDependenciesFor: normalizeOptionalStringArray(prd.releasesDependenciesFor),
+    schedulerHints: normalizeSchedulerHints(prd.schedulerHints),
+    referenceImplementation: normalizeOptionalRecord<PRDReferenceImplementation>(prd.referenceImplementation),
   };
 }
 
@@ -155,10 +218,20 @@ export function parsePRDContent(content: string, prdPath: string = 'prd.json'): 
     title: frontmatter.title,
     description: frontmatter.description,
     userStories: frontmatterStories && frontmatterStories.length > 0 ? frontmatterStories : bodyStories,
+    acceptanceCriteria: frontmatter.acceptanceCriteria,
+    nonGoals: frontmatter.nonGoals,
+    safetyBoundaries: frontmatter.safetyBoundaries,
+    forbiddenWriteSurface: frontmatter.forbiddenWriteSurface,
+    verificationCommands: frontmatter.verificationCommands,
     dependencies: frontmatter.dependencies,
     writeSurface: frontmatter.writeSurface,
     conflictDomains: frontmatter.conflictDomains,
     integrationLane: frontmatter.integrationLane,
+    priorityClass: frontmatter.priorityClass,
+    repairOf: frontmatter.repairOf,
+    releasesDependenciesFor: frontmatter.releasesDependenciesFor,
+    schedulerHints: frontmatter.schedulerHints,
+    referenceImplementation: frontmatter.referenceImplementation,
   }, fallbackId);
 }
 
@@ -318,6 +391,8 @@ export interface DependencyBlocker {
   reason: string;
   retryable?: boolean;
   autoRecoveryActive?: boolean;
+  dependencyRepairActive?: boolean;
+  repairTaskIds?: string[];
   actionRequired: boolean;
 }
 
@@ -327,10 +402,66 @@ export interface DependencyCheckResult {
   blockers: DependencyBlocker[];
   failed: string[];
   recovering: string[];
+  repairTaskIds: string[];
   missing: string[];
 }
 
-function classifyDependencyBlocker(depId: string, depTask: Task | null): DependencyBlocker | null {
+const ACTIVE_DEPENDENCY_REPAIR_STATUSES = new Set<Task['status']>([
+  'pending',
+  'running',
+  'ready_to_finalize',
+  'finalizing',
+  'failed_finalize',
+]);
+
+function uniqueStrings(values: Array<string | undefined>): string[] {
+  return Array.from(new Set(values.filter((value): value is string => Boolean(value))));
+}
+
+function matchesRepoPath(task: Task, repoPath?: string): boolean {
+  return !repoPath || sameRepoPath(task.repoPath, repoPath);
+}
+
+function isDependencyRepairTaskForPrd(task: Task, depId: string, candidates: Task[] = []): boolean {
+  const identity = inferDependencyRepairIdentityFromTask(task, candidates);
+  return identity?.repairOf.prdId === depId
+    || identity?.releasesDependenciesFor.includes(depId) === true;
+}
+
+function isActiveDependencyRepairTaskForPrd(task: Task, depId: string, candidates: Task[] = []): boolean {
+  return isDependencyRepairTaskForPrd(task, depId, candidates)
+    && ACTIVE_DEPENDENCY_REPAIR_STATUSES.has(task.status);
+}
+
+function isIntegratedDependencyRepairTaskForPrd(task: Task, depId: string, candidates: Task[] = []): boolean {
+  return isDependencyRepairTaskForPrd(task, depId, candidates)
+    && task.status === 'completed'
+    && resolveTaskIntegrationStatus(task) === 'integrated';
+}
+
+function findActiveDependencyRepairTasks(
+  depId: string,
+  tasks: Task[],
+  options: { repoPath?: string },
+): Task[] {
+  return tasks.filter((task) => (
+    matchesRepoPath(task, options.repoPath)
+    && isActiveDependencyRepairTaskForPrd(task, depId, tasks)
+  ));
+}
+
+function findIntegratedDependencyRepairTask(
+  depId: string,
+  tasks: Task[],
+  options: { repoPath?: string },
+): Task | undefined {
+  return tasks.find((task) => (
+    matchesRepoPath(task, options.repoPath)
+    && isIntegratedDependencyRepairTaskForPrd(task, depId, tasks)
+  ));
+}
+
+function classifyDependencyBlocker(depId: string, depTask: Task | null, candidates: Task[] = []): DependencyBlocker | null {
   if (!depTask) {
     return {
       prdId: depId,
@@ -349,7 +480,8 @@ function classifyDependencyBlocker(depId: string, depTask: Task | null): Depende
     return null;
   }
 
-  const autoRecoveryActive = evaluateAutoRecovery(depTask).active;
+  const dependencyRepairActive = isActiveDependencyRepairTaskForPrd(depTask, depId, candidates);
+  const autoRecoveryActive = evaluateAutoRecovery(depTask).active || dependencyRepairActive;
   const base = {
     prdId: depId,
     taskId: depTask.id,
@@ -357,6 +489,8 @@ function classifyDependencyBlocker(depId: string, depTask: Task | null): Depende
     integrationStatus,
     retryable: depTask.lastErrorRetryable,
     autoRecoveryActive,
+    dependencyRepairActive,
+    repairTaskIds: dependencyRepairActive ? [depTask.id] : undefined,
   };
 
   if (depTask.status === 'failed') {
@@ -473,19 +607,50 @@ export async function checkDependencies(
       blockers: [],
       failed: [],
       recovering: [],
+      repairTaskIds: [],
       missing: [],
     };
   }
 
   const blockers: DependencyBlocker[] = [];
+  const tasks = await stateManager.listTasks();
 
   for (const depId of prd.dependencies) {
+    const integratedRepairTask = findIntegratedDependencyRepairTask(depId, tasks, {
+      repoPath: options.repoPath,
+    });
+    if (integratedRepairTask) {
+      continue;
+    }
+
     const depTask = await stateManager.getTaskByPrdId(depId, {
       repoPath: options.repoPath,
     });
 
-    const blocker = classifyDependencyBlocker(depId, depTask);
+    const blocker = classifyDependencyBlocker(depId, depTask, tasks);
     if (blocker) {
+      if (blocker.actionRequired) {
+        const activeRepairTasks = findActiveDependencyRepairTasks(depId, tasks, {
+          repoPath: options.repoPath,
+        });
+        const repairTaskIds = uniqueStrings([
+          ...(blocker.repairTaskIds || []),
+          ...activeRepairTasks.map((task) => task.id),
+        ]);
+
+        if (repairTaskIds.length > 0) {
+          blockers.push({
+            ...blocker,
+            reason: `dependency is waiting for active repair task ${repairTaskIds.join(', ')}`,
+            autoRecoveryActive: true,
+            dependencyRepairActive: true,
+            repairTaskIds,
+            actionRequired: false,
+          });
+          continue;
+        }
+      }
+
       const repairTaskId = depTask?.baselineQualityGate?.repairTaskId;
       if (
         blocker.actionRequired
@@ -521,6 +686,7 @@ export async function checkDependencies(
     recovering: blockers
       .filter((blocker) => blocker.autoRecoveryActive && !blocker.actionRequired)
       .map((blocker) => blocker.prdId),
+    repairTaskIds: uniqueStrings(blockers.flatMap((blocker) => blocker.repairTaskIds || [])),
     missing: blockers
       .filter((blocker) => blocker.kind === 'missing')
       .map((blocker) => blocker.prdId),

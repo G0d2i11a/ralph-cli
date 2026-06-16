@@ -102,6 +102,26 @@ Each Ralph home has its own `config.json`, `tasks/`, `manager/state.json`, `mana
 
 If you intentionally share one Ralph home across repos, coordination remains repo-scoped, and `ralph queue`, `ralph manager-status`, and `ralph doctor` report `repoCount`, `mixedRepos`, and active `repoPaths` so the mixed control plane is visible.
 
+### Initialize a Project
+
+Run `ralph init` once per project/control-plane home. It creates the Ralph home, writes project metadata, and registers the project with Ralph Menu Bar so old temporary homes do not appear automatically.
+
+```bash
+ralph --home ~/.ralph-homes/my-project init --repo ~/Project/my-project --name my-project
+ralph --home ~/.ralph-homes/anchorwise init --repo ~/Project/marginary --name Anchorwise
+```
+
+Useful options:
+
+```text
+--repo <path>              Repository path (defaults to current directory)
+--name <name>              Project display name
+--agent <claude|codex>     Default agent path/name stored in config
+--backend <name>           Default backend stored in config
+--max-concurrent <count>   Per-home concurrency
+--no-register-menubar      Initialize without adding the project to Ralph Menu Bar
+```
+
 ### Parallel Ralph
 
 Ralph CLI is meant to be used as a small local control plane, not as a single foreground command that blocks one repository at a time.

@@ -215,6 +215,16 @@ function readGitDir(worktreePath: string): string {
   return path.resolve(worktreePath, match[1]);
 }
 
+function resolveGitCommonDir(repoPath: string): string {
+  const output = execFileSync('git', ['rev-parse', '--git-common-dir'], {
+    cwd: repoPath,
+    encoding: 'utf-8',
+    stdio: ['ignore', 'pipe', 'pipe'],
+  }).trim();
+
+  return path.isAbsolute(output) ? output : path.resolve(repoPath, output);
+}
+
 function ensurePathInside(parent: string, candidate: string, label: string): void {
   const normalizedParent = resolveExistingPath(parent);
   const normalizedCandidate = resolveExistingPath(candidate);
@@ -229,7 +239,7 @@ function assertFinalizerScope(task: Task): void {
   const repoPath = resolveExistingPath(task.repoPath);
   const worktreePath = resolveExistingPath(task.worktree);
   const allowedWorktreeRoot = path.join(repoPath, '.ralph-worktrees');
-  const allowedGitWorktreeRoot = path.join(repoPath, '.git', 'worktrees');
+  const allowedGitWorktreeRoot = path.join(resolveGitCommonDir(repoPath), 'worktrees');
 
   ensurePathInside(allowedWorktreeRoot, worktreePath, 'Worktree');
 

@@ -1,5 +1,195 @@
 import Foundation
 
+private func pathExists(_ path: String) -> Bool {
+  FileManager.default.fileExists(atPath: path)
+}
+
+private func looksLikeRalphHome(_ path: String) -> Bool {
+  var isDirectory: ObjCBool = false
+  guard FileManager.default.fileExists(atPath: path, isDirectory: &isDirectory), isDirectory.boolValue else {
+    return false
+  }
+
+  let markers = [
+    "config.json",
+    "tasks",
+    "manager/state.json",
+    "manager.lock",
+    "logs",
+    "locks",
+    "generated-prds",
+  ]
+
+  return markers.contains { marker in
+    pathExists(URL(fileURLWithPath: path).appendingPathComponent(marker).path)
+  }
+}
+
+private func hasRuntimeEvidence(_ homePath: String) -> Bool {
+  let homeURL = URL(fileURLWithPath: homePath)
+  if pathExists(homeURL.appendingPathComponent("manager").appendingPathComponent("state.json").path)
+    || pathExists(homeURL.appendingPathComponent("manager.lock").path) {
+    return true
+  }
+
+  let tasksDirectory = homeURL.appendingPathComponent("tasks", isDirectory: true)
+  guard let taskDirectories = try? FileManager.default.contentsOfDirectory(
+    at: tasksDirectory,
+    includingPropertiesForKeys: [.isDirectoryKey],
+    options: [.skipsHiddenFiles]
+  ) else {
+    return false
+  }
+
+  return taskDirectories.contains { $0.lastPathComponent.hasPrefix("task-") }
+}
+
+private func canonicalPath(_ path: String) -> String {
+  let expanded = expandPath(path)
+  return URL(fileURLWithPath: expanded).resolvingSymlinksInPath().standardized.path
+}
+
+private struct RalphHomeTaskState: Decodable {
+  let repoPath: String?
+}
+
+private struct RalphHomeManagerState: Decodable {
+  let repoPath: String?
+  let repoPaths: [String]?
+}
+
+private func decodeJsonFile<T: Decodable>(_ type: T.Type, at path: String) -> T? {
+  guard let data = try? Data(contentsOf: URL(fileURLWithPath: path)) else {
+    return nil
+  }
+  return try? JSONDecoder().decode(type, from: data)
+}
+
+private func projectNameFromRepoPath(_ repoPath: String?) -> String? {
+  guard let repoPath else { return nil }
+  let name = URL(fileURLWithPath: repoPath).lastPathComponent.trimmingCharacters(in: .whitespacesAndNewlines)
+  return name.isEmpty ? nil : name
+}
+
+private func repoPathFromRalphHomeState(_ homePath: String) -> String? {
+  let managerStatePath = URL(fileURLWithPath: homePath)
+    .appendingPathComponent("manager")
+    .appendingPathComponent("state.json")
+    .path
+
+  if let managerState = decodeJsonFile(RalphHomeManagerState.self, at: managerStatePath) {
+    if let repoPath = managerState.repoPath?.trimmingCharacters(in: .whitespacesAndNewlines),
+       !repoPath.isEmpty {
+      return repoPath
+    }
+    if let repoPath = managerState.repoPaths?.first?.trimmingCharacters(in: .whitespacesAndNewlines),
+       !repoPath.isEmpty {
+      return repoPath
+    }
+  }
+
+  let tasksDirectory = URL(fileURLWithPath: homePath).appendingPathComponent("tasks", isDirectory: true)
+  guard let taskDirectories = try? FileManager.default.contentsOfDirectory(
+    at: tasksDirectory,
+    includingPropertiesForKeys: [.contentModificationDateKey],
+    options: [.skipsHiddenFiles]
+  ) else {
+    return nil
+  }
+
+  let sortedTaskDirectories = taskDirectories.sorted { lhs, rhs in
+    let lhsDate = (try? lhs.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
+    let rhsDate = (try? rhs.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
+    return lhsDate > rhsDate
+  }
+
+  for taskDirectory in sortedTaskDirectories {
+    let statePath = taskDirectory.appendingPathComponent("state.json").path
+    if let taskState = decodeJsonFile(RalphHomeTaskState.self, at: statePath),
+       let repoPath = taskState.repoPath?.trimmingCharacters(in: .whitespacesAndNewlines),
+       !repoPath.isEmpty {
+      return repoPath
+    }
+  }
+
+  return nil
+}
+
+private func projectNameFromRalphHomeState(_ homePath: String) -> String? {
+  projectNameFromRepoPath(repoPathFromRalphHomeState(homePath))
+}
+
+private func discoverRalphHomeProjects() -> [RalphMenuBarProject] {
+  let fileManager = FileManager.default
+  let userHome = fileManager.homeDirectoryForCurrentUser
+  var candidates: [String] = [
+    userHome.appendingPathComponent(".ralph").path,
+  ]
+
+  if let homeEntries = try? fileManager.contentsOfDirectory(
+    at: userHome,
+    includingPropertiesForKeys: [.isDirectoryKey],
+    options: []
+  ) {
+    candidates.append(contentsOf: homeEntries
+      .filter { $0.lastPathComponent.hasPrefix(".ralph-") }
+      .map(\.path))
+  }
+
+  let homesDirectory = userHome.appendingPathComponent(".ralph-homes", isDirectory: true)
+  if let homeEntries = try? fileManager.contentsOfDirectory(
+    at: homesDirectory,
+    includingPropertiesForKeys: [.isDirectoryKey],
+    options: [.skipsHiddenFiles]
+  ) {
+    candidates.append(contentsOf: homeEntries.map(\.path))
+  }
+
+  var seen = Set<String>()
+  return candidates
+    .map(canonicalPath)
+    .filter { path in
+      if seen.contains(path) || !looksLikeRalphHome(path) || !hasRuntimeEvidence(path) {
+        return false
+      }
+      seen.insert(path)
+      return true
+    }
+    .sorted()
+    .map {
+      RalphMenuBarProject(
+        name: projectNameFromRalphHomeState($0) ?? RalphMenuBarConfig.inferredProjectName(for: $0),
+        ralphHome: $0
+      )
+    }
+}
+
+private func dedupeProjectsByHomeAndRepo(_ projects: [RalphMenuBarProject]) -> [RalphMenuBarProject] {
+  var seenHomes = Set<String>()
+  var seenRepos = Set<String>()
+  var output: [RalphMenuBarProject] = []
+
+  for project in projects {
+    let homeKey = canonicalPath(project.ralphHome)
+    if seenHomes.contains(homeKey) {
+      continue
+    }
+
+    if let repoPath = repoPathFromRalphHomeState(homeKey) {
+      let repoKey = canonicalPath(repoPath)
+      if seenRepos.contains(repoKey) {
+        continue
+      }
+      seenRepos.insert(repoKey)
+    }
+
+    seenHomes.insert(homeKey)
+    output.append(project)
+  }
+
+  return output
+}
+
 struct RalphMenuBarProject: Codable, Identifiable, Equatable {
   var name: String
   var ralphHome: String
@@ -13,6 +203,7 @@ struct RalphMenuBarConfig: Codable {
   var ralphHome: String
   var projects: [RalphMenuBarProject]?
   var selectedProjectId: String?
+  var autoDiscoverHomes: Bool?
   var refreshSeconds: TimeInterval
   var staleHeartbeatSeconds: TimeInterval
   var recentCompletedWindowSeconds: TimeInterval
@@ -24,6 +215,7 @@ struct RalphMenuBarConfig: Codable {
       ralphHome: home,
       projects: defaultProjects(primaryHome: home),
       selectedProjectId: nil,
+      autoDiscoverHomes: false,
       refreshSeconds: 5,
       staleHeartbeatSeconds: 900,
       recentCompletedWindowSeconds: 7200,
@@ -56,19 +248,10 @@ struct RalphMenuBarConfig: Codable {
       .filter { !$0.name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
       .filter { !$0.ralphHome.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
 
-    if configured.isEmpty {
-      return Self.defaultProjects(primaryHome: ralphHome)
-    }
+    let configuredOrDefault = configured.isEmpty ? Self.defaultProjects(primaryHome: ralphHome) : configured
+    let discovered = autoDiscoverHomes == false ? [] : discoverRalphHomeProjects()
 
-    var seen = Set<String>()
-    return configured.filter { project in
-      let key = expandPath(project.ralphHome)
-      if seen.contains(key) {
-        return false
-      }
-      seen.insert(key)
-      return true
-    }
+    return dedupeProjectsByHomeAndRepo(configuredOrDefault + discovered)
   }
 }
 
@@ -312,6 +495,15 @@ struct ManagerStatusSnapshot: Decodable {
   let message: String?
 }
 
+struct ManagerControlSnapshot: Decodable {
+  let schedulingPaused: Bool?
+  let pausedAt: TimeInterval?
+  let pausedBy: String?
+  let pauseReason: String?
+  let resumedAt: TimeInterval?
+  let controlPath: String?
+}
+
 struct QueueSummary: Decodable {
   let totalActive: Int?
   let running: Int?
@@ -367,6 +559,7 @@ struct QueueSnapshotPayload: Decodable {
   let ralphHome: String
   let repoPaths: [String]
   let manager: ManagerStatusSnapshot?
+  let control: ManagerControlSnapshot?
   let summary: QueueSummary?
   let actions: [TaskState]?
   let recentCompleted: [TaskState]?
@@ -387,6 +580,7 @@ struct Snapshot {
   let totalCompletedCount: Int
   let repoPaths: [String]
   let managerState: ManagerState?
+  let managerControl: ManagerControlSnapshot?
   let managerIsStale: Bool
   let managerIsActive: Bool
   let managerCodeDriftDetected: Bool
@@ -404,6 +598,7 @@ struct Snapshot {
   var queuedCount: Int { queuedTasks.count }
   var actionCount: Int { awaitingApprovalCount + blockedCount + policyBlockedCount + diagnosticsCount }
   var recentCompletedCount: Int { recentCompleted.count }
+  var isSchedulingPaused: Bool { managerControl?.schedulingPaused == true }
 
   var awaitingApprovalTasks: [TaskState] {
     actions.filter { queuePhase($0) == "awaiting_approval" }
@@ -441,6 +636,10 @@ struct Snapshot {
     active.filter { isQueuedQueueTask($0) }
   }
 
+  var stoppableRunningTasks: [TaskState] {
+    executingTasks.filter { isStoppableTask($0) }
+  }
+
   static func empty(homePath: String) -> Snapshot {
     Snapshot(
       homePath: homePath,
@@ -454,6 +653,7 @@ struct Snapshot {
       totalCompletedCount: 0,
       repoPaths: [],
       managerState: nil,
+      managerControl: nil,
       managerIsStale: false,
       managerIsActive: false,
       managerCodeDriftDetected: false,

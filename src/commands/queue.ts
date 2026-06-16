@@ -18,6 +18,7 @@ import { StateManager } from '../core/state';
 import { TaskScheduler } from '../core/scheduler';
 import { Task } from '../types/task';
 import { resolveRalphHome } from '../core/paths';
+import { ManagerControlSnapshot, readManagerControl } from '../core/manager-control';
 import { detectDuplicateRepoManagers, DuplicateRepoManagerReport } from '../core/repo-manager-registry';
 
 interface PendingSummary {
@@ -26,6 +27,7 @@ interface PendingSummary {
   dependencyBlockers?: unknown[];
   failedDependencies?: string[];
   recoveringDependencies?: string[];
+  repairTaskIds?: string[];
   missingDependencies?: string[];
   blockers: string[];
   failedBlockers?: string[];
@@ -90,6 +92,7 @@ export type QueueStateDetail =
   | 'blocked_by_coordination'
   | 'blocked_by_baseline'
   | 'blocked_by_environment'
+  | 'blocked_by_manager_pause'
   | 'blocked_by_manager_ownership'
   | 'blocked_by_ingestion_config'
   | 'blocked_by_deadlock'
@@ -145,6 +148,7 @@ export interface QueueState {
   nextAction: string;
   autonomous: boolean;
   blockers?: string[];
+  repairTaskIds?: string[];
   recovery?: QueueRecoveryState;
   approval?: QueueApprovalState;
   policy?: QueuePolicyState;
@@ -176,9 +180,11 @@ interface SystemBlockItem {
 }
 
 interface QueueActionability {
-  status: 'idle' | 'runnable' | 'running' | 'recovering' | 'awaiting_approval' | 'blocked' | 'blocked_by_policy' | 'diagnostics' | 'ingestion_backlog';
+  status: 'idle' | 'paused' | 'runnable' | 'running' | 'recovering' | 'awaiting_approval' | 'blocked' | 'blocked_by_policy' | 'diagnostics' | 'ingestion_backlog';
   reason?: string;
   principalBlocker?: string;
+  principalRepairTask?: string;
+  repairBlockedBy?: string;
   nextAction?: string;
 }
 
@@ -252,6 +258,13 @@ function isIntegratedCompletion(task: Task): boolean {
   return task.status === 'completed' && resolveTaskIntegrationStatus(task) === 'integrated';
 }
 
+function isGeneratedFollowupTask(task: Task): boolean {
+  return Boolean(
+    task.prdId?.startsWith('followup:')
+    || task.prdPath?.split(/[\\/]/).includes('generated-prds')
+  );
+}
+
 function isDeliveryPendingCompletion(task: Task): boolean {
   if (!isIntegratedCompletion(task)) {
     return false;
@@ -305,6 +318,10 @@ function hasStoppedRecoveryState(task: Task): boolean {
   );
 }
 
+function isGeneratedFollowupStoppedRecovery(task: Task): boolean {
+  return isGeneratedFollowupTask(task) && hasStoppedRecoveryState(task);
+}
+
 function stoppedFailedReason(task: Task): string {
   if (task.mergeConflictPhase === 'integration_sync') {
     return 'integration_sync_conflict';
@@ -315,6 +332,10 @@ function stoppedFailedReason(task: Task): string {
   }
 
   if (task.transientRecoveryStoppedAt) {
+    if (task.transientRecoveryStopReason === 'transient_rate_limit_circuit_open') {
+      return 'transient_rate_limit_circuit_open';
+    }
+
     return 'transient_recovery_stopped';
   }
 
@@ -339,6 +360,10 @@ function stoppedFailedReason(task: Task): string {
   }
 
   if (task.autoRecoveryStoppedAt) {
+    if (task.autoRecoveryStopReason === 'operator_stopped') {
+      return 'task_failed';
+    }
+
     return 'generic_recovery_stopped';
   }
 
@@ -713,6 +738,7 @@ function queueStateFromBlockReason(input: {
     nextAction,
     autonomous,
     blockers,
+    repairTaskIds: pendingState?.repairTaskIds?.length ? pendingState.repairTaskIds : undefined,
     recovery,
     ...extra,
   });
@@ -728,12 +754,23 @@ function queueStateFromBlockReason(input: {
       policy: buildQueuePolicy('policy_unresolved_merge_conflict', reason),
     });
   case 'transient_recovery_stopped':
+    if (isGeneratedFollowupStoppedRecovery(task)) {
+      return state('diagnostics', 'diagnosing_failure', false);
+    }
     return state('recovering', 'retrying_agent_context', true);
+  case 'transient_rate_limit_circuit_open':
+    return state('blocked', 'blocked_by_environment', false);
   case 'agent_context_recovery_stopped':
   case 'story_repair_stopped':
+    if (isGeneratedFollowupStoppedRecovery(task)) {
+      return state('diagnostics', 'diagnosing_failure', false);
+    }
     return state('recovering', 'splitting_story', true);
   case 'failed_blocker_recovery_stopped':
   case 'generic_recovery_stopped':
+    if (isGeneratedFollowupStoppedRecovery(task)) {
+      return state('diagnostics', 'diagnosing_failure', false);
+    }
     return state('recovering', 'generating_followup_prd', true);
   case 'story_incomplete':
     return state('recovering', 'auto_repairing_story', true);
@@ -802,6 +839,7 @@ export function deriveQueueState(
     nextAction,
     autonomous,
     blockers,
+    repairTaskIds: pendingState?.repairTaskIds?.length ? pendingState.repairTaskIds : undefined,
     recovery,
     ...extra,
   });
@@ -953,6 +991,40 @@ function isActiveQueueState(queueState: QueueState): boolean {
     || isActionItem(queueState);
 }
 
+function isOperatorCancelledObsoleteRecoveryTask(task: Task): boolean {
+  if (task.status !== 'failed') {
+    return false;
+  }
+
+  const failure = task.latestFailure as { kind?: unknown; class?: unknown } | undefined;
+  const failureKind = typeof failure?.kind === 'string'
+    ? failure.kind
+    : typeof failure?.class === 'string'
+      ? failure.class
+      : undefined;
+  return failureKind === 'operator_cancelled_obsolete_recovery'
+    && !evaluateAutoRecovery(task).active
+    && !hasHotConflictReservation(task);
+}
+
+function isArchivedTerminalFailure(task: Task): boolean {
+  if (task.status !== 'failed' && task.status !== 'stagnant') {
+    return false;
+  }
+
+  if (
+    task.worktreeReclaimDecision !== 'archive_only'
+    && task.worktreeReclaimDecision !== 'archive_then_reclaim'
+  ) {
+    return false;
+  }
+
+  return Boolean(task.worktreeReclaimEvidencePath)
+    && Boolean(task.worktreeReclaimEvidenceManifestPath)
+    && !evaluateAutoRecovery(task).active
+    && !hasHotConflictReservation(task);
+}
+
 function toCompactStoryProgress(
   storyProgress: Task['storyProgress'],
 ) {
@@ -1050,6 +1122,11 @@ function compactTaskSummary(taskSummary: Record<string, any>) {
     id: taskSummary.id,
     status: taskSummary.status,
     prdId: taskSummary.prdId,
+    effectiveDependencyPrdId: taskSummary.effectiveDependencyPrdId,
+    priorityClass: taskSummary.priorityClass,
+    repairOf: taskSummary.repairOf,
+    releasesDependenciesFor: taskSummary.releasesDependenciesFor,
+    schedulerHints: taskSummary.schedulerHints,
     prdTitle: taskSummary.prdTitle,
     prdPath: taskSummary.prdPath,
     repoPath: taskSummary.repoPath,
@@ -1068,6 +1145,7 @@ function compactTaskSummary(taskSummary: Record<string, any>) {
     blockers: taskSummary.blockers,
     failedDependencies: taskSummary.failedDependencies,
     recoveringDependencies: taskSummary.recoveringDependencies,
+    repairTaskIds: taskSummary.repairTaskIds,
     missingDependencies: taskSummary.missingDependencies,
     failedBlockers: taskSummary.failedBlockers,
     recoveringBlockers: taskSummary.recoveringBlockers,
@@ -1105,6 +1183,11 @@ function summarizeTask(
     id: task.id,
     status: task.status,
     prdId: task.prdId,
+    effectiveDependencyPrdId: task.effectiveDependencyPrdId,
+    priorityClass: task.priorityClass,
+    repairOf: task.repairOf,
+    releasesDependenciesFor: task.releasesDependenciesFor,
+    schedulerHints: task.schedulerHints,
     prdTitle: task.prdTitle,
     prdPath: task.prdPath,
     repoPath: task.repoPath,
@@ -1123,6 +1206,7 @@ function summarizeTask(
     dependencyBlockers: pendingState?.dependencyBlockers,
     failedDependencies: pendingState?.failedDependencies,
     recoveringDependencies: pendingState?.recoveringDependencies,
+    repairTaskIds: pendingState?.repairTaskIds,
     missingDependencies: pendingState?.missingDependencies,
     blockers: pendingState?.reason === 'dependencies'
       ? pendingState.dependencies
@@ -1203,7 +1287,7 @@ export function resolveNextAction(
     return 'manager will normalize this already integrated product task to completed';
   }
 
-  if (task.followupTaskIds?.length) {
+  if (task.followupTaskIds?.length && !isIntegratedCompletion(task)) {
     return `follow-up task ${task.followupTaskIds[0]} is carrying this recovery path`;
   }
 
@@ -1238,6 +1322,13 @@ export function resolveNextAction(
 
     if (task.repairContext?.mode === 'finalize') {
       return `start finalize repair anchored to ${task.repairContext.storyId}`;
+    }
+
+    if (
+      pendingState?.reason === 'queued'
+      && pendingState.running >= pendingState.maxConcurrent
+    ) {
+      return `wait for a concurrency slot; ${pendingState.running}/${pendingState.maxConcurrent} worker slot(s) are occupied`;
     }
 
     return 'start when a concurrency slot is available';
@@ -1281,6 +1372,10 @@ export function resolveNextAction(
       return 'obsolete baseline repair was superseded by a newer package-specific repair';
     }
 
+    if (isGeneratedFollowupStoppedRecovery(task)) {
+      return 'generated follow-up recovery failed; Ralph will not generate another automatic follow-up, inspect and explicitly retry, replace, or archive it';
+    }
+
     if (task.mergeConflictPhase === 'integration_sync') {
       return `resolve the integration branch sync conflict: run ralph repair-conflicts ${task.id} --dry-run; if only allowlisted docs/status conflicts are reported, run --apply, then let manager re-probe or retry the blocked task`;
     }
@@ -1298,6 +1393,10 @@ export function resolveNextAction(
     }
 
     if (task.transientRecoveryStoppedAt) {
+      if (task.transientRecoveryStopReason === 'transient_rate_limit_circuit_open') {
+        return 'backend rate limit circuit is open; wait for quota/backoff to clear, then explicitly retry or resume scheduling when ready';
+      }
+
       return 'inspect stopped transient recovery and explicitly retry or repair';
     }
 
@@ -1310,6 +1409,10 @@ export function resolveNextAction(
     }
 
     if (task.autoRecoveryStoppedAt) {
+      if (task.autoRecoveryStopReason === 'operator_stopped') {
+        return 'operator stopped this task; explicitly retry, repair, or archive if further action is needed';
+      }
+
       return 'manager will generate a follow-up PRD for the stopped recovery state';
     }
 
@@ -1736,8 +1839,39 @@ function buildFollowupShadowedTaskIds(tasks: Task[]): Set<string> {
   return shadowedTaskIds;
 }
 
+function buildObsoleteGeneratedFollowupTaskIds(tasks: Task[]): Set<string> {
+  const tasksById = new Map(tasks.map((task) => [task.id, task]));
+  const obsoleteTaskIds = new Set<string>();
+
+  for (const sourceTask of tasks) {
+    if (!sourceTask.followupTaskIds?.length || !isIntegratedCompletion(sourceTask)) {
+      continue;
+    }
+
+    for (const followupTaskId of sourceTask.followupTaskIds) {
+      const followupTask = tasksById.get(followupTaskId);
+      if (!followupTask || !isGeneratedFollowupTask(followupTask)) {
+        continue;
+      }
+
+      if (
+        followupTask.status === 'running'
+        || followupTask.status === 'finalizing'
+        || hasHotConflictReservation(followupTask)
+      ) {
+        continue;
+      }
+
+      obsoleteTaskIds.add(followupTask.id);
+    }
+  }
+
+  return obsoleteTaskIds;
+}
+
 export function buildSystemBlocks(input: {
   repoPath?: string;
+  control?: ManagerControlSnapshot;
   duplicateManagers?: DuplicateRepoManagerReport;
   ingestion: {
     managerActive: boolean;
@@ -1754,6 +1888,21 @@ export function buildSystemBlocks(input: {
   };
 }): SystemBlockItem[] {
   const items: SystemBlockItem[] = [];
+
+  if (input.control?.schedulingPaused) {
+    const controlError = input.control.error;
+    items.push({
+      id: controlError ? 'manager-control-unreadable' : 'manager-scheduling-paused',
+      scope: 'system',
+      phase: 'blocked',
+      detail: 'blocked_by_manager_pause',
+      reason: controlError ?? 'manager_scheduling_paused',
+      repoPath: input.repoPath,
+      nextAction: controlError
+        ? `repair ${input.control.controlPath} or run ralph resume to rewrite manager control state`
+        : 'run ralph resume to allow auto-ingest, recovery, finalization, and queued task starts',
+    });
+  }
 
   if (input.duplicateManagers?.duplicateRepoManagers) {
     items.push({
@@ -1826,6 +1975,16 @@ export function resolveActionability(input: {
     queuedRunnable: number;
   };
 }): QueueActionability {
+  const paused = input.systemBlocks.find((item) => item.detail === 'blocked_by_manager_pause');
+  if (paused) {
+    return {
+      status: 'paused',
+      reason: paused.reason,
+      principalBlocker: paused.id,
+      nextAction: paused.nextAction,
+    };
+  }
+
   const policyBlock = [
     ...input.systemBlocks.filter((item) => item.phase === 'blocked_by_policy'),
     ...input.actions.filter((item) => item.queueState.phase === 'blocked_by_policy'),
@@ -1915,6 +2074,12 @@ export function resolveActionability(input: {
       status: 'recovering',
       reason: recovering.queueState?.reason ?? recovering.queueState?.detail ?? recovering.autoRecovery?.kind,
       principalBlocker: recovering.id,
+      ...(recovering.queueState?.repairTaskIds?.[0]
+        ? { principalRepairTask: recovering.queueState.repairTaskIds[0] }
+        : {}),
+      ...(recovering.queueState?.blockers?.[0]
+        ? { repairBlockedBy: recovering.queueState.blockers[0] }
+        : {}),
       nextAction: recovering.nextAction,
     };
   }
@@ -1961,12 +2126,22 @@ export async function buildQueueSnapshot(
   const tasks = await stateManager.listTasks();
   const queueStateContext = buildQueueStateContext(tasks);
   const followupShadowedTaskIds = buildFollowupShadowedTaskIds(tasks);
+  const obsoleteGeneratedFollowupTaskIds = buildObsoleteGeneratedFollowupTaskIds(tasks);
   const manager = adjustManagerStatusForFinalizerLease(
     getManagerStatus({ ralphHome, staleAfterMs, now: () => snapshotNow }),
     findFreshFinalizerLease(tasks, snapshotNow),
   );
+  const control = readManagerControl({ ralphHome });
   const activeTasks = tasks.filter((task) => {
     if (isSupersededBaselineRepairTask(task)) {
+      return false;
+    }
+
+    if (isOperatorCancelledObsoleteRecoveryTask(task)) {
+      return false;
+    }
+
+    if (isArchivedTerminalFailure(task)) {
       return false;
     }
 
@@ -1974,6 +2149,10 @@ export async function buildQueueSnapshot(
       queueStateContext.obsoleteBaselineRepairTaskIds?.has(task.id)
       && !hasHotConflictReservation(task)
     ) {
+      return false;
+    }
+
+    if (obsoleteGeneratedFollowupTaskIds.has(task.id)) {
       return false;
     }
 
@@ -2051,6 +2230,10 @@ export async function buildQueueSnapshot(
       id: task.id,
       status: task.status,
       prdId: task.prdId,
+      effectiveDependencyPrdId: task.effectiveDependencyPrdId,
+      priorityClass: task.priorityClass,
+      repairOf: task.repairOf,
+      releasesDependenciesFor: task.releasesDependenciesFor,
       repoPath: task.repoPath,
       queueState: task.queueState,
       reason: task.queueState.reason,
@@ -2117,6 +2300,7 @@ export async function buildQueueSnapshot(
   };
   const systemBlocks = buildSystemBlocks({
     repoPath: queueRepoPath,
+    control,
     duplicateManagers,
     ingestion: {
       managerActive: manager.active,
@@ -2177,6 +2361,7 @@ export async function buildQueueSnapshot(
     ralphHome,
     ...repoSummary,
     manager,
+    control,
     actionability,
     summary,
     actions,

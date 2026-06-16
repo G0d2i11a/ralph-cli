@@ -1,4 +1,6 @@
-export type TaskStatus = 'pending' | 'running' | 'ready_to_finalize' | 'finalizing' | 'completed' | 'failed' | 'failed_finalize' | 'stagnant';
+import type { PRDPriorityClass, PRDRepairOf, PRDSchedulerHints } from './prd';
+
+export type TaskStatus = 'pending' | 'running' | 'ready_to_finalize' | 'finalizing' | 'completed' | 'failed' | 'failed_finalize' | 'stagnant' | 'archived';
 export type TaskMergeStrategy = 'manual' | 'ours' | 'theirs';
 export type StoryStatus = 'pending' | 'in_progress' | 'needs_repair' | 'passed' | 'failed';
 export type FinalizeRepairFailureKind = 'merge_conflict' | 'quality_gate' | 'finalizer_error';
@@ -327,10 +329,18 @@ export interface Task {
   declaredWriteSurface?: string[];
   declaredConflictDomains?: string[];
   integrationLane?: string;
+  priorityClass?: PRDPriorityClass;
+  repairOf?: PRDRepairOf;
+  releasesDependenciesFor?: string[];
+  schedulerHints?: PRDSchedulerHints;
+  effectiveDependencyPrdId?: string;
   enqueuedAt?: number;
   baseRef?: string;
   intendedMergeTarget?: string;
   status: TaskStatus;
+  archivedAt?: number;
+  archivedReason?: string;
+  archivedFromStatus?: TaskStatus;
   revision?: number;
   updatedAt?: number;
   startTime: number;

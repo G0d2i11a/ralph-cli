@@ -21,6 +21,37 @@ test('classifyAgentFailureOutput marks model-capacity failures as retryable tran
   assert.equal(result.explicit, true);
 });
 
+test('classifyAgentFailureOutput marks Codex usage limits as retryable rate limits', () => {
+  const result = classifyAgentFailureOutput(
+    "ERROR: You've hit your usage limit. Visit https://chatgpt.com/codex/settings/usage to purchase more credits or try again at 7:39 AM.",
+  );
+
+  assert.equal(result.kind, 'backend_rate_limited');
+  assert.equal(result.class, 'transient_backend');
+  assert.equal(result.retryable, true);
+  assert.equal(result.explicit, true);
+});
+
+test('classifyAgentFailureOutput marks HTTP 429 retry-limit failures as retryable rate limits', () => {
+  const result = classifyAgentFailureOutput('ERROR: exceeded retry limit, last status: 429');
+
+  assert.equal(result.kind, 'backend_rate_limited');
+  assert.equal(result.class, 'transient_backend');
+  assert.equal(result.retryable, true);
+  assert.equal(result.explicit, true);
+});
+
+test('classifyAgentFailureOutput marks provider auth unavailable as explicit auth/config failure', () => {
+  const result = classifyAgentFailureOutput(
+    'ServiceUnavailableError: OpenAIException - {"error":{"message":"auth_unavailable: no auth available (providers=codex, model=gpt-5.5)"}}',
+  );
+
+  assert.equal(result.kind, 'auth_or_config_error');
+  assert.equal(result.class, 'unknown');
+  assert.equal(result.retryable, false);
+  assert.equal(result.explicit, true);
+});
+
 test('classifyAgentFailureOutput marks reconnecting transport failures as retryable transport errors', () => {
   const result = classifyAgentFailureOutput('Connection lost while streaming output, reconnecting now.');
 

@@ -110,6 +110,50 @@ test('queue state keeps active auto recovery out of action items', () => {
   assert.equal(isActionItem(queueState), false);
 });
 
+test('queue system blocks report manager scheduling pause', () => {
+  const systemBlocks = buildSystemBlocks({
+    repoPath: '/tmp/repo',
+    control: {
+      schemaVersion: 1,
+      schedulingPaused: true,
+      pausedAt: 100,
+      pauseReason: 'operator_paused',
+      controlPath: '/tmp/home/manager/control.json',
+      stateExists: true,
+    },
+    ingestion: {
+      managerActive: true,
+      managerAutoIngestEnabled: true,
+      notIngestedCount: 0,
+      nextAction: 'auto-ingest inventory is clear',
+    },
+    taskActionCount: 0,
+    tasks: [],
+    capacity: {
+      running: 0,
+      available: 3,
+      queuedRunnable: 1,
+    },
+  });
+
+  assert.equal(systemBlocks[0].id, 'manager-scheduling-paused');
+  assert.equal(systemBlocks[0].detail, 'blocked_by_manager_pause');
+
+  const actionability = resolveActionability({
+    tasks: [],
+    actions: [],
+    systemBlocks,
+    capacity: {
+      running: 0,
+      available: 3,
+      queuedRunnable: 1,
+    },
+  });
+
+  assert.equal(actionability.status, 'paused');
+  assert.equal(actionability.reason, 'manager_scheduling_paused');
+});
+
 test('queue state treats pending tasks waiting on recovery as autonomous recovering', () => {
   const task = createTask({
     status: 'pending',
@@ -126,6 +170,209 @@ test('queue state treats pending tasks waiting on recovery as autonomous recover
   assert.equal(queueState.reason, 'waiting_for_coordination_recovery');
   assert.equal(queueState.autonomous, true);
   assert.equal(isActionItem(queueState), false);
+});
+
+test('queue snapshot reports failed dependency with active dependency repair as waiting recovery', async () => {
+  const homeDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-queue-dependency-repair-active-'));
+  const previousRalphHome = process.env.RALPH_HOME;
+
+  try {
+    process.env.RALPH_HOME = homeDir;
+    const stateManager = new StateManager({ ralphHome: homeDir });
+    await stateManager.saveTask(createTask({
+      id: 'failed-p0',
+      prdId: 'P0-003',
+      prdDependencies: [],
+      status: 'failed',
+      startTime: 100,
+      enqueuedAt: 100,
+      lastError: 'P0 failed',
+    }));
+    await stateManager.saveTask(createTask({
+      id: 'repair-p0',
+      prdId: 'followup:P0-003:repair',
+      prdDependencies: [],
+      priorityClass: 'dependency_repair',
+      repairOf: {
+        prdId: 'P0-003',
+        taskId: 'failed-p0',
+        reason: 'dependency repair',
+      },
+      releasesDependenciesFor: ['P0-003'],
+      effectiveDependencyPrdId: 'P0-003',
+      status: 'running',
+      startTime: 200,
+      enqueuedAt: 200,
+    }));
+    await stateManager.saveTask(createTask({
+      id: 'p1',
+      prdId: 'P1',
+      prdDependencies: ['P0-003'],
+      status: 'pending',
+      startTime: 300,
+      enqueuedAt: 300,
+    }));
+
+    const snapshot = await buildQueueSnapshot(undefined, 7200, 5, true);
+    const p1 = snapshot.tasks.find((task) => task.id === 'p1');
+
+    assert.equal(p1.queueState.phase, 'recovering');
+    assert.equal(p1.queueState.detail, 'blocked_by_dependency');
+    assert.equal(p1.queueState.reason, 'waiting_for_dependency_recovery');
+    assert.deepEqual(p1.failedDependencies, []);
+    assert.deepEqual(p1.recoveringDependencies, ['P0-003']);
+    assert.deepEqual(p1.repairTaskIds, ['repair-p0']);
+    assert.deepEqual(p1.queueState.blockers, ['P0-003']);
+    assert.deepEqual(p1.queueState.repairTaskIds, ['repair-p0']);
+  } finally {
+    if (previousRalphHome === undefined) {
+      delete process.env.RALPH_HOME;
+    } else {
+      process.env.RALPH_HOME = previousRalphHome;
+    }
+    fs.rmSync(homeDir, { recursive: true, force: true });
+  }
+});
+
+test('queue snapshot stops reporting recovery after dependency repair integrates', async () => {
+  const homeDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-queue-dependency-repair-integrated-'));
+  const previousRalphHome = process.env.RALPH_HOME;
+
+  try {
+    process.env.RALPH_HOME = homeDir;
+    const stateManager = new StateManager({ ralphHome: homeDir });
+    await stateManager.saveTask(createTask({
+      id: 'failed-p0',
+      prdId: 'P0-003',
+      prdDependencies: [],
+      status: 'failed',
+      startTime: 100,
+      enqueuedAt: 100,
+      lastError: 'P0 failed',
+    }));
+    await stateManager.saveTask(createTask({
+      id: 'repair-p0',
+      prdId: 'followup:P0-003:repair',
+      prdDependencies: [],
+      priorityClass: 'dependency_repair',
+      repairOf: {
+        prdId: 'P0-003',
+        taskId: 'failed-p0',
+        reason: 'dependency repair',
+      },
+      releasesDependenciesFor: ['P0-003'],
+      effectiveDependencyPrdId: 'P0-003',
+      status: 'completed',
+      integrationStatus: 'integrated',
+      integratedAt: 400,
+      integrationCommitSha: 'repair-sha',
+      targetSyncStatus: 'disabled',
+      startTime: 200,
+      enqueuedAt: 200,
+    }));
+    await stateManager.saveTask(createTask({
+      id: 'p1',
+      prdId: 'P1',
+      prdDependencies: ['P0-003'],
+      status: 'pending',
+      startTime: 300,
+      enqueuedAt: 300,
+    }));
+
+    const snapshot = await buildQueueSnapshot(undefined, 7200, 5, true);
+    const p1 = snapshot.tasks.find((task) => task.id === 'p1');
+
+    assert.equal(p1.queueState.phase, 'queued');
+    assert.equal(p1.queueState.detail, 'waiting_for_slot');
+    assert.notEqual(p1.queueState.reason, 'waiting_for_dependency_recovery');
+    assert.notEqual(p1.queueState.reason, 'blocked_failed_dependency');
+    assert.equal(p1.recoveringDependencies, undefined);
+    assert.equal(p1.failedDependencies, undefined);
+    assert.equal(p1.repairTaskIds, undefined);
+  } finally {
+    if (previousRalphHome === undefined) {
+      delete process.env.RALPH_HOME;
+    } else {
+      process.env.RALPH_HOME = previousRalphHome;
+    }
+    fs.rmSync(homeDir, { recursive: true, force: true });
+  }
+});
+
+test('queue snapshot falls back to failed dependency after dependency repair fails', async () => {
+  const homeDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-queue-dependency-repair-failed-'));
+  const previousRalphHome = process.env.RALPH_HOME;
+
+  try {
+    process.env.RALPH_HOME = homeDir;
+    const stateManager = new StateManager({ ralphHome: homeDir });
+    await stateManager.saveTask(createTask({
+      id: 'failed-p0',
+      prdId: 'P0-003',
+      prdDependencies: [],
+      status: 'failed',
+      startTime: 100,
+      enqueuedAt: 100,
+      lastError: 'P0 failed',
+    }));
+    await stateManager.saveTask(createTask({
+      id: 'repair-p0',
+      prdId: 'followup:P0-003:repair',
+      prdDependencies: [],
+      priorityClass: 'dependency_repair',
+      repairOf: {
+        prdId: 'P0-003',
+        taskId: 'failed-p0',
+        reason: 'dependency repair',
+      },
+      releasesDependenciesFor: ['P0-003'],
+      effectiveDependencyPrdId: 'P0-003',
+      status: 'failed',
+      startTime: 200,
+      enqueuedAt: 200,
+      lastError: 'repair failed',
+    }));
+    await stateManager.saveTask(createTask({
+      id: 'p1',
+      prdId: 'P1',
+      prdDependencies: ['P0-003'],
+      status: 'pending',
+      startTime: 300,
+      enqueuedAt: 300,
+    }));
+
+    const snapshot = await buildQueueSnapshot(undefined, 7200, 5, true);
+    const p1 = snapshot.tasks.find((task) => task.id === 'p1');
+
+    assert.equal(p1.queueState.phase, 'blocked');
+    assert.equal(p1.queueState.detail, 'blocked_by_dependency');
+    assert.equal(p1.queueState.reason, 'blocked_failed_dependency');
+    assert.deepEqual(p1.failedDependencies, ['P0-003']);
+    assert.deepEqual(p1.recoveringDependencies, []);
+    assert.deepEqual(p1.queueState.blockers, ['P0-003']);
+    assert.equal(p1.queueState.repairTaskIds, undefined);
+  } finally {
+    if (previousRalphHome === undefined) {
+      delete process.env.RALPH_HOME;
+    } else {
+      process.env.RALPH_HOME = previousRalphHome;
+    }
+    fs.rmSync(homeDir, { recursive: true, force: true });
+  }
+});
+
+test('pending queued next action reports occupied worker capacity', () => {
+  const task = createTask({
+    status: 'pending',
+  });
+
+  assert.equal(resolveNextAction(task, {
+    reason: 'queued',
+    dependencies: [],
+    blockers: [],
+    maxConcurrent: 1,
+    running: 1,
+  }), 'wait for a concurrency slot; 1/1 worker slot(s) are occupied');
 });
 
 test('queue state maps stopped agent context recovery to split/follow-up path', () => {
@@ -149,8 +396,8 @@ test('queue state maps generic stopped recovery to autonomous follow-up generati
     status: 'failed',
     autoRecoveryKind: undefined,
     autoRecoveryStoppedAt: 200,
-    autoRecoveryStopReason: 'operator_stopped',
-    autoRecoveryLastReason: 'Task was explicitly stopped by operator',
+    autoRecoveryStopReason: 'recovery_budget_exhausted',
+    autoRecoveryLastReason: 'Generic recovery budget exhausted',
   });
 
   const queueState = assertQueueState(task, 'recovering', 'generating_followup_prd');
@@ -158,6 +405,40 @@ test('queue state maps generic stopped recovery to autonomous follow-up generati
   assert.equal(queueState.reason, 'generic_recovery_stopped');
   assert.equal(isActionItem(queueState), false);
   assert.match(resolveNextAction(task), /generate a follow-up PRD/);
+});
+
+test('queue state treats generated follow-up stopped recovery as diagnostics', () => {
+  const task = createTask({
+    status: 'failed',
+    prdId: 'followup:source-prd:abc123',
+    autoRecoveryKind: 'story_repair',
+    storyRepairRecoveryStoppedAt: 200,
+    storyRepairRecoveryStopReason: 'story_repair_hard_cap_reached',
+    autoRecoveryStoppedAt: 200,
+    autoRecoveryStopReason: 'story_repair_hard_cap_reached',
+  });
+
+  const queueState = assertQueueState(task, 'diagnostics', 'diagnosing_failure');
+
+  assert.equal(queueState.reason, 'story_repair_stopped');
+  assert.equal(isActionItem(queueState), true);
+  assert.match(resolveNextAction(task), /will not generate another automatic follow-up/);
+});
+
+test('queue state treats operator-stopped failure as diagnostics, not follow-up planning', () => {
+  const task = createTask({
+    status: 'failed',
+    autoRecoveryKind: undefined,
+    autoRecoveryStoppedAt: 200,
+    autoRecoveryStopReason: 'operator_stopped',
+    autoRecoveryLastReason: 'Task was explicitly stopped by operator',
+  });
+
+  const queueState = assertQueueState(task, 'diagnostics', 'diagnosing_failure');
+
+  assert.equal(queueState.reason, 'task_failed');
+  assert.equal(isActionItem(queueState), true);
+  assert.doesNotMatch(resolveNextAction(task), /generate a follow-up PRD/);
 });
 
 test('queue snapshot separates follow-up planning from active recovery count', async () => {
@@ -172,8 +453,8 @@ test('queue snapshot separates follow-up planning from active recovery count', a
       status: 'failed',
       autoRecoveryKind: undefined,
       autoRecoveryStoppedAt: 200,
-      autoRecoveryStopReason: 'operator_stopped',
-      autoRecoveryLastReason: 'Task was explicitly stopped by operator',
+      autoRecoveryStopReason: 'recovery_budget_exhausted',
+      autoRecoveryLastReason: 'Generic recovery budget exhausted',
       declaredWriteSurface: ['apps/web'],
     }));
 
@@ -577,6 +858,50 @@ test('queue snapshot excludes obsolete stopped baseline repairs from active diag
   }
 });
 
+test('queue snapshot excludes operator-cancelled obsolete recovery from active diagnostics', async () => {
+  const homeDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-queue-obsolete-recovery-'));
+  const previousRalphHome = process.env.RALPH_HOME;
+
+  try {
+    process.env.RALPH_HOME = homeDir;
+    const stateManager = new StateManager({ ralphHome: homeDir });
+    await stateManager.saveTask(createTask({
+      id: 'active-task',
+      status: 'running',
+      currentUS: 'US-001',
+    }));
+    await stateManager.saveTask(createTask({
+      id: 'obsolete-recovery',
+      status: 'failed',
+      worktree: '',
+      latestFailure: {
+        kind: 'operator_cancelled_obsolete_recovery',
+        class: 'operator_cancelled_obsolete_recovery',
+        message: 'Obsolete recovery task cancelled because a combined PRD supersedes it.',
+        observedAt: 200,
+        retryable: false,
+      },
+    }));
+
+    const snapshot = await buildQueueSnapshot(undefined, 7200, 5, true);
+
+    assert.equal(snapshot.summary.totalActive, 1);
+    assert.equal(snapshot.summary.running, 1);
+    assert.equal(snapshot.summary.diagnostics, 0);
+    assert.deepEqual(snapshot.tasks.map((task) => task.id), ['active-task']);
+    assert.deepEqual(snapshot.actions, []);
+    assert.equal(snapshot.actionability.status, 'runnable');
+    assert.equal(snapshot.actionability.reason, 'workers_running');
+  } finally {
+    if (previousRalphHome === undefined) {
+      delete process.env.RALPH_HOME;
+    } else {
+      process.env.RALPH_HOME = previousRalphHome;
+    }
+    fs.rmSync(homeDir, { recursive: true, force: true });
+  }
+});
+
 test('queue snapshot hides stopped source tasks while generated follow-ups are active', async () => {
   const homeDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-queue-followup-shadow-'));
   const previousRalphHome = process.env.RALPH_HOME;
@@ -654,6 +979,140 @@ test('queue snapshot hides stopped source tasks after generated follow-up comple
     assert.equal(snapshot.summary.recovering, 0);
     assert.deepEqual(snapshot.tasks, []);
     assert.deepEqual(snapshot.actions, []);
+  } finally {
+    if (previousRalphHome === undefined) {
+      delete process.env.RALPH_HOME;
+    } else {
+      process.env.RALPH_HOME = previousRalphHome;
+    }
+    fs.rmSync(homeDir, { recursive: true, force: true });
+  }
+});
+
+test('queue snapshot excludes archived terminal failures from active diagnostics', async () => {
+  const homeDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-queue-archived-terminal-failure-'));
+  const previousRalphHome = process.env.RALPH_HOME;
+
+  try {
+    process.env.RALPH_HOME = homeDir;
+    const stateManager = new StateManager({ ralphHome: homeDir });
+    await stateManager.saveTask(createTask({
+      id: 'archived-failed-task',
+      status: 'failed',
+      autoRecoveryKind: 'transient',
+      autoRecoveryStoppedAt: 200,
+      autoRecoveryStopReason: 'operator_stopped',
+      worktreeReclaimDecision: 'archive_only',
+      worktreeReclaimEvidencePath: path.join(homeDir, 'reclamation', 'evidence', 'archived-failed-task'),
+      worktreeReclaimEvidenceManifestPath: path.join(homeDir, 'reclamation', 'evidence', 'archived-failed-task', 'manifest.json'),
+      lastError: 'Worker process is no longer running',
+      lastErrorRetryable: true,
+    }));
+
+    const snapshot = await buildQueueSnapshot(undefined, 7200, 5, true);
+
+    assert.equal(snapshot.summary.totalActive, 0);
+    assert.equal(snapshot.summary.diagnostics, 0);
+    assert.deepEqual(snapshot.tasks, []);
+    assert.deepEqual(snapshot.actions, []);
+    assert.equal(snapshot.actionability.status, 'idle');
+    assert.equal(snapshot.actionability.reason, 'no_active_tasks');
+  } finally {
+    if (previousRalphHome === undefined) {
+      delete process.env.RALPH_HOME;
+    } else {
+      process.env.RALPH_HOME = previousRalphHome;
+    }
+    fs.rmSync(homeDir, { recursive: true, force: true });
+  }
+});
+
+test('queue snapshot keeps archived terminal failures active while recovery is still running', async () => {
+  const homeDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-queue-archived-active-recovery-'));
+  const previousRalphHome = process.env.RALPH_HOME;
+
+  try {
+    process.env.RALPH_HOME = homeDir;
+    const stateManager = new StateManager({ ralphHome: homeDir });
+    await stateManager.saveTask(createTask({
+      id: 'archived-but-recovering-task',
+      status: 'failed',
+      autoRecoveryKind: 'transient',
+      autoRecoveryStartedAt: 200,
+      autoRecoveryDeadlineAt: Date.now() + 60_000,
+      autoRecoveryTotalRequeues: 1,
+      autoRecoveryNextEligibleAt: Date.now() - 1_000,
+      lastErrorKind: 'worker_process_exited',
+      lastErrorClass: 'transient_backend',
+      lastErrorRetryable: true,
+      worktreeReclaimDecision: 'archive_only',
+      worktreeReclaimEvidencePath: path.join(homeDir, 'reclamation', 'evidence', 'archived-but-recovering-task'),
+      worktreeReclaimEvidenceManifestPath: path.join(homeDir, 'reclamation', 'evidence', 'archived-but-recovering-task', 'manifest.json'),
+    }));
+
+    const snapshot = await buildQueueSnapshot(undefined, 7200, 5, true);
+
+    assert.equal(snapshot.summary.totalActive, 1);
+    assert.equal(snapshot.summary.recovering, 1);
+    assert.deepEqual(snapshot.tasks.map((task) => task.id), ['archived-but-recovering-task']);
+    assert.equal(snapshot.actionability.status, 'recovering');
+  } finally {
+    if (previousRalphHome === undefined) {
+      delete process.env.RALPH_HOME;
+    } else {
+      process.env.RALPH_HOME = previousRalphHome;
+    }
+    fs.rmSync(homeDir, { recursive: true, force: true });
+  }
+});
+
+test('queue snapshot ignores failed generated follow-up after source task integrates', async () => {
+  const homeDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-queue-followup-obsolete-after-integrated-'));
+  const previousRalphHome = process.env.RALPH_HOME;
+
+  try {
+    process.env.RALPH_HOME = homeDir;
+    const stateManager = new StateManager({ ralphHome: homeDir });
+    await stateManager.saveTask(createTask({
+      id: 'integrated-source-task',
+      prdId: 'source-prd',
+      status: 'completed',
+      completedUS: ['US-001'],
+      storyProgress: [{
+        id: 'US-001',
+        status: 'passed',
+        attempts: 1,
+      }],
+      integrationStatus: 'integrated',
+      integratedAt: 400,
+      integrationCommitSha: 'source-sha',
+      targetSyncStatus: 'disabled',
+      updatedAt: Date.now(),
+      followupTaskIds: ['stale-followup-task'],
+      declaredWriteSurface: ['apps/web'],
+    }));
+    await stateManager.saveTask(createTask({
+      id: 'stale-followup-task',
+      prdId: 'followup:source-prd:abc123',
+      status: 'failed',
+      autoRecoveryStoppedAt: 500,
+      autoRecoveryStopReason: 'operator_stopped',
+      startTime: 300,
+      updatedAt: 500,
+      declaredWriteSurface: ['apps/web'],
+    }));
+
+    const snapshot = await buildQueueSnapshot(undefined, 7200, 5, true);
+
+    assert.equal(snapshot.summary.totalActive, 0);
+    assert.equal(snapshot.summary.diagnostics, 0);
+    assert.deepEqual(snapshot.tasks, []);
+    assert.deepEqual(snapshot.actions, []);
+    assert.equal(snapshot.actionability.status, 'idle');
+    const recentSourceTask = snapshot.recentCompleted.find((task) => task.id === 'integrated-source-task');
+    assert.ok(recentSourceTask);
+    assert.match(recentSourceTask.nextAction, /target sync is disabled/);
+    assert.doesNotMatch(recentSourceTask.nextAction, /follow-up task/);
   } finally {
     if (previousRalphHome === undefined) {
       delete process.env.RALPH_HOME;

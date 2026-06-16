@@ -11,6 +11,7 @@ const {
   probeTaskWorktreeMergeability,
   syncTargetBranchIfSafe,
 } = require('../dist/core/merge.js');
+const { mergeCommand } = require('../dist/commands/merge.js');
 
 function git(args, cwd) {
   return execFileSync('git', args, {
@@ -66,6 +67,12 @@ function createTask(repoDir, taskId = 'task-merge') {
   };
 }
 
+function writeTaskState(ralphHome, task) {
+  const taskDir = path.join(ralphHome, 'tasks', task.id);
+  fs.mkdirSync(taskDir, { recursive: true });
+  fs.writeFileSync(path.join(taskDir, 'state.json'), JSON.stringify(task, null, 2));
+}
+
 test('mergeBranch integrates through dedicated worktree when live checkout is dirty', async () => {
   const repoDir = createRepo();
 
@@ -89,6 +96,98 @@ test('mergeBranch integrates through dedicated worktree when live checkout is di
     assert.equal(git(['rev-parse', '--abbrev-ref', 'HEAD'], repoDir), 'main');
     assert.equal(fs.readFileSync(path.join(repoDir, 'dirty.txt'), 'utf-8'), 'dirty\n');
   } finally {
+    fs.rmSync(repoDir, { recursive: true, force: true });
+  }
+});
+
+test('mergeBranch reuses repoPath when it is already the integration worktree', async () => {
+  const repoDir = createRepo();
+
+  try {
+    const seedTask = createTask(repoDir, 'task-seed-integration');
+    const seedResult = await mergeBranch(seedTask, 'main', 'manual', {
+      pullLatest: false,
+      syncTargetBranch: false,
+    });
+
+    assert.equal(seedResult.success, true, seedResult.message);
+    const integrationWorktree = seedResult.integrationWorktree;
+    assert.ok(integrationWorktree);
+
+    const taskId = 'task-from-integration-worktree';
+    const worktreePath = path.join(integrationWorktree, '.ralph-worktrees', taskId);
+    fs.mkdirSync(path.dirname(worktreePath), { recursive: true });
+    git(['worktree', 'add', '-b', `ralph/${taskId}`, worktreePath, 'ralph/integration/main'], integrationWorktree);
+    fs.appendFileSync(path.join(worktreePath, 'feature.txt'), 'nested task change\n');
+    git(['add', 'feature.txt'], worktreePath);
+    git(['commit', '-m', 'feat: nested task change'], worktreePath);
+
+    const task = {
+      id: taskId,
+      prdPath: path.join(integrationWorktree, 'prd.json'),
+      status: 'completed',
+      startTime: Date.now(),
+      completedUS: [],
+      worktree: worktreePath,
+      logPath: path.join(integrationWorktree, '.ralph', 'tasks', taskId, 'agent.log'),
+      agent: 'codex',
+      repoPath: integrationWorktree,
+      loopCount: 0,
+      consecutiveNoProgress: 0,
+      consecutiveErrors: 0,
+      lastProgressTime: Date.now(),
+      lastFilesChanged: 1,
+    };
+
+    const result = await mergeBranch(task, 'main', 'manual', {
+      pullLatest: false,
+      syncTargetBranch: false,
+    });
+
+    assert.equal(result.success, true, result.message);
+    assert.equal(path.resolve(result.integrationWorktree), path.resolve(integrationWorktree));
+    assert.equal(fs.existsSync(path.join(integrationWorktree, '.ralph-integration', 'main')), false);
+    assert.match(git(['show', 'ralph/integration/main:feature.txt'], integrationWorktree), /nested task change/);
+  } finally {
+    fs.rmSync(repoDir, { recursive: true, force: true });
+  }
+});
+
+test('mergeCommand honors configured integration worktree directory', async () => {
+  const repoDir = createRepo();
+  const ralphHome = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-merge-command-home-'));
+  const customIntegrationRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-custom-integration-'));
+  const previousRalphHome = process.env.RALPH_HOME;
+
+  try {
+    const task = createTask(repoDir, 'task-merge-command-custom-integration');
+    process.env.RALPH_HOME = ralphHome;
+    fs.mkdirSync(ralphHome, { recursive: true });
+    fs.writeFileSync(path.join(ralphHome, 'config.json'), JSON.stringify({
+      merge: {
+        targetBranch: 'main',
+        pullLatest: false,
+        useIntegrationWorktree: true,
+        integrationWorktreeDir: customIntegrationRoot,
+        syncTargetBranch: false,
+      },
+    }, null, 2));
+    writeTaskState(ralphHome, task);
+
+    await mergeCommand(task.id, { strategy: 'manual' });
+
+    const expectedIntegrationWorktree = path.join(customIntegrationRoot, 'main');
+    assert.equal(git(['rev-parse', '--abbrev-ref', 'HEAD'], expectedIntegrationWorktree), 'ralph/integration/main');
+    assert.match(git(['show', 'ralph/integration/main:feature.txt'], repoDir), /task change/);
+    assert.equal(fs.existsSync(path.join(repoDir, '.ralph-integration', 'main')), false);
+  } finally {
+    if (previousRalphHome === undefined) {
+      delete process.env.RALPH_HOME;
+    } else {
+      process.env.RALPH_HOME = previousRalphHome;
+    }
+    fs.rmSync(customIntegrationRoot, { recursive: true, force: true });
+    fs.rmSync(ralphHome, { recursive: true, force: true });
     fs.rmSync(repoDir, { recursive: true, force: true });
   }
 });

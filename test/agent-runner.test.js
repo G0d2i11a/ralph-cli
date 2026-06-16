@@ -121,7 +121,12 @@ test('AgentRunner defaults Codex to the direct CLI backend', async () => {
     assert.match(captured.args[1], /Codex smoke/);
     assert.match(captured.args[1], /Ralph Worktree Boundary/);
     assert.match(captured.args[1], /only editable project checkout/);
+    assert.match(captured.args[1], /Ralph Worker Subagent Boundary/);
+    assert.match(captured.args[1], /Codex subagents are available in this worker/);
+    assert.match(captured.args[1], /Do not spawn subagents merely because a host-level AGENTS\.md describes a coordinator role/);
+    assert.match(captured.args[1], /If you spawn a full-history fork, omit inherited agent type, model, and reasoning-effort fields/);
     assert.equal(captured.args[2], '--full-auto');
+    assert.equal(captured.args.includes('--model'), false);
     const cdIndex = captured.args.indexOf('--cd');
     assert.notEqual(cdIndex, -1);
     assert.equal(captured.args[cdIndex + 1], worktreePath);
@@ -133,6 +138,76 @@ test('AgentRunner defaults Codex to the direct CLI backend', async () => {
     assert.equal(fs.existsSync(path.join(worktreePath, '.ralph-cache', 'prisma')), true);
     assert.ok(!captured.args.includes('--cwd'));
     assert.ok(!captured.args.includes('--log'));
+  } finally {
+    childProcess.spawn = originalSpawn;
+    process.env.HOME = previousHome;
+    restoreRunnerEnv(previousRunnerEnv);
+    await cleanupPath(tempRoot);
+    await cleanupPath(worktreePath);
+    delete require.cache[require.resolve('../dist/core/agent.js')];
+  }
+});
+
+test('AgentRunner includes PRD context and Oracle candidate bundle in Codex prompt', async () => {
+  const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-agent-prd-context-'));
+  const worktreePath = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-agent-worktree-'));
+  const logPath = path.join(tempRoot, 'agent.log');
+  const previousHome = process.env.HOME;
+  const previousRunnerEnv = captureRunnerEnv();
+  const originalSpawn = childProcess.spawn;
+
+  let captured;
+
+  try {
+    process.env.HOME = tempRoot;
+    delete process.env.RALPH_AGENT_RUNNERS_CLI;
+    delete process.env.RALPH_SDK_RUNNER_CLI;
+    childProcess.spawn = (command, args, options) => {
+      captured = { command, args, options };
+      return createMockChild({
+        stdoutLines: [JSON.stringify({ kind: 'final', payload: { status: 'success' } })],
+      });
+    };
+
+    const { AgentRunner } = require('../dist/core/agent.js');
+    const runner = new AgentRunner();
+
+    const result = await runner.runUserStory(
+      {
+        id: 'US-1',
+        title: 'Oracle candidate smoke',
+        description: 'Use the candidate implementation.',
+        acceptanceCriteria: ['Candidate code is validated.'],
+      },
+      worktreePath,
+      'codex',
+      logPath,
+      undefined,
+      undefined,
+      {
+        id: 'prd-oracle-candidate',
+        title: 'Oracle candidate PRD',
+        description: 'Top-level PRD description.',
+        userStories: [],
+        forbiddenWriteSurface: ['packages/control-plane/src/routes/**'],
+        verificationCommands: ['npm --prefix packages/control-plane run build'],
+        referenceImplementation: {
+          status: 'candidate_complete',
+          kind: 'unified_patch_or_complete_files',
+          touchedFiles: ['packages/control-plane/src/example.ts'],
+          patch: 'diff --git a/packages/control-plane/src/example.ts b/packages/control-plane/src/example.ts\n',
+        },
+      },
+    );
+
+    assert.equal(result.success, true);
+    assert.ok(captured, 'spawn should be called');
+    assert.match(captured.args[1], /Full PRD Context/);
+    assert.match(captured.args[1], /prd-oracle-candidate/);
+    assert.match(captured.args[1], /packages\/control-plane\/src\/routes\/\*\*/);
+    assert.match(captured.args[1], /candidate_complete/);
+    assert.match(captured.args[1], /diff --git a\/packages\/control-plane\/src\/example\.ts/);
+    assert.match(captured.args[1], /Apply or adapt that candidate first/);
   } finally {
     childProcess.spawn = originalSpawn;
     process.env.HOME = previousHome;
@@ -662,6 +737,84 @@ test('AgentRunner extends idle timeout while long-running build command is activ
     for (const timer of timers) {
       clearTimeout(timer);
     }
+    childProcess.spawn = originalSpawn;
+    childProcess.execFileSync = originalExecFileSync;
+    process.env.HOME = previousHome;
+    restoreRunnerEnv(previousRunnerEnv);
+    await cleanupPath(tempRoot);
+    await cleanupPath(worktreePath);
+    delete require.cache[require.resolve('../dist/core/agent.js')];
+    delete require.cache[require.resolve('../dist/core/worktree-process-cleanup.js')];
+  }
+});
+
+test('AgentRunner does not treat its own Codex prompt as a long-running build command', async () => {
+  const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-agent-prompt-build-timeout-'));
+  const worktreePath = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-agent-worktree-'));
+  const logPath = path.join(tempRoot, 'agent.log');
+  const previousHome = process.env.HOME;
+  const previousRunnerEnv = captureRunnerEnv();
+  const originalSpawn = childProcess.spawn;
+  const originalExecFileSync = childProcess.execFileSync;
+
+  let child;
+
+  try {
+    process.env.HOME = tempRoot;
+    delete process.env.RALPH_AGENT_RUNNERS_CLI;
+    delete process.env.RALPH_SDK_RUNNER_CLI;
+    fs.mkdirSync(path.join(tempRoot, '.ralph'), { recursive: true });
+    fs.writeFileSync(
+      path.join(tempRoot, '.ralph', 'config.json'),
+      JSON.stringify({
+        agent: {
+          timeout: 0.02,
+          longRunningCommandPatterns: ['pnpm build'],
+        },
+      }),
+    );
+
+    childProcess.execFileSync = (command, args) => {
+      if (command === 'ps' && args.includes('-axo')) {
+        return `23456 /opt/homebrew/bin/codex exec Please validate with pnpm build --cd ${worktreePath}\n`;
+      }
+
+      if (command === 'ps' && args[0] === '-p') {
+        return `1 1 /opt/homebrew/bin/codex exec Please validate with pnpm build --cd ${worktreePath}\n`;
+      }
+
+      if (command === 'lsof') {
+        return `n${worktreePath}\n`;
+      }
+
+      return originalExecFileSync(command, args);
+    };
+
+    childProcess.spawn = () => {
+      child = createMockChild({ exitCode: null, closeOnKill: true });
+      return child;
+    };
+
+    const { AgentRunner } = require('../dist/core/agent.js');
+    const runner = new AgentRunner();
+
+    const result = await runner.runUserStory(
+      {
+        id: 'US-prompt-build-timeout',
+        title: 'Prompt build timeout smoke',
+        description: 'The prompt mentions pnpm build but no build process is active.',
+        acceptanceCriteria: ['Timeout should still fire.'],
+      },
+      worktreePath,
+      'codex',
+      logPath,
+    );
+
+    assert.equal(result.success, false);
+    assert.equal(result.timedOut, true);
+    assert.ok(child.killSignals.includes('SIGTERM'));
+    assert.doesNotMatch(result.output, /long-running command is active/);
+  } finally {
     childProcess.spawn = originalSpawn;
     childProcess.execFileSync = originalExecFileSync;
     process.env.HOME = previousHome;

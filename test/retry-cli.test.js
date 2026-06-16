@@ -584,6 +584,75 @@ test('retry --finalize-only keeps completed stories and restores ready_to_finali
   }
 });
 
+test('retry --finalize-only can restore a failed task whose stories are already verified', () => {
+  const homeDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-retry-failed-finalize-home-'));
+  const repoDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-retry-failed-finalize-repo-'));
+  const taskId = 'failed-with-verified-stories-task';
+  const taskDir = path.join(homeDir, '.ralph', 'tasks', taskId);
+  const prdPath = path.join(repoDir, 'prd.json');
+
+  try {
+    fs.mkdirSync(taskDir, { recursive: true });
+    fs.writeFileSync(prdPath, JSON.stringify({
+      id: 'retry-failed-finalize-prd',
+      title: 'Retry Failed Finalize PRD',
+      description: 'retry failed task finalize only',
+      dependencies: [],
+      userStories: [
+        { id: 'US-001', title: 'One', description: 'one', acceptanceCriteria: ['done'] },
+        { id: 'US-002', title: 'Two', description: 'two', acceptanceCriteria: ['done'] },
+      ],
+    }, null, 2));
+    fs.writeFileSync(path.join(taskDir, 'state.json'), JSON.stringify({
+      id: taskId,
+      prdPath,
+      prdId: 'retry-failed-finalize-prd',
+      prdDependencies: [],
+      status: 'failed',
+      startTime: Date.now(),
+      endTime: Date.now(),
+      completedUS: ['US-001', 'US-002'],
+      worktree: path.join(repoDir, '.ralph-worktrees', taskId),
+      logPath: path.join(taskDir, 'agent.log'),
+      agent: 'codex',
+      repoPath: repoDir,
+      loopCount: 2,
+      consecutiveNoProgress: 2,
+      consecutiveErrors: 2,
+      lastProgressTime: 1,
+      lastError: 'model auth unavailable after stories were operator-verified',
+      lastErrorKind: 'auth_or_config_error',
+      lastErrorClass: 'unknown',
+      lastErrorRetryable: false,
+      storyProgress: [
+        { id: 'US-001', status: 'passed', attempts: 1, updatedAt: 1 },
+        { id: 'US-002', status: 'passed', attempts: 1, updatedAt: 2 },
+      ],
+    }, null, 2));
+
+    const result = runCli(['retry', taskId, '--finalize-only'], { HOME: homeDir });
+    const output = JSON.parse(result.stdout);
+    const state = JSON.parse(fs.readFileSync(path.join(taskDir, 'state.json'), 'utf-8'));
+
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(output.previousStatus, 'failed');
+    assert.equal(output.currentStatus, 'ready_to_finalize');
+    assert.equal(output.finalizeOnly, true);
+    assert.deepEqual(output.resetStoryIds, []);
+    assert.deepEqual(state.completedUS, ['US-001', 'US-002']);
+    assert.equal(state.storyProgress[0].status, 'passed');
+    assert.equal(state.storyProgress[1].status, 'passed');
+    assert.equal(state.lastError, undefined);
+    assert.equal(state.lastErrorKind, undefined);
+    assert.equal(state.loopCount, 0);
+    assert.equal(state.consecutiveNoProgress, 0);
+    assert.equal(state.consecutiveErrors, 0);
+  } finally {
+    fs.rmSync(homeDir, { recursive: true, force: true });
+    fs.rmSync(repoDir, { recursive: true, force: true });
+  }
+});
+
 test('retry sends failed_finalize merge conflicts back to anchored merge repair instead of rerunning finalizer only', () => {
   const homeDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-retry-merge-home-'));
   const repoDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-retry-merge-repo-'));

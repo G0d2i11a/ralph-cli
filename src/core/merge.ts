@@ -280,6 +280,14 @@ function isGitWorktree(worktreePath: string): boolean {
   return tryRunGit(worktreePath, ['rev-parse', '--is-inside-work-tree']) === 'true';
 }
 
+function normalizeWorktreePathForComparison(worktreePath: string): string {
+  try {
+    return fs.realpathSync.native(worktreePath);
+  } catch {
+    return path.resolve(worktreePath);
+  }
+}
+
 function listWorktrees(repoPath: string): GitWorktree[] {
   const output = tryRunGit(repoPath, ['worktree', 'list', '--porcelain']) || '';
   const worktrees: GitWorktree[] = [];
@@ -504,11 +512,23 @@ function ensureIntegrationWorktree(
 ): { integrationBranch: string; integrationWorktree: string } {
   const normalizedTarget = normalizeBranchName(targetBranch);
   const integrationBranch = `ralph/integration/${normalizedTarget}`;
+  const normalizedRepoPath = normalizeWorktreePathForComparison(repoPath);
+  const currentRepoWorktree = listWorktrees(repoPath).find(
+    (worktree) => normalizeWorktreePathForComparison(worktree.path) === normalizedRepoPath,
+  );
+
+  if (currentRepoWorktree?.branch === integrationBranch) {
+    return { integrationBranch, integrationWorktree: path.resolve(repoPath) };
+  }
+
   const integrationRoot = path.isAbsolute(integrationWorktreeDir)
     ? integrationWorktreeDir
     : path.join(repoPath, integrationWorktreeDir);
   const integrationWorktree = path.join(integrationRoot, sanitizePathSegment(normalizedTarget));
-  const currentWorktree = listWorktrees(repoPath).find((worktree) => worktree.path === integrationWorktree);
+  const normalizedIntegrationWorktree = normalizeWorktreePathForComparison(integrationWorktree);
+  const currentWorktree = listWorktrees(repoPath).find(
+    (worktree) => normalizeWorktreePathForComparison(worktree.path) === normalizedIntegrationWorktree,
+  );
 
   fs.mkdirSync(path.dirname(integrationWorktree), { recursive: true });
 

@@ -15,7 +15,7 @@ _ralph_completion() {
   local cur prev commands
   cur="\${COMP_WORDS[COMP_CWORD]}"
   prev="\${COMP_WORDS[COMP_CWORD-1]}"
-  commands="start batch-start status list stop merge finalize update retry reset-stagnation watch watchdog watchdog-install watchdog-uninstall stats completion"
+  commands="init start batch-start status list stop pause resume merge finalize update retry reset-stagnation watch watchdog watchdog-install watchdog-uninstall stats completion"
 
   case "\${prev}" in
     ralph)
@@ -31,7 +31,7 @@ _ralph_completion() {
       COMPREPLY=( $(compgen -W "\${task_ids}" -- \${cur}) )
       return 0
       ;;
-    --repo|--ez4ielts-dir)
+    --repo|--ez4ielts-dir|--menubar-config)
       COMPREPLY=( $(compgen -d -- \${cur}) )
       return 0
       ;;
@@ -59,7 +59,7 @@ _ralph_completion() {
 
   case "\${cur}" in
     -*)
-      local opts="--repo --agent --backend --status --auto --strategy --target --format --all --interval --profile --auto-ingest-ez4ielts --ingest-existing-ez4ielts --ez4ielts-dir --story-id --passes --notes --detailed --home-path --homes --log --once --dry-run --load --older-than-hours --include-orphans --archive-dirty --include-dirty-failed --include-dirty-orphans --reclaim-archived-dirty --abandon-retryable --max-removals --no-restart-code-drift --no-restart-stale --help"
+      local opts="--repo --name --agent --backend --max-concurrent --menubar-config --no-register-menubar --reason --status --auto --strategy --target --format --all --interval --profile --auto-ingest-ez4ielts --ingest-existing-ez4ielts --ez4ielts-dir --story-id --passes --notes --detailed --home-path --homes --log --once --dry-run --load --older-than-hours --include-orphans --archive-dirty --include-dirty-failed --include-dirty-orphans --reclaim-archived-dirty --abandon-retryable --max-removals --no-restart-code-drift --no-restart-stale --help"
       COMPREPLY=( $(compgen -W "\${opts}" -- \${cur}) )
       return 0
       ;;
@@ -77,11 +77,14 @@ function generateZshCompletion(): string {
 _ralph() {
   local -a commands
   commands=(
+    'init:Initialize a Ralph home and register it with the menu bar'
     'start:Start a new task from a PRD file'
     'batch-start:Start multiple tasks from PRD files'
     'status:Show status of a task or all running tasks'
     'list:List all tasks'
     'stop:Stop a running task'
+    'pause:Pause manager scheduling without killing running tasks'
+    'resume:Resume manager scheduling'
     'merge:Merge a completed task'
     'finalize:Commit task changes using the restricted finisher flow'
     'update:Update a task or user story status'
@@ -108,6 +111,16 @@ _ralph() {
       ;;
     args)
       case $words[1] in
+        init)
+          _arguments \\
+            '--repo[Repository path]:directory:_directories' \\
+            '--name[Project display name]:name:' \\
+            '--agent[Agent to use]:agent:(claude codex)' \\
+            '--backend[Backend to use]:backend:(cli agent-runners)' \\
+            '--max-concurrent[Runner concurrency]:count:' \\
+            '--menubar-config[Ralph Menu Bar config path]:file:_files' \\
+            '--no-register-menubar[Do not register with Ralph Menu Bar]'
+          ;;
         start)
           _arguments \\
             '1:PRD file:_files -g "*.md|*.json"' \\
@@ -136,6 +149,13 @@ _ralph() {
             '--story-id[User story ID]:story id:' \\
             '--passes[Mark story as passing]' \\
             '--notes[Implementation notes]:notes:'
+          ;;
+        pause)
+          _arguments \\
+            '--reason[Reason to record in control state]:reason:'
+          ;;
+        resume)
+          _arguments
           ;;
         stats)
           _arguments \\

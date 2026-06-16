@@ -218,6 +218,10 @@ export function listWorktreeProcessCandidatePids(_worktreePath: string, commandP
           }
 
           const command = normalizeCommand(match[2]).toLowerCase();
+          if (isAgentRunnerInvocationCommand(command)) {
+            return [];
+          }
+
           if (!patterns.some((pattern) => command.includes(pattern))) {
             return [];
           }
@@ -235,6 +239,17 @@ export function listWorktreeProcessCandidatePids(_worktreePath: string, commandP
   } catch {
     return [];
   }
+}
+
+function isAgentRunnerInvocationCommand(command: string): boolean {
+  const normalized = normalizeCommand(command).toLowerCase();
+
+  return (
+    /(^|[\s/])codex(?:\.js)?\s+exec(?=\s|$)/.test(normalized)
+    || /(^|[\s/])claude(?=\s|$)[\s\S]*(\s-p\s|\s--print(?=\s|$)|\s--permission-mode\s)/.test(normalized)
+    || normalized.includes('/agent-runners/')
+    || normalized.includes('/sdk-runners/')
+  );
 }
 
 function resolvePathForComparison(targetPath: string): string {

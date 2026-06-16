@@ -161,9 +161,13 @@ export async function retryCommand(taskId: string, options: RetryCommandOptions 
       process.exit(1);
     }
 
-    if (options.finalizeOnly && previousStatus !== 'failed_finalize') {
+    const finalizeOnlyRetryableStatus = previousStatus === 'failed_finalize'
+      || previousStatus === 'failed'
+      || previousStatus === 'stagnant';
+
+    if (options.finalizeOnly && !finalizeOnlyRetryableStatus) {
       console.error(JSON.stringify({
-        error: `Cannot use --finalize-only for task status '${previousStatus}'. Only 'failed_finalize' tasks can be retried this way.`,
+        error: `Cannot use --finalize-only for task status '${previousStatus}'. Only 'failed', 'stagnant', or 'failed_finalize' tasks can be retried this way.`,
         taskId,
         currentStatus: previousStatus,
       }));

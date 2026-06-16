@@ -122,7 +122,7 @@ async function runWorker(taskId: string) {
       let lastStoryError = getStoryProgress(task, us.id)?.lastError;
       let transientRetryCountForStory = 0;
 
-      while (!storyPassed && getStoryAttempts(task, us.id) < maxStoryAttempts) {
+      while (!storyPassed && hasStoryAttemptsRemaining(task, us.id, maxStoryAttempts)) {
         const latestTaskState = await stateManager.loadTask(task.id);
         if (latestTaskState) {
           task.repairContext = latestTaskState.repairContext;
@@ -204,11 +204,11 @@ async function runWorker(taskId: string) {
           ...createWorkerLeaseUpdate(configManager),
         });
 
-        console.log(`Running User Story: ${us.id} - ${us.title} (attempt ${attempt}/${maxStoryAttempts})`);
+        console.log(`Running User Story: ${us.id} - ${us.title} (attempt ${formatAttemptProgress(attempt, maxStoryAttempts)})`);
         appendTaskEvent(task, {
           type: 'story_attempt_started',
           storyId: us.id,
-          message: `Started ${us.id} attempt ${attempt}/${maxStoryAttempts}`,
+          message: `Started ${us.id} attempt ${formatAttemptProgress(attempt, maxStoryAttempts)}`,
           data: { attempt, maxStoryAttempts },
         });
 
@@ -242,7 +242,8 @@ async function runWorker(taskId: string) {
               threadId: task.threadId,
               threadStoryId: task.threadStoryId,
               storyId: us.id,
-            }
+            },
+            prd,
           ).finally(() => heartbeat.stop());
 
           let continuationStateChanged = false;
@@ -309,8 +310,8 @@ async function runWorker(taskId: string) {
           ) {
             const nextTransientRetryCount = transientRetryCountForStory + 1;
 
-            if (nextTransientRetryCount > maxTransientRetries) {
-              lastStoryError = `Transient retry budget exhausted for ${us.id}: ${failureClassification.message}`;
+            if (isRetryLimitExceeded(nextTransientRetryCount, maxTransientRetries)) {
+              lastStoryError = `Transient retry limit exhausted for ${us.id}: ${failureClassification.message}`;
               task.lastError = lastStoryError;
               task.lastErrorKind = failureClassification.kind;
               task.lastErrorClass = failureClassification.class;
@@ -396,7 +397,7 @@ async function runWorker(taskId: string) {
               },
             });
             console.log(
-              `[Worker] Transient failure for ${us.id} (${failureClassification.kind}), retrying in ${delayMs}ms (${transientRetryCountForStory}/${maxTransientRetries})`
+              `[Worker] Transient failure for ${us.id} (${failureClassification.kind}), retrying in ${delayMs}ms (${formatRetryProgress(transientRetryCountForStory, maxTransientRetries)})`
             );
             await sleep(delayMs);
             continue;
@@ -429,8 +430,8 @@ async function runWorker(taskId: string) {
             task.lastErrorHadObjectiveProgress = hasObjectiveEvidence;
             task.transientRetryBudget = maxTransientRetries;
 
-            if (nextTransientRetryCount > maxTransientRetries) {
-              const exhaustedMessage = `Transient exact mergeability probe retry budget exhausted for ${us.id}: ${mergeRepairVerification.message}`;
+            if (isRetryLimitExceeded(nextTransientRetryCount, maxTransientRetries)) {
+              const exhaustedMessage = `Transient exact mergeability probe retry limit exhausted for ${us.id}: ${mergeRepairVerification.message}`;
               task.lastError = exhaustedMessage;
               task.storyProgress = upsertStoryProgress(task, us.id, {
                 status: 'failed',
@@ -510,7 +511,7 @@ async function runWorker(taskId: string) {
               },
             });
             console.log(
-              `[Worker] Transient exact mergeability probe failure for ${us.id} (${task.lastErrorKind}), retrying probe in ${delayMs}ms without rerunning the agent (${transientRetryCountForStory}/${maxTransientRetries})`
+              `[Worker] Transient exact mergeability probe failure for ${us.id} (${task.lastErrorKind}), retrying probe in ${delayMs}ms without rerunning the agent (${formatRetryProgress(transientRetryCountForStory, maxTransientRetries)})`
             );
             await sleep(delayMs);
           }
@@ -701,7 +702,7 @@ async function runWorker(taskId: string) {
             }
 
             lastStoryError = result.output.slice(-500);
-            const hasAttemptsLeft = attempt < maxStoryAttempts;
+            const hasAttemptsLeft = hasStoryAttemptAfterCurrent(attempt, maxStoryAttempts);
             task.storyProgress = upsertStoryProgress(task, us.id, {
               status: hasAttemptsLeft ? 'needs_repair' : 'failed',
               lastError: lastStoryError,
@@ -755,7 +756,7 @@ async function runWorker(taskId: string) {
         if (!storyCompletionDecision.accepted) {
           lastStoryError = storyCompletionDecision.message;
           console.error(lastStoryError);
-          const hasAttemptsLeft = attempt < maxStoryAttempts;
+          const hasAttemptsLeft = hasStoryAttemptAfterCurrent(attempt, maxStoryAttempts);
           task.lastError = lastStoryError;
           if (isMergeRepairAttempt) {
             const observedAt = Date.now();
@@ -974,7 +975,7 @@ async function runWorker(taskId: string) {
       if (!storyPassed) {
         const storyProgress = getStoryProgress(task, us.id);
         const attempts = getStoryAttempts(task, us.id);
-        const exhaustedMessage = `User story ${us.id} exhausted ${attempts}/${maxStoryAttempts} attempts without reaching passed status (last status: ${storyProgress?.status || 'pending'})`;
+        const exhaustedMessage = `User story ${us.id} exhausted ${formatAttemptProgress(attempts, maxStoryAttempts)} attempts without reaching passed status (last status: ${storyProgress?.status || 'pending'})`;
         task.lastError = exhaustedMessage;
         task.lastErrorKind = 'story_incomplete';
         task.lastErrorClass = 'semantic';
@@ -1067,24 +1068,48 @@ async function runWorker(taskId: string) {
   }
 }
 
-function resolveMaxStoryAttempts(configManager: ConfigManager): number {
+function resolveMaxStoryAttempts(configManager: ConfigManager): number | undefined {
   const rawValue = Number(configManager.get('runner.maxStoryAttempts'));
 
-  if (!Number.isFinite(rawValue) || rawValue < 1) {
-    return 2;
+  if (!Number.isFinite(rawValue) || rawValue <= 0) {
+    return undefined;
   }
 
   return Math.floor(rawValue);
 }
 
-function resolveMaxTransientRetries(configManager: ConfigManager): number {
+function resolveMaxTransientRetries(configManager: ConfigManager): number | undefined {
   const rawValue = Number(configManager.get('runner.maxTransientRetriesPerStory'));
 
-  if (!Number.isFinite(rawValue) || rawValue < 0) {
-    return 3;
+  if (!Number.isFinite(rawValue) || rawValue <= 0) {
+    return undefined;
   }
 
   return Math.floor(rawValue);
+}
+
+function hasStoryAttemptsRemaining(task: Task, storyId: string, maxStoryAttempts?: number): boolean {
+  return maxStoryAttempts === undefined || getStoryAttempts(task, storyId) < maxStoryAttempts;
+}
+
+function hasStoryAttemptAfterCurrent(attempt: number, maxStoryAttempts?: number): boolean {
+  return maxStoryAttempts === undefined || attempt < maxStoryAttempts;
+}
+
+function isRetryLimitExceeded(nextRetryCount: number, maxRetries?: number): boolean {
+  return maxRetries !== undefined && nextRetryCount > maxRetries;
+}
+
+function formatLimit(limit?: number): string {
+  return limit === undefined ? 'unlimited' : String(limit);
+}
+
+function formatAttemptProgress(attempt: number, maxStoryAttempts?: number): string {
+  return `${attempt}/${formatLimit(maxStoryAttempts)}`;
+}
+
+function formatRetryProgress(retryCount: number, maxRetries?: number): string {
+  return `${retryCount}/${formatLimit(maxRetries)}`;
 }
 
 function resolveTransientRetryDelayMs(retryCount: number, configManager: ConfigManager): number {

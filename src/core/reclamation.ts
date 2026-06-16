@@ -18,6 +18,7 @@ import { WorktreeInspection, WorktreeManager } from './worktree';
 
 export type ReclamationMode =
   | 'manager_startup'
+  | 'manager_clean_terminal'
   | 'manager_periodic'
   | 'disk_pressure'
   | 'watchdog'
@@ -29,14 +30,20 @@ export interface ReclamationRunOptions {
   repoPath?: string;
   includeWorktrees?: boolean;
   includeOrphanWorktrees?: boolean;
+  cleanTerminalOnly?: boolean;
   maxDurationMs?: number;
   olderThanHours?: number;
+  cleanTerminalRetentionHoursOverride?: number;
+  dirtyTerminalRetentionHoursOverride?: number;
+  cleanOrphanRetentionHoursOverride?: number;
+  dirtyOrphanRetentionHoursOverride?: number;
   maxRemovals?: number;
   lockTimeoutMs?: number;
   dirtyTerminalModeOverride?: DirtyWorktreeReclamationMode;
   dirtyOrphanModeOverride?: DirtyWorktreeReclamationMode;
   includeDirtyOrphanWorktrees?: boolean;
   abandonRetryable?: boolean;
+  skipKeepNewestPerRepo?: boolean;
 }
 
 export interface ReclamationSectionReport {
@@ -129,11 +136,19 @@ interface WorktreeCandidate {
   evidence?: EvidenceArchiveResult;
 }
 
+interface PreRemovalValidationResult {
+  ok: boolean;
+  reason?: string;
+  safetyGates?: ReclamationSafetyGate[];
+  inspection?: WorktreeInspection;
+}
+
 const TERMINAL_STATUSES = new Set<TaskStatus>([
   'completed',
   'failed',
   'failed_finalize',
   'stagnant',
+  'archived',
 ]);
 
 const RETRY_ATTENTION_ERROR_CLASSES = new Set<TaskErrorClass>([
@@ -152,6 +167,10 @@ function getNumber(value: unknown, fallback: number): number {
 
 function getBoolean(value: unknown, fallback: boolean): boolean {
   return typeof value === 'boolean' ? value : fallback;
+}
+
+function getNonNegativeNumber(value: unknown, fallback: number): number {
+  return Math.max(0, getNumber(value, fallback));
 }
 
 function isPidRunning(pid: number | undefined): boolean {
@@ -175,6 +194,26 @@ function parseLeaseOwnerPid(leaseOwner: string | undefined): number | undefined 
 
   const pid = Number(match[1]);
   return Number.isInteger(pid) && pid > 0 ? pid : undefined;
+}
+
+function getTaskActivitySkipReason(
+  task: Pick<Task, 'pid' | 'leaseOwner' | 'leaseExpiresAt'>,
+  now: number,
+): string | undefined {
+  if (isPidRunning(task.pid)) {
+    return 'task_pid_running';
+  }
+
+  const leasePid = parseLeaseOwnerPid(task.leaseOwner);
+  if (leasePid && isPidRunning(leasePid)) {
+    return 'task_lease_owner_running';
+  }
+
+  if (task.leaseExpiresAt && task.leaseExpiresAt > now) {
+    return 'task_lease_fresh';
+  }
+
+  return undefined;
 }
 
 function isPathInside(parentPath: string, candidatePath: string): boolean {
@@ -232,6 +271,13 @@ export class ReclamationService {
 
   getStartupDelayMs(): number {
     return Math.max(0, getNumber(this.configManager.get('reclamation.startupDelaySeconds'), 30)) * 1000;
+  }
+
+  getCleanTerminalSweepIntervalMs(): number {
+    return Math.max(
+      1,
+      getNumber(this.configManager.get('reclamation.worktrees.cleanTerminalSweepIntervalSeconds'), 30),
+    ) * 1000;
   }
 
   async run(options: ReclamationRunOptions = {}): Promise<ReclamationReport> {
@@ -294,7 +340,7 @@ export class ReclamationService {
     const tasks = await this.stateManager.listTasks();
     const taskCandidates = await this.collectTaskWorktreeCandidates(tasks, options);
     const shouldIncludeOrphans = options.includeOrphanWorktrees
-      ?? (options.mode !== 'manual' && this.shouldCleanupOrphans());
+      ?? (!options.cleanTerminalOnly && options.mode !== 'manual' && this.shouldCleanupOrphans());
     const orphanCandidates = shouldIncludeOrphans
       ? await this.collectOrphanWorktreeCandidates(tasks, options)
       : [];
@@ -341,15 +387,25 @@ export class ReclamationService {
     const now = this.now();
     const groupedByRepo = new Map<string, WorktreeCandidate[]>();
     const candidates: WorktreeCandidate[] = [];
+    const repoPathFilter = options.repoPath ? path.resolve(options.repoPath) : undefined;
 
     for (const task of tasks) {
       if (!TERMINAL_STATUSES.has(task.status) || !task.worktree) {
         continue;
       }
 
+      if (repoPathFilter && path.resolve(task.repoPath) !== repoPathFilter) {
+        continue;
+      }
+
       const finishedAt = getTaskFinishedAt(task);
       const ageHours = Math.max(0, (now - finishedAt) / (60 * 60 * 1000));
       const inspection = await this.worktreeManager.inspectWorktree(task.repoPath, task.worktree);
+
+      if (options.cleanTerminalOnly && inspection.dirty) {
+        continue;
+      }
+
       const retentionHours = this.getTaskRetentionHours(task, options, inspection);
       const candidate: WorktreeCandidate = {
         kind: 'task_worktree',
@@ -377,18 +433,46 @@ export class ReclamationService {
       candidates.push(candidate);
     }
 
-    if (options.mode !== 'manual' && options.olderThanHours === undefined) {
-      const keepNewestPerRepo = Math.max(0, getNumber(this.configManager.get('reclamation.worktrees.keepNewestPerRepo'), 5));
+    if (
+      !options.skipKeepNewestPerRepo
+      && options.mode !== 'manual'
+      && options.olderThanHours === undefined
+    ) {
+      const keepNewestCleanPerRepo = getNonNegativeNumber(
+        this.configManager.get('reclamation.worktrees.keepNewestCleanPerRepo'),
+        0,
+      );
+      const keepNewestDirtyPerRepo = getNonNegativeNumber(
+        this.configManager.get('reclamation.worktrees.keepNewestDirtyPerRepo'),
+        getNonNegativeNumber(this.configManager.get('reclamation.worktrees.keepNewestPerRepo'), 0),
+      );
 
       for (const repoCandidates of groupedByRepo.values()) {
-        for (const candidate of repoCandidates.slice().sort(sortByFinishedAtDesc).slice(0, keepNewestPerRepo)) {
-          candidate.reclaimable = false;
-          candidate.reason = 'keep_newest_per_repo';
-        }
+        this.retainNewest(
+          repoCandidates.filter((candidate) => !candidate.inspection?.dirty),
+          keepNewestCleanPerRepo,
+          'keep_newest_clean_per_repo',
+        );
+        this.retainNewest(
+          repoCandidates.filter((candidate) => candidate.inspection?.dirty),
+          keepNewestDirtyPerRepo,
+          'keep_newest_dirty_per_repo',
+        );
       }
     }
 
     return candidates.sort((a, b) => (a.finishedAt ?? 0) - (b.finishedAt ?? 0));
+  }
+
+  private retainNewest(candidates: WorktreeCandidate[], keepCount: number, reason: string): void {
+    if (keepCount <= 0) {
+      return;
+    }
+
+    for (const candidate of candidates.slice().sort(sortByFinishedAtDesc).slice(0, keepCount)) {
+      candidate.reclaimable = false;
+      candidate.reason = reason;
+    }
   }
 
   private async collectOrphanWorktreeCandidates(
@@ -414,8 +498,12 @@ export class ReclamationService {
     }
 
     const candidates: WorktreeCandidate[] = [];
-    const cleanRetentionHours = options.olderThanHours ?? getNumber(this.configManager.get('reclamation.worktrees.orphanRetentionHours'), 24);
-    const dirtyRetentionHours = options.olderThanHours ?? getNumber(this.configManager.get('reclamation.worktrees.dirtyOrphanRetentionHours'), 720);
+    const cleanRetentionHours = options.cleanOrphanRetentionHoursOverride
+      ?? options.olderThanHours
+      ?? getNumber(this.configManager.get('reclamation.worktrees.orphanRetentionHours'), 24);
+    const dirtyRetentionHours = options.dirtyOrphanRetentionHoursOverride
+      ?? options.olderThanHours
+      ?? getNumber(this.configManager.get('reclamation.worktrees.dirtyOrphanRetentionHours'), 720);
 
     for (const repoPath of repoPaths) {
       if (!fs.existsSync(path.join(repoPath, '.git'))) {
@@ -531,14 +619,30 @@ export class ReclamationService {
       }
     }
 
-    result.wouldRemove = true;
-    report.candidates.push(result);
-
     if (options.dryRun || !candidate.existed) {
+      result.wouldRemove = true;
+      report.candidates.push(result);
       return;
     }
 
-    const removal = await this.worktreeManager.removeWorktreeSafe(candidate.repoPath, candidate.worktree, { force: true });
+    const validation = await this.validateCandidateBeforeRemoval(candidate, decision, options);
+    if (!validation.ok) {
+      result.reason = validation.reason || 'pre_removal_validation_failed';
+      result.safetyGates = validation.safetyGates ?? result.safetyGates;
+      result.dirty = validation.inspection?.dirty ?? result.dirty;
+      result.registeredGitWorktree = validation.inspection?.registered ?? result.registeredGitWorktree;
+      result.pathInsideRalphWorktrees = validation.inspection?.pathInsideRalphWorktrees ?? result.pathInsideRalphWorktrees;
+      report.skipped.push(result);
+      report.worktrees.skipped++;
+      return;
+    }
+
+    result.wouldRemove = true;
+    report.candidates.push(result);
+
+    const removal = await this.worktreeManager.removeWorktreeSafe(candidate.repoPath, candidate.worktree, {
+      force: decision.action === 'archive_then_reclaim',
+    });
     if (!removal.removed) {
       result.reason = removal.error || 'remove_failed';
       report.errors.push({
@@ -632,17 +736,11 @@ export class ReclamationService {
       return 'path_outside_ralph_worktrees';
     }
 
-    if (candidate.task && isPidRunning(candidate.task.pid)) {
-      return 'task_pid_running';
-    }
-
-    const leasePid = candidate.task ? parseLeaseOwnerPid(candidate.task.leaseOwner) : undefined;
-    if (leasePid && isPidRunning(leasePid)) {
-      return 'task_lease_owner_running';
-    }
-
-    if (candidate.task?.leaseExpiresAt && candidate.task.leaseExpiresAt > this.now()) {
-      return 'task_lease_fresh';
+    if (candidate.task) {
+      const activitySkipReason = getTaskActivitySkipReason(candidate.task, this.now());
+      if (activitySkipReason) {
+        return activitySkipReason;
+      }
     }
 
     if (
@@ -793,7 +891,11 @@ export class ReclamationService {
     const inspection = candidate.inspection;
 
     addGate('terminal_status_allowed', candidate.kind === 'orphan_worktree' || Boolean(candidate.task && TERMINAL_STATUSES.has(candidate.task.status)), 'status_not_terminal');
-    addGate('task_not_active', !candidate.task || (!isPidRunning(candidate.task.pid) && !(candidate.task.leaseExpiresAt && candidate.task.leaseExpiresAt > this.now())), 'task_active_or_leased');
+    addGate(
+      'task_not_active',
+      !candidate.task || !getTaskActivitySkipReason(candidate.task, this.now()),
+      'task_active_or_leased',
+    );
     addGate('path_confined', Boolean(inspection?.pathInsideRalphWorktrees), 'path_outside_ralph_worktrees');
 
     if (
@@ -984,13 +1086,107 @@ export class ReclamationService {
     };
   }
 
+  private async validateCandidateBeforeRemoval(
+    candidate: WorktreeCandidate,
+    decision: ReclamationDecision,
+    options: ReclamationRunOptions,
+  ): Promise<PreRemovalValidationResult> {
+    if (candidate.task) {
+      const loadTask = (this.stateManager as unknown as {
+        loadTask?: (taskId: string) => Promise<Task | null | undefined>;
+      }).loadTask;
+
+      if (typeof loadTask === 'function') {
+        const latestTask = await loadTask.call(this.stateManager, candidate.task.id);
+        if (!latestTask) {
+          return { ok: false, reason: 'task_missing_before_removal' };
+        }
+
+        if (!TERMINAL_STATUSES.has(latestTask.status)) {
+          return { ok: false, reason: 'task_no_longer_terminal' };
+        }
+
+        if (!latestTask.worktree) {
+          return { ok: false, reason: 'task_worktree_cleared_before_removal' };
+        }
+
+        if (path.resolve(latestTask.repoPath) !== path.resolve(candidate.repoPath)) {
+          return { ok: false, reason: 'task_repo_changed_before_removal' };
+        }
+
+        if (path.resolve(latestTask.worktree) !== path.resolve(candidate.worktree)) {
+          return { ok: false, reason: 'task_worktree_changed_before_removal' };
+        }
+
+        const activitySkipReason = getTaskActivitySkipReason(latestTask, this.now());
+        if (activitySkipReason) {
+          return { ok: false, reason: activitySkipReason };
+        }
+
+        candidate.task = latestTask;
+      }
+    }
+
+    const inspection = await this.worktreeManager.inspectWorktree(candidate.repoPath, candidate.worktree);
+    candidate.inspection = inspection;
+    candidate.existed = inspection.exists;
+
+    if (!inspection.exists) {
+      return { ok: false, reason: 'worktree_missing_before_removal', inspection };
+    }
+
+    if (!inspection.pathInsideRalphWorktrees) {
+      return { ok: false, reason: 'path_outside_ralph_worktrees', inspection };
+    }
+
+    if (inspection.statusError) {
+      return { ok: false, reason: 'status_unreadable_before_removal', inspection };
+    }
+
+    if (decision.action === 'remove_clean') {
+      if (inspection.dirty) {
+        return { ok: false, reason: 'became_dirty_before_clean_removal', inspection };
+      }
+
+      return { ok: true, inspection };
+    }
+
+    if (decision.action === 'archive_then_reclaim' && inspection.dirty) {
+      const attentionState = this.classifyWorktreeAttention(candidate, options);
+      const safetyGates = this.getDirtySafetyGates(candidate, attentionState, options);
+      const failedGate = safetyGates.find((gate) => !gate.passed);
+      if (failedGate) {
+        return {
+          ok: false,
+          reason: failedGate.reason || `${failedGate.name}_failed_before_removal`,
+          safetyGates,
+          inspection,
+        };
+      }
+
+      return { ok: true, safetyGates, inspection };
+    }
+
+    return { ok: true, inspection };
+  }
+
   private getTaskRetentionHours(
     task: Task,
     options: ReclamationRunOptions,
     inspection?: WorktreeInspection,
   ): number {
+    const dirty = inspection?.dirty === true;
+
     if (options.olderThanHours !== undefined) {
       return options.olderThanHours;
+    }
+
+    if (!dirty && options.cleanTerminalRetentionHoursOverride !== undefined) {
+      return Math.max(0, options.cleanTerminalRetentionHoursOverride);
+    }
+
+    if (dirty && options.dirtyTerminalRetentionHoursOverride !== undefined) {
+      return Math.max(0, options.dirtyTerminalRetentionHoursOverride);
     }
 
     if (task.status === 'completed') {
@@ -999,36 +1195,38 @@ export class ReclamationService {
         return getNumber(this.configManager.get('reclamation.worktrees.targetSyncDeferredRetentionHours'), 72);
       }
 
+      if (!dirty) {
+        return getNonNegativeNumber(
+          this.configManager.get('reclamation.worktrees.cleanTerminalRetentionHours'),
+          0,
+        );
+      }
+
       return getNumber(this.configManager.get('reclamation.worktrees.completedRetentionHours'), 24);
     }
 
-    if (task.status === 'failed_finalize') {
-      if (inspection?.dirty) {
-        return getNumber(
-          this.configManager.get('reclamation.worktrees.dirtyFailedFinalizeRetentionHours'),
-          getNumber(this.configManager.get('reclamation.worktrees.dirtyFailedRetentionHours'), 336),
-        );
-      }
+    if (!dirty) {
+      return getNonNegativeNumber(
+        this.configManager.get('reclamation.worktrees.cleanTerminalRetentionHours'),
+        0,
+      );
+    }
 
-      return getNumber(this.configManager.get('reclamation.worktrees.failedFinalizeRetentionHours'), 168);
+    if (task.status === 'failed_finalize') {
+      return getNumber(
+        this.configManager.get('reclamation.worktrees.dirtyFailedFinalizeRetentionHours'),
+        getNumber(this.configManager.get('reclamation.worktrees.dirtyFailedRetentionHours'), 336),
+      );
     }
 
     if (task.status === 'stagnant') {
-      if (inspection?.dirty) {
-        return getNumber(
-          this.configManager.get('reclamation.worktrees.dirtyStagnantRetentionHours'),
-          getNumber(this.configManager.get('reclamation.worktrees.dirtyFailedRetentionHours'), 336),
-        );
-      }
-
-      return getNumber(this.configManager.get('reclamation.worktrees.stagnantRetentionHours'), 168);
+      return getNumber(
+        this.configManager.get('reclamation.worktrees.dirtyStagnantRetentionHours'),
+        getNumber(this.configManager.get('reclamation.worktrees.dirtyFailedRetentionHours'), 336),
+      );
     }
 
-    if (inspection?.dirty) {
-      return getNumber(this.configManager.get('reclamation.worktrees.dirtyFailedRetentionHours'), 336);
-    }
-
-    return getNumber(this.configManager.get('reclamation.worktrees.failedRetentionHours'), 168);
+    return getNumber(this.configManager.get('reclamation.worktrees.dirtyFailedRetentionHours'), 336);
   }
 
   private getTaskTier(task: Task, options: ReclamationRunOptions): string {

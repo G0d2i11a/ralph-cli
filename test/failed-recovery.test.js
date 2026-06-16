@@ -570,6 +570,175 @@ test('dependency watcher retries transient failed target sync for integrated com
   fs.rmSync(tempDir, { recursive: true, force: true });
 });
 
+test('dependency watcher retries ENOENT target sync failures for integrated completed tasks', async () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-target-sync-enoent-retry-'));
+  const stateManager = new FakeStateManager([
+    {
+      id: 'enoent-sync-task',
+      prdPath: path.join(tempDir, 'prd.json'),
+      prdId: 'enoent-sync-prd',
+      status: 'completed',
+      startTime: 100,
+      completedUS: ['US-001'],
+      storyProgress: [
+        { id: 'US-001', status: 'passed', attempts: 1, updatedAt: 1 },
+      ],
+      worktree: path.join(tempDir, 'worktree'),
+      logPath: path.join(tempDir, 'agent.log'),
+      agent: 'codex',
+      repoPath: path.join(tempDir, 'repo'),
+      loopCount: 1,
+      consecutiveNoProgress: 0,
+      consecutiveErrors: 0,
+      lastProgressTime: 100,
+      lastFilesChanged: 1,
+      integratedAt: 150,
+      mergedAt: 150,
+      integrationStatus: 'integrated',
+      integrationBranch: 'ralph/integration/main',
+      integrationWorktree: path.join(tempDir, 'integration'),
+      integrationCommitSha: 'abc123',
+      mergeCommitSha: 'abc123',
+      mergeTargetBranch: 'main',
+      mergeStrategy: 'manual',
+      mergeMessage: 'Integrated task branch into ralph/integration/main',
+      targetSyncStatus: 'failed',
+      targetSyncDeferredReason: 'target sync retry failed: spawnSync git ENOENT',
+    },
+  ]);
+  const mergeCalls = [];
+  const watcher = new DependencyWatcher(
+    {},
+    {
+      stateManager,
+      configManager: createConfigManager({
+        autoMerge: true,
+        'merge.syncTargetBranch': true,
+      }),
+      scheduler: {
+        describePendingTask: async () => queuedPendingState(),
+        schedulePendingTasks: async () => [],
+      },
+      sleep: async () => undefined,
+      logger: { log() {}, error() {} },
+      mergeTask: async (task, targetBranch, strategy, options) => {
+        mergeCalls.push({ taskId: task.id, targetBranch, strategy, options });
+        return {
+          success: true,
+          hasConflicts: false,
+          alreadyMerged: true,
+          commitSha: 'abc123',
+          integrationBranch: 'ralph/integration/main',
+          integrationWorktree: path.join(tempDir, 'integration'),
+          targetSynced: false,
+          targetSyncMessage: 'main sync deferred: checkout has uncommitted changes',
+          message: 'task branch is already integrated in ralph/integration/main; main sync deferred: checkout has uncommitted changes',
+        };
+      },
+    },
+  );
+
+  await watcher.reconcileDeferredTargetSyncs();
+
+  const task = stateManager.tasks.get('enoent-sync-task');
+  assert.equal(mergeCalls.length, 1);
+  assert.equal(mergeCalls[0].targetBranch, 'main');
+  assert.equal(mergeCalls[0].options.syncTargetBranch, true);
+  assert.equal(task.integrationStatus, 'integrated');
+  assert.equal(task.targetSyncStatus, 'deferred_dirty_checkout');
+  assert.equal(task.targetSyncedAt, undefined);
+  assert.match(task.targetSyncDeferredReason, /sync deferred/);
+  assert.match(task.mergeMessage, /sync deferred/);
+
+  fs.rmSync(tempDir, { recursive: true, force: true });
+});
+
+test('dependency watcher retries target sync without completed task worktree', async () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-target-sync-missing-worktree-'));
+  const repoDir = path.join(tempDir, 'repo');
+  fs.mkdirSync(repoDir, { recursive: true });
+  git(repoDir, ['init', '-b', 'main']);
+  git(repoDir, ['config', 'user.name', 'Ralph Test']);
+  git(repoDir, ['config', 'user.email', 'ralph@example.com']);
+  fs.writeFileSync(path.join(repoDir, 'README.md'), 'base\n');
+  git(repoDir, ['add', 'README.md']);
+  git(repoDir, ['commit', '-m', 'base']);
+
+  git(repoDir, ['checkout', '-b', 'ralph/integration/main']);
+  fs.writeFileSync(path.join(repoDir, 'feature.txt'), 'feature\n');
+  git(repoDir, ['add', 'feature.txt']);
+  git(repoDir, ['commit', '-m', 'feature']);
+  const integrationCommitSha = execFileSync('git', ['rev-parse', 'HEAD'], {
+    cwd: repoDir,
+    encoding: 'utf-8',
+  }).trim();
+  git(repoDir, ['checkout', 'main']);
+  fs.writeFileSync(path.join(repoDir, 'local-dirty.txt'), 'do not overwrite\n');
+
+  const stateManager = new FakeStateManager([
+    {
+      id: 'missing-worktree-sync-task',
+      prdPath: path.join(tempDir, 'prd.json'),
+      prdId: 'missing-worktree-sync-prd',
+      status: 'completed',
+      startTime: 100,
+      completedUS: ['US-001'],
+      storyProgress: [
+        { id: 'US-001', status: 'passed', attempts: 1, updatedAt: 1 },
+      ],
+      worktree: path.join(tempDir, 'removed-worktree'),
+      logPath: path.join(tempDir, 'agent.log'),
+      agent: 'codex',
+      repoPath: repoDir,
+      loopCount: 1,
+      consecutiveNoProgress: 0,
+      consecutiveErrors: 0,
+      lastProgressTime: 100,
+      lastFilesChanged: 1,
+      integratedAt: 150,
+      mergedAt: 150,
+      integrationStatus: 'integrated',
+      integrationBranch: 'ralph/integration/main',
+      integrationWorktree: path.join(repoDir, '.ralph-integration', 'main'),
+      integrationCommitSha,
+      mergeCommitSha: integrationCommitSha,
+      mergeTargetBranch: 'main',
+      mergeStrategy: 'manual',
+      mergeMessage: 'Integrated task branch into ralph/integration/main',
+      targetSyncStatus: 'failed',
+      targetSyncDeferredReason: 'target sync retry failed: spawnSync git ENOENT',
+    },
+  ]);
+  const watcher = new DependencyWatcher(
+    {},
+    {
+      stateManager,
+      configManager: createConfigManager({
+        autoMerge: true,
+        'merge.syncTargetBranch': true,
+      }),
+      scheduler: {
+        describePendingTask: async () => queuedPendingState(),
+        schedulePendingTasks: async () => [],
+      },
+      sleep: async () => undefined,
+      logger: { log() {}, error() {} },
+    },
+  );
+
+  await watcher.reconcileDeferredTargetSyncs();
+
+  const task = stateManager.tasks.get('missing-worktree-sync-task');
+  assert.equal(task.integrationStatus, 'integrated');
+  assert.equal(task.targetSyncStatus, 'deferred_dirty_checkout');
+  assert.equal(task.targetSyncedAt, undefined);
+  assert.match(task.targetSyncDeferredReason, /sync deferred/);
+  assert.match(task.targetSyncDeferredReason, /local-dirty\.txt/);
+  assert.match(task.mergeMessage, /sync deferred/);
+
+  fs.rmSync(tempDir, { recursive: true, force: true });
+});
+
 test('dependency watcher clears stale deferred target sync when target publishing is disabled', async () => {
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-target-sync-disabled-'));
   const repoDir = path.join(tempDir, 'repo');
@@ -2602,6 +2771,81 @@ test('dependency watcher backfills legacy transient failures and schedules bound
   assert.ok(task.transientRecoveryNextEligibleAt > Date.now());
 });
 
+test('dependency watcher refreshes expired never-requeued transient recovery windows', async () => {
+  const staleStartedAt = Date.now() - (3 * 60 * 60 * 1000);
+  const stateManager = new FakeStateManager([
+    {
+      id: 'failed-transient-expired-never-requeued',
+      prdPath: '/tmp/prd.json',
+      status: 'failed',
+      startTime: 100,
+      completedUS: ['US-001'],
+      storyProgress: [
+        { id: 'US-001', status: 'passed', attempts: 1, updatedAt: 1 },
+        {
+          id: 'US-002',
+          status: 'failed',
+          attempts: 2,
+          lastError: "ERROR: You've hit your usage limit. Try again at 7:39 AM.",
+          updatedAt: 2,
+        },
+      ],
+      worktree: '/repo/.ralph-worktrees/failed-transient-expired-never-requeued',
+      logPath: '/tmp/failed-transient-expired-never-requeued.log',
+      agent: 'codex',
+      repoPath: '/repo',
+      loopCount: 2,
+      consecutiveNoProgress: 2,
+      consecutiveErrors: 2,
+      lastProgressTime: 100,
+      lastFilesChanged: 0,
+      lastError: "ERROR: You've hit your usage limit. Visit https://chatgpt.com/codex/settings/usage to purchase more credits or try again at 7:39 AM.",
+      lastErrorKind: 'unknown_no_progress',
+      lastErrorClass: 'unknown',
+      lastErrorRetryable: false,
+      lastErrorSignature: 'unknown_no_progress',
+      transientRecoveryStartedAt: staleStartedAt,
+      transientRecoveryDeadlineAt: staleStartedAt + 60_000,
+      transientRecoveryTotalRequeues: 0,
+      transientRecoveryStoppedAt: staleStartedAt + 60_000,
+      transientRecoveryStopReason: 'transient_deadline_exhausted',
+      autoRecoveryKind: 'transient',
+      autoRecoveryTotalRequeues: 0,
+      autoRecoveryStoppedAt: staleStartedAt + 60_000,
+      autoRecoveryStopReason: 'transient_deadline_exhausted',
+    },
+  ]);
+
+  const watcher = new DependencyWatcher(
+    {},
+    {
+      stateManager,
+      configManager: createConfigManager(),
+      scheduler: {
+        schedulePendingTasks: async () => [],
+      },
+      sleep: async () => undefined,
+      logger: { log() {}, error() {} },
+    },
+  );
+
+  await watcher.recoverFailedTransientTasks();
+  const task = stateManager.tasks.get('failed-transient-expired-never-requeued');
+  assert.equal(task.status, 'pending');
+  assert.equal(task.storyProgress[1].status, 'pending');
+  assert.equal(task.storyProgress[1].attempts, 0);
+  assert.equal(task.lastErrorKind, 'backend_rate_limited');
+  assert.equal(task.lastErrorClass, 'transient_backend');
+  assert.equal(task.lastErrorRetryable, true);
+  assert.equal(task.lastErrorSignature, 'backend_rate_limited');
+  assert.equal(task.transientRecoveryStopReason, undefined);
+  assert.equal(task.autoRecoveryStopReason, undefined);
+  assert.ok(task.transientRecoveryStartedAt > staleStartedAt);
+  assert.ok(task.transientRecoveryDeadlineAt > Date.now());
+  assert.equal(task.transientRecoveryTotalRequeues, 1);
+  assert.equal(task.autoRecoveryTotalRequeues, 1);
+});
+
 test('dependency watcher requeues Codex context-window failures in a fresh conversation', async () => {
   const stateManager = new FakeStateManager([
     {
@@ -3626,6 +3870,77 @@ test('dependency watcher stops repeated same-signature transient failures', asyn
   const task = stateManager.tasks.get('failed-transient-stop');
   assert.equal(task.status, 'failed');
   assert.equal(task.transientRecoveryStopReason, 'transient_same_signature_no_progress');
+  assert.ok(task.transientRecoveryStoppedAt);
+});
+
+test('dependency watcher opens rate-limit circuit before generating more transient recovery', async () => {
+  const stateManager = new FakeStateManager([
+    {
+      id: 'failed-transient-rate-limit-circuit',
+      prdPath: '/tmp/prd.json',
+      status: 'failed',
+      startTime: 100,
+      completedUS: [],
+      storyProgress: [
+        {
+          id: 'US-001',
+          status: 'failed',
+          attempts: 2,
+          lastError: "ERROR: You've hit your usage limit. Try again later. 429",
+          updatedAt: 1,
+        },
+      ],
+      worktree: '/repo/.ralph-worktrees/failed-transient-rate-limit-circuit',
+      logPath: '/tmp/failed-transient-rate-limit-circuit.log',
+      agent: 'codex',
+      repoPath: '/repo',
+      loopCount: 2,
+      consecutiveNoProgress: 2,
+      consecutiveErrors: 2,
+      lastProgressTime: 100,
+      lastFilesChanged: 0,
+      lastError: "ERROR: You've hit your usage limit. Try again later. 429",
+      lastErrorKind: 'backend_rate_limited',
+      lastErrorClass: 'transient_backend',
+      lastErrorRetryable: true,
+      lastErrorSignature: 'backend_rate_limited',
+      lastErrorHadObjectiveProgress: false,
+      lastErrorObservedAt: 2000,
+      transientRecoveryStartedAt: Date.now() - 5000,
+      transientRecoveryDeadlineAt: Date.now() + 60000,
+      transientRecoveryTotalRequeues: 1,
+      transientRecoveryConsecutiveSameSignature: 1,
+      transientRecoveryLastFailureKind: 'backend_rate_limited',
+      transientRecoveryLastFailureClass: 'transient_backend',
+      transientRecoveryLastFailureSignature: 'backend_rate_limited',
+      transientRecoveryLastFailureObservedAt: 1000,
+      transientRecoveryLastFailureStoryId: 'US-001',
+      transientRecoveryNextEligibleAt: Date.now() - 1000,
+      autoRecoveryKind: 'transient',
+      autoRecoveryTotalRequeues: 1,
+      autoRecoveryHardCap: 20,
+    },
+  ]);
+
+  const watcher = new DependencyWatcher(
+    {},
+    {
+      stateManager,
+      configManager: createConfigManager(),
+      scheduler: {
+        schedulePendingTasks: async () => [],
+      },
+      sleep: async () => undefined,
+      logger: { log() {}, error() {} },
+    },
+  );
+
+  await watcher.recoverFailedTransientTasks();
+  const task = stateManager.tasks.get('failed-transient-rate-limit-circuit');
+  assert.equal(task.status, 'failed');
+  assert.equal(task.transientRecoveryStopReason, 'transient_rate_limit_circuit_open');
+  assert.equal(task.autoRecoveryStopReason, 'transient_rate_limit_circuit_open');
+  assert.equal(task.transientRecoveryNextEligibleAt, undefined);
   assert.ok(task.transientRecoveryStoppedAt);
 });
 

@@ -2,16 +2,20 @@
 
 import { Command } from 'commander';
 import * as path from 'path';
+import { initCommand } from './commands/init';
 import { startCommand } from './commands/start';
 import { batchStartCommand } from './commands/batch-start';
 import { statusCommand } from './commands/status';
 import { listCommand } from './commands/list';
 import { stopCommand } from './commands/stop';
+import { pauseCommand } from './commands/pause';
+import { resumeCommand } from './commands/resume';
 import { mergeCommand } from './commands/merge';
 import { finalizeCommand } from './commands/finalize';
 import { statsCommand } from './commands/stats';
 import { updateCommand } from './commands/update';
 import { retryCommand } from './commands/retry';
+import { archiveCommand } from './commands/archive';
 import { repairConflictsCommand } from './commands/repair-conflicts';
 import { resetStagnationCommand } from './commands/reset-stagnation';
 import { completionCommand } from './commands/completion';
@@ -53,11 +57,29 @@ program.hook('preAction', (_thisCommand, actionCommand) => {
 });
 
 program
+  .command('init')
+  .description('Initialize a Ralph home for a repo and register it with the menu bar')
+  .option('--repo <path>', 'Repository path (defaults to current directory)')
+  .option('--name <name>', 'Project display name used by Ralph Menu Bar')
+  .option('--agent <name>', 'Default agent path/name to store in config (claude|codex)', DEFAULT_AGENT)
+  .option('--backend <name>', `Default backend to store in config (cli|agent-runners, default: ${DEFAULT_BACKEND})`)
+  .option('--max-concurrent <count>', 'Runner concurrency for this Ralph home')
+  .option('--menubar-config <path>', 'Ralph Menu Bar config path')
+  .option('--no-register-menubar', 'Initialize the Ralph home without adding it to Ralph Menu Bar')
+  .addHelpText('after', `
+Examples:
+  $ ralph --home ~/.ralph-homes/my-project init --repo ~/Project/my-project --name my-project
+  $ ralph --home ~/.ralph-homes/anchorwise init --repo ~/Project/marginary --name Anchorwise
+  $ ralph init --repo . --no-register-menubar`)
+  .action(initCommand);
+
+program
   .command('start <prd-path>')
   .description('Start a new task from a PRD file')
   .option('--repo <path>', 'Repository path (defaults to current directory)')
   .option('--agent <name>', 'Agent to use (claude|codex)', DEFAULT_AGENT)
   .option('--backend <name>', `Backend to use (cli|agent-runners, default: ${DEFAULT_BACKEND})`)
+  .option('--base-ref <ref>', 'Git ref to use as the task worktree base instead of the repo current branch')
   .option('--allow-duplicate', 'Allow enqueueing a duplicate active PRD for the same repo')
   .addHelpText('after', `
 Examples:
@@ -96,6 +118,24 @@ program
 Examples:
   $ ralph stop task-1772544497775-wdat8zyr5`)
   .action(stopCommand);
+
+program
+  .command('pause')
+  .description('Pause Ralph manager scheduling without killing running tasks')
+  .option('--reason <reason>', 'Reason to record in the Ralph home control state')
+  .addHelpText('after', `
+Examples:
+  $ ralph pause
+  $ ralph pause --reason "backend rate limited"`)
+  .action(pauseCommand);
+
+program
+  .command('resume')
+  .description('Resume Ralph manager scheduling after a pause')
+  .addHelpText('after', `
+Examples:
+  $ ralph resume`)
+  .action(resumeCommand);
 
 program
   .command('merge <task-id>')
@@ -165,6 +205,15 @@ Examples:
   $ ralph retry task-1772544497775-wdat8zyr5
   $ ralph retry task-1772544497775-wdat8zyr5 --finalize-only`)
   .action(retryCommand);
+
+program
+  .command('archive <task-id>')
+  .description('Archive a terminal failed task so it no longer blocks queue diagnostics')
+  .option('--reason <reason>', 'Reason to record on the archived task')
+  .addHelpText('after', `
+Examples:
+  $ ralph archive task-1772544497775-wdat8zyr5 --reason "duplicate task superseded by completed retry"`)
+  .action(archiveCommand);
 
 program
   .command('repair-conflicts <task-id>')

@@ -134,6 +134,103 @@ test('enqueueTaskFromPrd stores declared coordination metadata from PRD', async 
   }
 });
 
+test('enqueueTaskFromPrd preserves Oracle reference implementation and PRD guardrails at intake', async () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-intake-reference-implementation-'));
+  const previousHome = process.env.HOME;
+
+  try {
+    process.env.HOME = tempDir;
+    const prdPath = createPrdFile(tempDir, 'prd-reference-implementation', [], {
+      acceptanceCriteria: ['top-level acceptance must be visible'],
+      nonGoals: ['do not add routes'],
+      safetyBoundaries: ['no provider calls'],
+      forbiddenWriteSurface: ['packages/control-plane/src/routes/**'],
+      verificationCommands: ['npm test'],
+      referenceImplementation: {
+        status: 'candidate_complete',
+        kind: 'unified_patch_or_complete_files',
+        touchedFiles: ['src/example.ts'],
+        patch: 'diff --git a/src/example.ts b/src/example.ts\n',
+      },
+    });
+    const stateManager = new FakeStateManager();
+    const scheduler = new NoopScheduler();
+
+    const result = await enqueueTaskFromPrd(prdPath, {
+      repoPath: tempDir,
+      stateManager,
+      scheduler,
+      configManager: { get: () => undefined },
+      now: () => 2_500,
+    });
+
+    const taskPrdPath = path.join(path.dirname((await stateManager.loadTask(result.taskId)).logPath), 'prd.json');
+    const taskPrd = JSON.parse(fs.readFileSync(taskPrdPath, 'utf8'));
+    assert.deepEqual(taskPrd.acceptanceCriteria, ['top-level acceptance must be visible']);
+    assert.deepEqual(taskPrd.nonGoals, ['do not add routes']);
+    assert.deepEqual(taskPrd.safetyBoundaries, ['no provider calls']);
+    assert.deepEqual(taskPrd.forbiddenWriteSurface, ['packages/control-plane/src/routes/**']);
+    assert.deepEqual(taskPrd.verificationCommands, ['npm test']);
+    assert.equal(taskPrd.referenceImplementation.status, 'candidate_complete');
+    assert.equal(taskPrd.referenceImplementation.patch, 'diff --git a/src/example.ts b/src/example.ts\n');
+  } finally {
+    process.env.HOME = previousHome;
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('enqueueTaskFromPrd stores dependency repair metadata from PRD', async () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-intake-repair-metadata-'));
+  const previousHome = process.env.HOME;
+
+  try {
+    process.env.HOME = tempDir;
+    const prdPath = createPrdFile(tempDir, 'followup:source-prd:abc123', [], {
+      priorityClass: 'dependency_repair',
+      repairOf: {
+        prdId: 'source-prd',
+        taskId: 'source-task',
+        reason: 'story_repair_hard_cap_reached',
+      },
+      releasesDependenciesFor: ['source-prd'],
+      schedulerHints: {
+        priorityClass: 'dependency_repair',
+        effectiveDependencyPrdId: 'source-prd',
+        releasesDependenciesFor: ['source-prd'],
+      },
+    });
+    const stateManager = new FakeStateManager();
+    const scheduler = new NoopScheduler();
+
+    const result = await enqueueTaskFromPrd(prdPath, {
+      repoPath: tempDir,
+      stateManager,
+      scheduler,
+      configManager: { get: () => undefined },
+      now: () => 1_000,
+    });
+
+    const task = await stateManager.loadTask(result.taskId);
+    assert.equal(task.prdId, 'followup:source-prd:abc123');
+    assert.equal(task.priorityClass, 'dependency_repair');
+    assert.deepEqual(task.repairOf, {
+      prdId: 'source-prd',
+      taskId: 'source-task',
+      reason: 'story_repair_hard_cap_reached',
+    });
+    assert.deepEqual(task.releasesDependenciesFor, ['source-prd']);
+    assert.equal(task.effectiveDependencyPrdId, 'source-prd');
+    assert.deepEqual(task.schedulerHints, {
+      priorityClass: 'dependency_repair',
+      effectiveDependencyPrdId: 'source-prd',
+      releasesDependenciesFor: ['source-prd'],
+    });
+  } finally {
+    process.env.HOME = previousHome;
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+});
+
 test('enqueueTaskFromPrd dedupes active tasks by repo and prd id by default', async () => {
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-intake-dedupe-'));
   const previousHome = process.env.HOME;

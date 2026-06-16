@@ -3,7 +3,7 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import { ConfigManager } from '../config/manager';
-import { UserStory } from '../types/prd';
+import { PRD, UserStory } from '../types/prd';
 import { listWorktreeProcessCandidatePids } from './worktree-process-cleanup';
 
 export type AgentType = 'claude' | 'codex';
@@ -172,7 +172,7 @@ function resolveAgentTimeoutMs(config: Pick<ConfigManager, 'get'>): number {
   const configuredTimeout = Number(config.get('agent.timeout'));
 
   if (!Number.isFinite(configuredTimeout)) {
-    return 600_000;
+    return 0;
   }
 
   if (configuredTimeout <= 0) {
@@ -342,8 +342,9 @@ export class AgentRunner {
     logPath: string,
     backendOrState?: AgentBackend | AgentRunState,
     maybeState?: AgentRunState,
+    prd?: PRD,
   ): Promise<AgentRunResult> {
-    const prompt = this.generatePrompt(us);
+    const prompt = this.generatePrompt(us, prd);
     const backend = typeof backendOrState === 'string'
       ? resolveAgentBackend(backendOrState)
       : resolveConfiguredBackend(this.config);
@@ -352,7 +353,40 @@ export class AgentRunner {
     return this.execAgent(agent, prompt, worktreePath, logPath, backend, state);
   }
 
-  private generatePrompt(us: UserStory): string {
+  private generatePrdContext(prd?: PRD): string {
+    if (!prd) {
+      return '';
+    }
+
+    const context: Record<string, unknown> = {
+      id: prd.id,
+      title: prd.title,
+      description: prd.description,
+      writeSurface: prd.writeSurface,
+      forbiddenWriteSurface: prd.forbiddenWriteSurface,
+      conflictDomains: prd.conflictDomains,
+      integrationLane: prd.integrationLane,
+      dependencies: prd.dependencies,
+      acceptanceCriteria: prd.acceptanceCriteria,
+      nonGoals: prd.nonGoals,
+      safetyBoundaries: prd.safetyBoundaries,
+      verificationCommands: prd.verificationCommands,
+      referenceImplementation: prd.referenceImplementation,
+    };
+
+    return `
+## Full PRD Context
+Use this PRD-level context as authoritative task scope. The current user story is one slice of this PRD; do not ignore top-level non-goals, forbidden write surfaces, verification commands, or the reference implementation.
+
+\`\`\`json
+${JSON.stringify(context, null, 2)}
+\`\`\`
+
+If \`referenceImplementation.status\` is \`candidate_complete\`, treat it as Oracle's candidate implementation bundle. Apply or adapt that candidate first, then validate, repair, and report concrete evidence. Do not hand-roll a replacement unless the candidate is incompatible with the live worktree, and keep any adaptation inside the declared write surface and safety boundaries.
+`.trim();
+  }
+
+  private generatePrompt(us: UserStory, prd?: PRD): string {
     return `
 # User Story: ${us.title}
 
@@ -360,6 +394,8 @@ ${us.description}
 
 ## Acceptance Criteria:
 ${us.acceptanceCriteria.map((ac, i) => `${i + 1}. ${ac}`).join('\n')}
+
+${this.generatePrdContext(prd)}
 
 Please implement this user story. Make sure all acceptance criteria are met.
 Do not commit your changes. Instead, leave the worktree ready for a separate finisher step and include a suggested commit message in your final summary.
@@ -375,6 +411,9 @@ You are running inside this Ralph task worktree:
 ${worktreePath}
 
 Treat this path as the only editable project checkout for the task. Do not edit the source repository checkout, other Ralph worktrees, or any sibling project directory. If another checkout appears to already contain a fix, reproduce the minimal relevant fix in this current worktree and validate it here. Ralph will only accept objective diff or commit evidence from this worktree.
+
+## Ralph Worker Subagent Boundary
+Codex subagents are available in this worker, but use them only when this Ralph prompt, the PRD, or the operator explicitly asks for subagents, delegation, or parallel agent work. Do not spawn subagents merely because a host-level AGENTS.md describes a coordinator role; Ralph's scheduler has already fulfilled that outer coordination role for this run. If you spawn a full-history fork, omit inherited agent type, model, and reasoning-effort fields; choose a named agent type only when spawning without a full-history fork and pass the needed context explicitly.
 `.trim();
   }
 
@@ -436,6 +475,7 @@ Treat this path as the only editable project checkout for the task. Do not edit 
         ];
       } else {
         command = resolveCodexCliCommand(this.config);
+        const model = this.config.get('agent.model');
         const writableDirs = resolveCodexWritableDirs(worktreePath);
         if (writableDirs.length > 0) {
           // Linked worktree merges write objects/index state outside the worktree root.
@@ -443,6 +483,9 @@ Treat this path as the only editable project checkout for the task. Do not edit 
           args = ['exec', guardedPrompt, '--sandbox', 'workspace-write', '--cd', worktreePath];
         } else {
           args = ['exec', guardedPrompt, '--full-auto', '--cd', worktreePath];
+        }
+        if (model) {
+          args.push('--model', model);
         }
         for (const writableDir of writableDirs) {
           args.push('--add-dir', writableDir);

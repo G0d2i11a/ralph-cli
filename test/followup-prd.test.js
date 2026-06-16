@@ -57,6 +57,50 @@ test('buildFollowupPrdForTask creates deterministic repair PRD content', () => {
   assert.match(generated.prd.description, /failure-signature/);
 });
 
+test('buildFollowupPrdForTask marks hard-cap dependency repair follow-up metadata', () => {
+  const task = createTask({
+    declaredWriteSurface: ['apps/api'],
+    declaredConflictDomains: ['api-contracts'],
+    integrationLane: 'api-repairs',
+    failedBlockerRecoveryDemandTaskIds: ['blocked-child'],
+  });
+
+  const generated = buildFollowupPrdForTask({
+    task,
+    reason: 'story_repair_hard_cap_reached',
+    failure: {
+      id: 'failure:hard-cap',
+      observedAt: 1,
+      kind: 'quality_gate',
+      signature: 'hard-cap-signature',
+      rawMessage: 'test failed',
+      failedFiles: ['apps/api/service.ts'],
+    },
+    recommendedStories: ['Repair the hard-cap blocker'],
+    scope: ['apps/api/routes.ts'],
+  });
+
+  assert.equal(generated.prd.id.startsWith('followup:source-prd:'), true);
+  assert.equal(generated.prd.priorityClass, 'dependency_repair');
+  assert.deepEqual(generated.prd.repairOf, {
+    prdId: 'source-prd',
+    taskId: 'source-task',
+    reason: 'story_repair_hard_cap_reached',
+  });
+  assert.deepEqual(generated.prd.releasesDependenciesFor, ['source-prd']);
+  assert.deepEqual(generated.prd.schedulerHints, {
+    priorityClass: 'dependency_repair',
+    effectiveDependencyPrdId: 'source-prd',
+    releasesDependenciesFor: ['source-prd'],
+    repairTaskId: 'source-task',
+    repairReason: 'story_repair_hard_cap_reached',
+    demandTaskIds: ['blocked-child'],
+  });
+  assert.deepEqual(generated.prd.conflictDomains, ['api-contracts']);
+  assert.equal(generated.prd.integrationLane, 'api-repairs');
+  assert.deepEqual(generated.prd.writeSurface, ['apps/api/routes.ts', 'apps/api/service.ts']);
+});
+
 test('enqueueFollowupPrd writes generated PRD, enqueues it, and records source linkage', async () => {
   const homeDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-followup-prd-'));
   const repoDir = path.join(homeDir, 'repo');
@@ -150,7 +194,9 @@ test('DependencyWatcher generates follow-up PRD for stopped story repair recover
       prdPath: path.join(repoDir, 'source.json'),
       logPath: path.join(homeDir, 'source-agent.log'),
       storyRepairRecoveryStoppedAt: 2000,
-      storyRepairRecoveryStopReason: 'story_repair_budget_exhausted',
+      storyRepairRecoveryStopReason: 'story_repair_hard_cap_reached',
+      declaredConflictDomains: ['apps-web'],
+      integrationLane: 'story-repair',
     });
     fs.writeFileSync(sourceTask.prdPath, JSON.stringify({
       id: 'source-prd',
@@ -179,9 +225,19 @@ test('DependencyWatcher generates follow-up PRD for stopped story repair recover
     const updatedSource = await stateManager.loadTask(sourceTask.id);
     assert.equal(updatedSource.followupPrdIds.length, 1);
     assert.equal(updatedSource.followupTaskIds.length, 1);
-    assert.equal(updatedSource.followupReason, 'story_repair_budget_exhausted');
+    assert.equal(updatedSource.followupReason, 'story_repair_hard_cap_reached');
     const followupTask = await stateManager.loadTask(updatedSource.followupTaskIds[0]);
     assert.equal(followupTask.prdId, updatedSource.followupPrdIds[0]);
+    assert.equal(followupTask.priorityClass, 'dependency_repair');
+    assert.deepEqual(followupTask.repairOf, {
+      prdId: 'source-prd',
+      taskId: 'source-task',
+      reason: 'story_repair_hard_cap_reached',
+    });
+    assert.deepEqual(followupTask.releasesDependenciesFor, ['source-prd']);
+    assert.equal(followupTask.effectiveDependencyPrdId, 'source-prd');
+    assert.deepEqual(followupTask.declaredConflictDomains, ['apps-web']);
+    assert.equal(followupTask.integrationLane, 'story-repair');
   } finally {
     process.env.HOME = previousHome;
     if (previousRalphHome === undefined) {
@@ -195,6 +251,71 @@ test('DependencyWatcher generates follow-up PRD for stopped story repair recover
 
 test('DependencyWatcher generates follow-up PRD for generic stopped recovery state', async () => {
   const homeDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-followup-generic-'));
+  const repoDir = path.join(homeDir, 'repo');
+  const previousHome = process.env.HOME;
+  const previousRalphHome = process.env.RALPH_HOME;
+  fs.mkdirSync(repoDir, { recursive: true });
+
+  try {
+    process.env.HOME = homeDir;
+    delete process.env.RALPH_HOME;
+    const stateManager = new StateManager();
+    const configManager = new ConfigManager();
+    const scheduler = {
+      describePendingTask: async () => null,
+      schedulePendingTasks: async () => {},
+    };
+    const sourceTask = createTask({
+      repoPath: repoDir,
+      prdPath: path.join(repoDir, 'source.json'),
+      logPath: path.join(homeDir, 'source-agent.log'),
+      autoRecoveryStoppedAt: 2000,
+      autoRecoveryStopReason: 'recovery_budget_exhausted',
+      autoRecoveryLastReason: 'Generic recovery budget exhausted',
+    });
+    fs.writeFileSync(sourceTask.prdPath, JSON.stringify({
+      id: 'source-prd',
+      title: 'Source PRD',
+      description: 'source',
+      userStories: [
+        {
+          id: 'US-001',
+          title: 'Source story',
+          description: 'source',
+          acceptanceCriteria: ['source'],
+        },
+      ],
+    }, null, 2));
+    await stateManager.saveTask(sourceTask);
+
+    const watcher = new DependencyWatcher({ repo: repoDir }, {
+      stateManager,
+      scheduler,
+      configManager,
+      logger: { log() {}, error() {} },
+    });
+
+    await watcher.recoverStoppedGenericRecoveryTasks();
+
+    const updatedSource = await stateManager.loadTask(sourceTask.id);
+    assert.equal(updatedSource.followupPrdIds.length, 1);
+    assert.equal(updatedSource.followupTaskIds.length, 1);
+    assert.equal(updatedSource.followupReason, 'recovery_budget_exhausted');
+    const followupTask = await stateManager.loadTask(updatedSource.followupTaskIds[0]);
+    assert.equal(followupTask.prdId, updatedSource.followupPrdIds[0]);
+  } finally {
+    process.env.HOME = previousHome;
+    if (previousRalphHome === undefined) {
+      delete process.env.RALPH_HOME;
+    } else {
+      process.env.RALPH_HOME = previousRalphHome;
+    }
+    fs.rmSync(homeDir, { recursive: true, force: true });
+  }
+});
+
+test('DependencyWatcher skips follow-up PRD for operator-stopped generic recovery state', async () => {
+  const homeDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-followup-operator-stopped-'));
   const repoDir = path.join(homeDir, 'repo');
   const previousHome = process.env.HOME;
   const previousRalphHome = process.env.RALPH_HOME;
@@ -242,11 +363,142 @@ test('DependencyWatcher generates follow-up PRD for generic stopped recovery sta
     await watcher.recoverStoppedGenericRecoveryTasks();
 
     const updatedSource = await stateManager.loadTask(sourceTask.id);
-    assert.equal(updatedSource.followupPrdIds.length, 1);
-    assert.equal(updatedSource.followupTaskIds.length, 1);
-    assert.equal(updatedSource.followupReason, 'operator_stopped');
-    const followupTask = await stateManager.loadTask(updatedSource.followupTaskIds[0]);
-    assert.equal(followupTask.prdId, updatedSource.followupPrdIds[0]);
+    assert.equal(updatedSource.followupPrdIds, undefined);
+    assert.equal(updatedSource.followupTaskIds, undefined);
+    assert.equal(updatedSource.followupReason, undefined);
+  } finally {
+    process.env.HOME = previousHome;
+    if (previousRalphHome === undefined) {
+      delete process.env.RALPH_HOME;
+    } else {
+      process.env.RALPH_HOME = previousRalphHome;
+    }
+    fs.rmSync(homeDir, { recursive: true, force: true });
+  }
+});
+
+test('DependencyWatcher skips follow-up PRD when rate-limit circuit is open', async () => {
+  const homeDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-followup-rate-limit-circuit-'));
+  const repoDir = path.join(homeDir, 'repo');
+  const previousHome = process.env.HOME;
+  const previousRalphHome = process.env.RALPH_HOME;
+  fs.mkdirSync(repoDir, { recursive: true });
+
+  try {
+    process.env.HOME = homeDir;
+    delete process.env.RALPH_HOME;
+    const stateManager = new StateManager();
+    const configManager = new ConfigManager();
+    const scheduler = {
+      describePendingTask: async () => null,
+      schedulePendingTasks: async () => {},
+    };
+    const sourceTask = createTask({
+      repoPath: repoDir,
+      prdPath: path.join(repoDir, 'source.json'),
+      logPath: path.join(homeDir, 'source-agent.log'),
+      lastErrorKind: 'backend_rate_limited',
+      lastErrorClass: 'transient_backend',
+      lastErrorHadObjectiveProgress: false,
+      transientRecoveryStoppedAt: 2000,
+      transientRecoveryStopReason: 'transient_rate_limit_circuit_open',
+      autoRecoveryStoppedAt: 2000,
+      autoRecoveryStopReason: 'transient_rate_limit_circuit_open',
+      autoRecoveryLastReason: 'Backend rate limit circuit opened',
+    });
+    fs.writeFileSync(sourceTask.prdPath, JSON.stringify({
+      id: 'source-prd',
+      title: 'Source PRD',
+      description: 'source',
+      userStories: [
+        {
+          id: 'US-001',
+          title: 'Source story',
+          description: 'source',
+          acceptanceCriteria: ['source'],
+        },
+      ],
+    }, null, 2));
+    await stateManager.saveTask(sourceTask);
+
+    const watcher = new DependencyWatcher({ repo: repoDir }, {
+      stateManager,
+      scheduler,
+      configManager,
+      logger: { log() {}, error() {} },
+    });
+
+    await watcher.recoverStoppedTransientTasks();
+
+    const updatedSource = await stateManager.loadTask(sourceTask.id);
+    assert.equal(updatedSource.followupPrdIds, undefined);
+    assert.equal(updatedSource.followupTaskIds, undefined);
+    assert.equal(updatedSource.followupReason, undefined);
+  } finally {
+    process.env.HOME = previousHome;
+    if (previousRalphHome === undefined) {
+      delete process.env.RALPH_HOME;
+    } else {
+      process.env.RALPH_HOME = previousRalphHome;
+    }
+    fs.rmSync(homeDir, { recursive: true, force: true });
+  }
+});
+
+test('DependencyWatcher skips recursive follow-up PRDs for generated follow-up tasks', async () => {
+  const homeDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-followup-recursive-'));
+  const repoDir = path.join(homeDir, 'repo');
+  const previousHome = process.env.HOME;
+  const previousRalphHome = process.env.RALPH_HOME;
+  fs.mkdirSync(repoDir, { recursive: true });
+
+  try {
+    process.env.HOME = homeDir;
+    delete process.env.RALPH_HOME;
+    const stateManager = new StateManager();
+    const configManager = {
+      get: (key) => key === 'runner.maxGeneratedFollowupDepth' ? 3 : undefined,
+    };
+    const scheduler = {
+      describePendingTask: async () => null,
+      schedulePendingTasks: async () => {},
+    };
+    const sourceTask = createTask({
+      repoPath: repoDir,
+      prdId: 'followup:source-prd:abc123',
+      prdPath: path.join(repoDir, 'generated-followup.json'),
+      logPath: path.join(homeDir, 'source-agent.log'),
+      storyRepairRecoveryStoppedAt: 2000,
+      storyRepairRecoveryStopReason: 'story_repair_hard_cap_reached',
+    });
+    fs.writeFileSync(sourceTask.prdPath, JSON.stringify({
+      id: 'followup:source-prd:abc123',
+      title: 'Generated Follow-up',
+      description: 'source',
+      userStories: [
+        {
+          id: 'US-001',
+          title: 'Source story',
+          description: 'source',
+          acceptanceCriteria: ['source'],
+        },
+      ],
+    }, null, 2));
+    await stateManager.saveTask(sourceTask);
+
+    const watcher = new DependencyWatcher({ repo: repoDir }, {
+      stateManager,
+      scheduler,
+      configManager,
+      logger: { log() {}, error() {} },
+    });
+
+    await watcher.recoverStoppedStoryRepairTasks();
+
+    const updatedSource = await stateManager.loadTask(sourceTask.id);
+    assert.equal(updatedSource.followupPrdIds, undefined);
+    assert.equal(updatedSource.followupTaskIds, undefined);
+    assert.equal(updatedSource.followupReason, undefined);
   } finally {
     process.env.HOME = previousHome;
     if (previousRalphHome === undefined) {
