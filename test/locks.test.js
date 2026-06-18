@@ -151,3 +151,24 @@ test('integration lane lock directories vary by lane', () => {
 
   assert.notEqual(laneA, laneB);
 });
+
+test('integration lane lock directories stay below filesystem component limits for long lane names', async () => {
+  const longLane = [
+    'ralph/integration/main',
+    'runtime role-need-to-mechanism derive compare validate',
+    'falsifier-gated dedicated non-authoritative live-like reversible activation',
+    'canonical production target-sync intentionally disabled',
+    'PRD237 stays NOT_REACHED',
+  ].join(' '.repeat(8));
+  const similarLongLane = `${longLane} variant`;
+  const lockDir = getIntegrationLaneLockDir('/tmp/repo', longLane);
+  const otherLockDir = getIntegrationLaneLockDir('/tmp/repo', similarLongLane);
+  const segment = path.basename(lockDir);
+
+  assert.ok(segment.length < 255, `lock segment too long: ${segment.length}`);
+  assert.notEqual(lockDir, otherLockDir);
+
+  await withIntegrationLaneLock('/tmp/repo', longLane, async () => {
+    assert.equal(fs.existsSync(lockDir), true);
+  });
+});

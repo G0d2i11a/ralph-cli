@@ -6,6 +6,7 @@ const os = require('node:os');
 const path = require('node:path');
 
 const { ReclamationService } = require('../dist/core/reclamation.js');
+const { WorktreeEvidenceArchiver } = require('../dist/core/reclamation-evidence.js');
 
 const HOUR = 60 * 60 * 1000;
 
@@ -45,6 +46,87 @@ function makeInspection(worktree, overrides = {}) {
     pathInsideRalphWorktrees: true,
     ...overrides,
   };
+}
+
+function makeEvidenceCandidate(repoPath, worktree, overrides = {}) {
+  return {
+    kind: 'task_worktree',
+    taskId: 'failed-task',
+    status: 'failed',
+    repoPath,
+    worktree,
+    tier: 'terminal',
+    inspection: makeInspection(worktree, {
+      dirty: true,
+      branch: 'ralph/failed-task',
+      head: '0123456789abcdef',
+    }),
+    ...overrides,
+  };
+}
+
+function makeEvidenceConfig(values = {}) {
+  return makeConfig({
+    'reclamation.evidence.includeTaskSnapshot': false,
+    'reclamation.evidence.includeTaskEventLogTail': false,
+    'reclamation.evidence.includeAgentLogTail': false,
+    'reclamation.evidence.includeStatus': false,
+    'reclamation.evidence.includePatches': false,
+    'reclamation.evidence.includeFileList': false,
+    'reclamation.evidence.includeUntrackedFiles': false,
+    ...values,
+  });
+}
+
+function makeEvidenceWorktreeManager() {
+  return {
+    getWorktreeStatusPorcelainV2: async () => '',
+    getWorktreeStatusShort: async () => '',
+    getWorktreeListPorcelain: async () => '',
+    getWorktreeDiffPatch: async () => '',
+    getWorktreeCachedDiffPatch: async () => '',
+    listTrackedAndOtherFiles: async () => [],
+    listUntrackedFiles: async () => [],
+  };
+}
+
+function makeArchiveDecision() {
+  return {
+    attentionState: 'retained',
+    action: 'archive_only',
+    reason: 'test',
+    safetyGates: [],
+  };
+}
+
+function writeEvidenceArchive(evidenceRoot, id, createdAtMs, payloadBytes) {
+  const dateSegment = new Date(createdAtMs).toISOString().slice(0, 10);
+  const archiveDir = path.join(evidenceRoot, dateSegment, id);
+  fs.mkdirSync(archiveDir, { recursive: true });
+  fs.writeFileSync(path.join(archiveDir, 'payload.bin'), Buffer.alloc(payloadBytes, 'x'));
+  fs.writeFileSync(
+    path.join(archiveDir, 'manifest.json'),
+    `${JSON.stringify({ createdAt: new Date(createdAtMs).toISOString() }, null, 2)}\n`,
+  );
+  fs.utimesSync(archiveDir, new Date(createdAtMs), new Date(createdAtMs));
+  return archiveDir;
+}
+
+function directoryBytes(dir) {
+  if (!fs.existsSync(dir)) {
+    return 0;
+  }
+
+  let total = 0;
+  for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+    const absolutePath = path.join(dir, entry.name);
+    if (entry.isDirectory()) {
+      total += directoryBytes(absolutePath);
+    } else if (entry.isFile()) {
+      total += fs.statSync(absolutePath).size;
+    }
+  }
+  return total;
 }
 
 function makeStateManager(home, tasks, updates = []) {
@@ -726,6 +808,115 @@ test('ReclamationService real evidence archive captures patches and untracked fi
     assert.match(fs.readFileSync(path.join(path.dirname(manifestPath), 'git-diff.patch'), 'utf-8'), /change/);
     assert.equal(fs.readFileSync(path.join(path.dirname(manifestPath), 'untracked', 'notes.txt'), 'utf-8'), 'untracked\n');
     assert.equal(updates[0].update.worktreeReclaimDecision, 'archive_only');
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+    fs.rmSync(repo, { recursive: true, force: true });
+  }
+});
+
+test('WorktreeEvidenceArchiver prunes old evidence archives and stale temp dirs before archiving', async () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-evidence-home-'));
+  const repo = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-evidence-repo-'));
+  const worktree = path.join(repo, '.ralph-worktrees', 'failed-task');
+  const evidenceRoot = path.join(home, 'evidence');
+  const now = Date.UTC(2026, 0, 2, 12, 0, 0);
+
+  try {
+    fs.mkdirSync(worktree, { recursive: true });
+    const oldArchive = writeEvidenceArchive(evidenceRoot, 'old-archive', now - 3 * HOUR, 1024);
+    const staleTemp = path.join(evidenceRoot, '.tmp', 'stale-archive');
+    fs.mkdirSync(staleTemp, { recursive: true });
+    fs.writeFileSync(path.join(staleTemp, 'partial.bin'), Buffer.alloc(1024, 'x'));
+    fs.utimesSync(staleTemp, new Date(now - 3 * HOUR), new Date(now - 3 * HOUR));
+
+    const archiver = new WorktreeEvidenceArchiver({
+      ralphHome: home,
+      configManager: makeEvidenceConfig({
+        'reclamation.evidence.dir': evidenceRoot,
+        'reclamation.evidence.maxAgeHours': 1,
+        'reclamation.evidence.incompleteTempRetentionHours': 1,
+      }),
+      worktreeManager: makeEvidenceWorktreeManager(),
+      now: () => now,
+    });
+
+    const result = await archiver.archive(makeEvidenceCandidate(repo, worktree), makeArchiveDecision(), { mode: 'manager_periodic' });
+
+    assert.equal(result.ok, true);
+    assert.ok(result.manifestPath);
+    assert.equal(fs.existsSync(result.manifestPath), true);
+    assert.equal(fs.existsSync(oldArchive), false);
+    assert.equal(fs.existsSync(staleTemp), false);
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+    fs.rmSync(repo, { recursive: true, force: true });
+  }
+});
+
+test('WorktreeEvidenceArchiver enforces evidence total byte cap while preserving current archive', async () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-evidence-home-'));
+  const repo = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-evidence-repo-'));
+  const worktree = path.join(repo, '.ralph-worktrees', 'failed-task');
+  const evidenceRoot = path.join(home, 'evidence');
+  const now = Date.UTC(2026, 0, 3, 12, 0, 0);
+  const maxTotalBytes = 20 * 1024;
+
+  try {
+    fs.mkdirSync(worktree, { recursive: true });
+    const oldestArchive = writeEvidenceArchive(evidenceRoot, 'oldest', now - 3 * HOUR, 10 * 1024);
+    writeEvidenceArchive(evidenceRoot, 'middle', now - 2 * HOUR, 10 * 1024);
+    writeEvidenceArchive(evidenceRoot, 'newest', now - HOUR, 10 * 1024);
+
+    const archiver = new WorktreeEvidenceArchiver({
+      ralphHome: home,
+      configManager: makeEvidenceConfig({
+        'reclamation.evidence.dir': evidenceRoot,
+        'reclamation.evidence.maxAgeHours': 24,
+        'reclamation.evidence.maxTotalBytes': maxTotalBytes,
+      }),
+      worktreeManager: makeEvidenceWorktreeManager(),
+      now: () => now,
+    });
+
+    const result = await archiver.archive(makeEvidenceCandidate(repo, worktree), makeArchiveDecision(), { mode: 'manager_periodic' });
+
+    assert.equal(result.ok, true);
+    assert.ok(result.dir);
+    assert.equal(fs.existsSync(result.dir), true);
+    assert.equal(fs.existsSync(oldestArchive), false);
+    assert.ok(directoryBytes(evidenceRoot) <= maxTotalBytes);
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+    fs.rmSync(repo, { recursive: true, force: true });
+  }
+});
+
+test('WorktreeEvidenceArchiver deletes incomplete temp archive when candidate exceeds size limit', async () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-evidence-home-'));
+  const repo = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-evidence-repo-'));
+  const worktree = path.join(repo, '.ralph-worktrees', 'failed-task');
+  const evidenceRoot = path.join(home, 'evidence');
+  const now = Date.UTC(2026, 0, 4, 12, 0, 0);
+
+  try {
+    fs.mkdirSync(worktree, { recursive: true });
+    const archiver = new WorktreeEvidenceArchiver({
+      ralphHome: home,
+      configManager: makeEvidenceConfig({
+        'reclamation.evidence.dir': evidenceRoot,
+        'reclamation.evidence.maxBytesPerCandidate': 1,
+      }),
+      worktreeManager: makeEvidenceWorktreeManager(),
+      now: () => now,
+    });
+
+    const result = await archiver.archive(makeEvidenceCandidate(repo, worktree), makeArchiveDecision(), { mode: 'manager_periodic' });
+    const tempRoot = path.join(evidenceRoot, '.tmp');
+
+    assert.equal(result.ok, false);
+    assert.equal(result.error, 'evidence_archive_limit_exceeded');
+    assert.equal(result.dir, undefined);
+    assert.equal(fs.existsSync(tempRoot) ? fs.readdirSync(tempRoot).length : 0, 0);
   } finally {
     fs.rmSync(home, { recursive: true, force: true });
     fs.rmSync(repo, { recursive: true, force: true });

@@ -149,6 +149,12 @@ test('ConfigManager defaults agent.backend to cli', withTempHome(async () => {
   assert.equal(manager.get('reclamation.evidence.enabled'), true);
   assert.equal(manager.get('reclamation.evidence.requireForDirtyReclaim'), true);
   assert.equal(manager.get('reclamation.evidence.includePatches'), true);
+  assert.equal(manager.get('reclamation.evidence.maxTotalBytes'), 512 * 1024 * 1024);
+  assert.equal(manager.get('reclamation.evidence.maxAgeHours'), 24);
+  assert.equal(manager.get('reclamation.evidence.incompleteTempRetentionHours'), 1);
+  assert.equal(manager.get('reclamation.evidence.pruneBeforeArchive'), true);
+  assert.equal(manager.get('reclamation.evidence.pruneAfterArchive'), true);
+  assert.equal(manager.get('reclamation.evidence.cleanupIncompleteOnFailure'), true);
   assert.equal(manager.get('reclamation.evidence.maxUntrackedFiles'), 500);
   assert.equal(manager.get('reclamation.tempDirs.enabled'), true);
   assert.deepEqual(manager.get('reclamation.tempDirs.roots'), ['/private/tmp']);

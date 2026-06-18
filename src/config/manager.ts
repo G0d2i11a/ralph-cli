@@ -92,6 +92,12 @@ export interface RalphConfig {
       includeFileList: boolean;
       includeUntrackedFiles: boolean;
       maxBytesPerCandidate: number;
+      maxTotalBytes: number;
+      maxAgeHours: number;
+      incompleteTempRetentionHours: number;
+      pruneBeforeArchive: boolean;
+      pruneAfterArchive: boolean;
+      cleanupIncompleteOnFailure: boolean;
       maxUntrackedFiles: number;
       maxUntrackedBytes: number;
       maxSingleUntrackedFileBytes: number;
@@ -285,6 +291,12 @@ const DEFAULT_CONFIG: RalphConfig = {
       includeFileList: true,
       includeUntrackedFiles: true,
       maxBytesPerCandidate: 100 * 1024 * 1024,
+      maxTotalBytes: 512 * 1024 * 1024,
+      maxAgeHours: 24,
+      incompleteTempRetentionHours: 1,
+      pruneBeforeArchive: true,
+      pruneAfterArchive: true,
+      cleanupIncompleteOnFailure: true,
       maxUntrackedFiles: 500,
       maxUntrackedBytes: 50 * 1024 * 1024,
       maxSingleUntrackedFileBytes: 10 * 1024 * 1024,

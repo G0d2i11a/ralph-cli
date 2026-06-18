@@ -6,6 +6,8 @@ import { getRalphPaths, RalphHomeOptions } from './paths';
 const LOCK_RETRY_MS = 50;
 const LOCK_TIMEOUT_MS = 30000;
 const LOCK_STALE_MS = 300000;
+const MAX_REPO_LOCK_SEGMENT_LENGTH = 48;
+const MAX_LANE_LOCK_SEGMENT_LENGTH = 96;
 
 interface LockOptions {
   now?: () => number;
@@ -19,6 +21,22 @@ export interface RalphLockOptions extends LockOptions, RalphHomeOptions {}
 function sanitizeSegment(value: string): string {
   const sanitized = value.replace(/[^a-zA-Z0-9._-]+/g, '-');
   return sanitized || 'lock';
+}
+
+function hashSegment(value: string): string {
+  return createHash('sha1').update(value).digest('hex');
+}
+
+function compactSegment(value: string, maxLength: number): string {
+  const sanitized = sanitizeSegment(value);
+  if (sanitized.length <= maxLength) {
+    return sanitized;
+  }
+
+  const hash = hashSegment(value);
+  const prefixLength = Math.max(1, maxLength - hash.length - 1);
+  const prefix = sanitized.slice(0, prefixLength).replace(/[-._]+$/g, '') || 'lock';
+  return `${prefix}-${hash}`;
 }
 
 function defaultSleep(ms: number): Promise<void> {
@@ -133,9 +151,9 @@ export function getIntegrationLaneLockDir(
   options: RalphHomeOptions = {},
 ): string {
   const resolvedRepoPath = path.resolve(repoPath);
-  const repoSlug = sanitizeSegment(path.basename(resolvedRepoPath));
-  const repoHash = createHash('sha1').update(resolvedRepoPath).digest('hex');
-  const laneSlug = sanitizeSegment(lane);
+  const repoSlug = compactSegment(path.basename(resolvedRepoPath), MAX_REPO_LOCK_SEGMENT_LENGTH);
+  const repoHash = hashSegment(resolvedRepoPath);
+  const laneSlug = compactSegment(lane, MAX_LANE_LOCK_SEGMENT_LENGTH);
   return path.join(getRalphPaths(options).locksDir, 'integration-lanes', `${repoSlug}-${repoHash}-${laneSlug}`);
 }
 

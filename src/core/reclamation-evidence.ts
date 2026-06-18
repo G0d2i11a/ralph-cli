@@ -89,6 +89,22 @@ interface WorktreeEvidenceArchiverDeps {
   now?: () => number;
 }
 
+interface EvidenceRetentionOptions {
+  maxTotalBytes: number;
+  maxAgeHours: number;
+  incompleteTempRetentionHours: number;
+  excludePaths?: string[];
+}
+
+interface EvidenceArchiveEntry {
+  path: string;
+  bytes: number;
+  createdAtMs: number;
+}
+
+const HOUR_MS = 60 * 60 * 1000;
+const EVIDENCE_DATE_DIR_PATTERN = /^\d{4}-\d{2}-\d{2}$/;
+
 function getNumber(value: unknown, fallback: number): number {
   const numeric = Number(value);
   return Number.isFinite(numeric) ? numeric : fallback;
@@ -174,6 +190,20 @@ export class WorktreeEvidenceArchiver {
     const maxUntrackedBytes = getNumber(this.configManager.get('reclamation.evidence.maxUntrackedBytes'), 50 * 1024 * 1024);
     const maxSingleUntrackedFileBytes = getNumber(this.configManager.get('reclamation.evidence.maxSingleUntrackedFileBytes'), 10 * 1024 * 1024);
     const logTailBytes = getNumber(this.configManager.get('reclamation.evidence.logTailBytes'), 256 * 1024);
+    const retention = this.resolveRetentionOptions();
+    const cleanupIncompleteOnFailure = getBoolean(this.configManager.get('reclamation.evidence.cleanupIncompleteOnFailure'), true);
+
+    if (getBoolean(this.configManager.get('reclamation.evidence.pruneBeforeArchive'), true)) {
+      this.pruneEvidenceRoot(evidenceRoot, retention);
+    }
+
+    if (retention.maxTotalBytes > 0 && this.measureEvidenceArchiveBytes(evidenceRoot) >= retention.maxTotalBytes) {
+      return {
+        ok: false,
+        complete: false,
+        error: 'evidence_archive_total_limit_exceeded',
+      };
+    }
 
     try {
       fs.mkdirSync(tempDir, { recursive: true });
@@ -340,11 +370,14 @@ export class WorktreeEvidenceArchiver {
           maxSingleUntrackedFileBytes,
         });
         fs.writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
+        if (cleanupIncompleteOnFailure) {
+          this.removePath(tempDir);
+        }
         return {
           ok: false,
           complete: false,
-          dir: tempDir,
-          manifestPath,
+          dir: cleanupIncompleteOnFailure ? undefined : tempDir,
+          manifestPath: cleanupIncompleteOnFailure ? undefined : manifestPath,
           bytes,
           error: 'evidence_archive_limit_exceeded',
         };
@@ -358,24 +391,54 @@ export class WorktreeEvidenceArchiver {
       });
       writeText('manifest', 'manifest.json', `${JSON.stringify(manifest, null, 2)}\n`);
 
+      const archiveBytes = this.measureDirectoryBytes(tempDir);
+      if (retention.maxTotalBytes > 0 && archiveBytes > retention.maxTotalBytes) {
+        if (cleanupIncompleteOnFailure) {
+          this.removePath(tempDir);
+        }
+        return {
+          ok: false,
+          complete: false,
+          dir: cleanupIncompleteOnFailure ? undefined : tempDir,
+          manifestPath: cleanupIncompleteOnFailure ? undefined : path.join(tempDir, 'manifest.json'),
+          bytes: archiveBytes,
+          error: 'evidence_archive_total_limit_exceeded',
+        };
+      }
+
       fs.mkdirSync(path.dirname(finalDir), { recursive: true });
       fs.renameSync(tempDir, finalDir);
+
+      if (getBoolean(this.configManager.get('reclamation.evidence.pruneAfterArchive'), true)) {
+        this.pruneEvidenceRoot(evidenceRoot, {
+          ...retention,
+          excludePaths: [finalDir],
+        });
+      }
 
       return {
         ok: true,
         complete: true,
         dir: finalDir,
         manifestPath: path.join(finalDir, 'manifest.json'),
-        bytes,
+        bytes: archiveBytes,
       };
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
+      const dir = fs.existsSync(tempDir) ? tempDir : undefined;
+      const manifestPath = dir && fs.existsSync(path.join(tempDir, 'manifest.json'))
+        ? path.join(tempDir, 'manifest.json')
+        : undefined;
+      const bytes = dir ? this.measureDirectoryBytes(tempDir) : undefined;
+      if (dir && cleanupIncompleteOnFailure) {
+        this.removePath(tempDir);
+      }
       return {
         ok: false,
         complete: false,
-        dir: fs.existsSync(tempDir) ? tempDir : undefined,
-        manifestPath: fs.existsSync(path.join(tempDir, 'manifest.json')) ? path.join(tempDir, 'manifest.json') : undefined,
-        bytes: fs.existsSync(tempDir) ? this.measureDirectoryBytes(tempDir) : undefined,
+        dir: cleanupIncompleteOnFailure ? undefined : dir,
+        manifestPath: cleanupIncompleteOnFailure ? undefined : manifestPath,
+        bytes,
         error: message,
       };
     }
@@ -421,6 +484,216 @@ export class WorktreeEvidenceArchiver {
       }
     }
     return total;
+  }
+
+  private resolveRetentionOptions(): EvidenceRetentionOptions {
+    return {
+      maxTotalBytes: Math.max(0, getNumber(this.configManager.get('reclamation.evidence.maxTotalBytes'), 512 * 1024 * 1024)),
+      maxAgeHours: Math.max(0, getNumber(this.configManager.get('reclamation.evidence.maxAgeHours'), 24)),
+      incompleteTempRetentionHours: Math.max(0, getNumber(this.configManager.get('reclamation.evidence.incompleteTempRetentionHours'), 1)),
+    };
+  }
+
+  private pruneEvidenceRoot(evidenceRoot: string, options: EvidenceRetentionOptions): void {
+    if (!fs.existsSync(evidenceRoot)) {
+      return;
+    }
+
+    this.pruneIncompleteTempArchives(evidenceRoot, options.incompleteTempRetentionHours);
+
+    if (options.maxAgeHours >= 0) {
+      const cutoffMs = this.now() - options.maxAgeHours * HOUR_MS;
+      for (const entry of this.listEvidenceArchiveEntries(evidenceRoot, options.excludePaths)) {
+        if (entry.createdAtMs < cutoffMs && this.removePath(entry.path)) {
+          this.removeEmptyDateDir(path.dirname(entry.path), evidenceRoot);
+        }
+      }
+    }
+
+    if (options.maxTotalBytes <= 0) {
+      return;
+    }
+
+    let entries = this.listEvidenceArchiveEntries(evidenceRoot, options.excludePaths)
+      .sort((left, right) => left.createdAtMs - right.createdAtMs);
+    let totalBytes = entries.reduce((total, entry) => total + entry.bytes, 0);
+
+    for (const entry of entries) {
+      if (totalBytes <= options.maxTotalBytes) {
+        break;
+      }
+
+      if (this.removePath(entry.path)) {
+        totalBytes -= entry.bytes;
+        this.removeEmptyDateDir(path.dirname(entry.path), evidenceRoot);
+      }
+    }
+
+    entries = this.listEvidenceArchiveEntries(evidenceRoot, options.excludePaths);
+    totalBytes = entries.reduce((total, entry) => total + entry.bytes, 0);
+    if (totalBytes <= options.maxTotalBytes) {
+      this.removeEmptyDateDirs(evidenceRoot);
+    }
+  }
+
+  private pruneIncompleteTempArchives(evidenceRoot: string, retentionHours: number): void {
+    const tempRoot = path.join(evidenceRoot, '.tmp');
+    if (!fs.existsSync(tempRoot)) {
+      return;
+    }
+
+    const cutoffMs = this.now() - retentionHours * HOUR_MS;
+    for (const entry of this.safeReadDir(tempRoot)) {
+      const absolutePath = path.join(tempRoot, entry.name);
+      const stat = this.safeLstat(absolutePath);
+      if (!stat || stat.mtimeMs >= cutoffMs) {
+        continue;
+      }
+      this.removePath(absolutePath);
+    }
+
+    this.removeEmptyDir(tempRoot);
+  }
+
+  private measureEvidenceArchiveBytes(evidenceRoot: string): number {
+    return this.listEvidenceArchiveEntries(evidenceRoot)
+      .reduce((total, entry) => total + entry.bytes, 0);
+  }
+
+  private listEvidenceArchiveEntries(evidenceRoot: string, excludePaths: string[] = []): EvidenceArchiveEntry[] {
+    if (!fs.existsSync(evidenceRoot)) {
+      return [];
+    }
+
+    const entries: EvidenceArchiveEntry[] = [];
+    for (const entry of this.safeReadDir(evidenceRoot)) {
+      if (entry.name === '.tmp') {
+        continue;
+      }
+
+      const absolutePath = path.join(evidenceRoot, entry.name);
+      if (entry.isDirectory() && EVIDENCE_DATE_DIR_PATTERN.test(entry.name)) {
+        for (const archiveEntry of this.safeReadDir(absolutePath)) {
+          const archivePath = path.join(absolutePath, archiveEntry.name);
+          const stat = this.safeLstat(archivePath);
+          if (!stat || this.isExcludedPath(archivePath, excludePaths)) {
+            continue;
+          }
+          entries.push({
+            path: archivePath,
+            bytes: this.measurePathBytes(archivePath),
+            createdAtMs: this.readArchiveCreatedAtMs(archivePath, stat.mtimeMs),
+          });
+        }
+        continue;
+      }
+
+      const stat = this.safeLstat(absolutePath);
+      if (!stat || !stat.isDirectory() || !fs.existsSync(path.join(absolutePath, 'manifest.json'))) {
+        continue;
+      }
+      if (this.isExcludedPath(absolutePath, excludePaths)) {
+        continue;
+      }
+      entries.push({
+        path: absolutePath,
+        bytes: this.measurePathBytes(absolutePath),
+        createdAtMs: this.readArchiveCreatedAtMs(absolutePath, stat.mtimeMs),
+      });
+    }
+
+    return entries;
+  }
+
+  private measurePathBytes(absolutePath: string): number {
+    const stat = this.safeLstat(absolutePath);
+    if (!stat) {
+      return 0;
+    }
+    if (stat.isDirectory()) {
+      return this.measureDirectoryBytes(absolutePath);
+    }
+    return stat.isFile() ? stat.size : 0;
+  }
+
+  private readArchiveCreatedAtMs(archivePath: string, fallbackMs: number): number {
+    const manifestPath = path.join(archivePath, 'manifest.json');
+    if (!fs.existsSync(manifestPath)) {
+      return fallbackMs;
+    }
+
+    try {
+      const parsed = JSON.parse(fs.readFileSync(manifestPath, 'utf-8')) as { createdAt?: unknown };
+      if (typeof parsed.createdAt === 'string') {
+        const createdAtMs = Date.parse(parsed.createdAt);
+        if (Number.isFinite(createdAtMs)) {
+          return createdAtMs;
+        }
+      }
+    } catch {
+      return fallbackMs;
+    }
+
+    return fallbackMs;
+  }
+
+  private safeReadDir(dir: string): fs.Dirent[] {
+    try {
+      return fs.readdirSync(dir, { withFileTypes: true });
+    } catch {
+      return [];
+    }
+  }
+
+  private safeLstat(absolutePath: string): fs.Stats | undefined {
+    try {
+      return fs.lstatSync(absolutePath);
+    } catch {
+      return undefined;
+    }
+  }
+
+  private isExcludedPath(absolutePath: string, excludePaths: string[]): boolean {
+    const resolvedPath = path.resolve(absolutePath);
+    return excludePaths.some((excludePath) => {
+      const resolvedExclude = path.resolve(excludePath);
+      return resolvedPath === resolvedExclude || isPathInside(resolvedExclude, resolvedPath);
+    });
+  }
+
+  private removePath(absolutePath: string): boolean {
+    try {
+      fs.rmSync(absolutePath, { recursive: true, force: true });
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  private removeEmptyDateDirs(evidenceRoot: string): void {
+    for (const entry of this.safeReadDir(evidenceRoot)) {
+      if (!entry.isDirectory() || !EVIDENCE_DATE_DIR_PATTERN.test(entry.name)) {
+        continue;
+      }
+      this.removeEmptyDateDir(path.join(evidenceRoot, entry.name), evidenceRoot);
+    }
+  }
+
+  private removeEmptyDateDir(dateDir: string, evidenceRoot: string): void {
+    if (path.dirname(dateDir) !== evidenceRoot || !EVIDENCE_DATE_DIR_PATTERN.test(path.basename(dateDir))) {
+      return;
+    }
+    this.removeEmptyDir(dateDir);
+  }
+
+  private removeEmptyDir(dir: string): void {
+    try {
+      if (fs.existsSync(dir) && fs.readdirSync(dir).length === 0) {
+        fs.rmdirSync(dir);
+      }
+    } catch {
+      // Best-effort cleanup only.
+    }
   }
 
   private buildManifest(
