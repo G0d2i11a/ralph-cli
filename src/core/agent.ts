@@ -4,6 +4,7 @@ import * as os from 'os';
 import * as path from 'path';
 import { ConfigManager } from '../config/manager';
 import { PRD, UserStory } from '../types/prd';
+import { TaskExecutionMode } from '../types/task';
 import { listWorktreeProcessCandidatePids } from './worktree-process-cleanup';
 
 export type AgentType = 'claude' | 'codex';
@@ -318,6 +319,7 @@ interface AgentRunState {
   threadId?: string;
   storyId?: string;
   threadStoryId?: string;
+  executionMode?: TaskExecutionMode;
 }
 
 export function resolveCodexConversationScope(config: Pick<ConfigManager, 'get'>): CodexConversationScope {
@@ -402,7 +404,26 @@ Do not commit your changes. Instead, leave the worktree ready for a separate fin
 `.trim();
   }
 
-  private addWorktreeGuard(prompt: string, worktreePath: string): string {
+  private addWorktreeGuard(
+    prompt: string,
+    worktreePath: string,
+    executionMode: TaskExecutionMode = 'worktree',
+  ): string {
+    if (executionMode === 'direct') {
+      return `
+${prompt}
+
+## Ralph Direct Queue Boundary
+You are running inside the repository checkout used by Ralph's single-thread direct queue:
+${worktreePath}
+
+Treat this path as the only editable project checkout for the task. Do not edit sibling project directories, create alternate worktrees, or change other checkouts. Do not commit your changes; Ralph's finalizer will validate and commit the direct-queue changes in this checkout.
+
+## Ralph Worker Subagent Boundary
+Codex subagents are available in this worker, but use them only when this Ralph prompt, the PRD, or the operator explicitly asks for subagents, delegation, or parallel agent work. Do not spawn subagents merely because a host-level AGENTS.md describes a coordinator role; Ralph's scheduler has already fulfilled that outer coordination role for this run. If you spawn a full-history fork, omit inherited agent type, model, and reasoning-effort fields; choose a named agent type only when spawning without a full-history fork and pass the needed context explicitly.
+`.trim();
+    }
+
     return `
 ${prompt}
 
@@ -429,7 +450,7 @@ Codex subagents are available in this worker, but use them only when this Ralph 
       let command: string;
       let args: string[];
 
-      const guardedPrompt = this.addWorktreeGuard(prompt, worktreePath);
+      const guardedPrompt = this.addWorktreeGuard(prompt, worktreePath, state?.executionMode);
 
       if (backend === 'agent-runners') {
         let agentRunnersCli: string;

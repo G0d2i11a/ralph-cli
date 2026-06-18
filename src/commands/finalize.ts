@@ -17,6 +17,10 @@ import {
 } from '../core/merge-policy';
 import { buildSuccessfulMergeTaskUpdates } from '../core/merge-task-updates';
 import {
+  buildDirectExecutionIntegrationUpdates,
+  isDirectExecutionTask,
+} from '../core/execution-mode';
+import {
   buildStoryCompletionInvariantFailureUpdates,
   evaluateTaskStoryCompletion,
   formatStoryCompletionInvariantMessage,
@@ -193,7 +197,9 @@ export async function finalizeCommand(taskId: string): Promise<void> {
         const result = finalizeTaskOutput(latestTask);
         const finalizerCommittedAt = result.committed ? Date.now() : undefined;
 
-        if (requiresPostFinalizeMergeProbe(latestTask)) {
+        const directExecution = isDirectExecutionTask(latestTask);
+
+        if (!directExecution && requiresPostFinalizeMergeProbe(latestTask)) {
           const mergeProbeResult = await probeTaskWorktreeMergeability(latestTask, targetBranch, {
             pullLatest: integrationPolicy.pullLatest,
             integrationWorktreeDir: integrationPolicy.integrationWorktreeDir,
@@ -219,6 +225,15 @@ export async function finalizeCommand(taskId: string): Promise<void> {
             );
           }
         }
+
+        const directIntegrationUpdates = directExecution
+          ? buildDirectExecutionIntegrationUpdates(
+              latestTask,
+              targetBranch,
+              integrationPolicy.strategy,
+              result.commitSha || latestTask.baseCommitSha,
+            )
+          : {};
 
         await stateManager.updateTask(taskId, {
           status: 'completed',
@@ -251,6 +266,7 @@ export async function finalizeCommand(taskId: string): Promise<void> {
           leaseExpiresAt: undefined,
           integrationLane,
           ...coordinationState.taskUpdates,
+          ...directIntegrationUpdates,
         });
         appendTaskEvent(latestTask, {
           type: 'finalizer_completed',
@@ -263,9 +279,9 @@ export async function finalizeCommand(taskId: string): Promise<void> {
           },
         });
 
-        let mergeUpdates = {};
+        let mergeUpdates = directIntegrationUpdates;
         let integrationFailure;
-        if (shouldAttemptAutomaticIntegration(integrationPolicy)) {
+        if (!directExecution && shouldAttemptAutomaticIntegration(integrationPolicy)) {
           try {
             if (
               isDestructiveMergeStrategy(integrationPolicy.strategy)

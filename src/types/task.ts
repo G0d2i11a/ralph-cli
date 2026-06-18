@@ -2,6 +2,7 @@ import type { PRDPriorityClass, PRDRepairOf, PRDSchedulerHints } from './prd';
 
 export type TaskStatus = 'pending' | 'running' | 'ready_to_finalize' | 'finalizing' | 'completed' | 'failed' | 'failed_finalize' | 'stagnant' | 'archived';
 export type TaskMergeStrategy = 'manual' | 'ours' | 'theirs';
+export type TaskExecutionMode = 'worktree' | 'direct';
 export type StoryStatus = 'pending' | 'in_progress' | 'needs_repair' | 'passed' | 'failed';
 export type FinalizeRepairFailureKind = 'merge_conflict' | 'quality_gate' | 'finalizer_error';
 export type TaskRepairMode = 'finalize' | 'merge';
@@ -349,6 +350,7 @@ export interface Task {
   completedUS: string[];
   storyProgress?: StoryProgress[];
   worktree: string;
+  executionMode?: TaskExecutionMode;
   worktreeReclaimedAt?: number;
   worktreeReclaimedBy?: 'manager' | 'watchdog' | 'manual';
   worktreeReclaimReason?: string;

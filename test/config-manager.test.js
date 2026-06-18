@@ -66,6 +66,7 @@ test('ConfigManager defaults agent.backend to cli', withTempHome(async () => {
   assert.equal(manager.get('agent.codexConversationScope'), 'story');
   assert.equal(manager.has('agent.backend'), true);
   assert.equal(resolveConfiguredBackend(manager), 'cli');
+  assert.equal(manager.get('runner.executionMode'), 'worktree');
   assert.equal(manager.get('autoMerge'), false);
   assert.equal(manager.get('merge.autoIntegrate'), true);
   assert.equal(manager.get('merge.targetBranch'), 'main');

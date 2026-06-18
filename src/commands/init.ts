@@ -5,6 +5,7 @@ import * as path from 'path';
 import { ConfigManager } from '../config/manager';
 import { DEFAULT_AGENT, DEFAULT_BACKEND, resolveAgentBackend, resolveAgentType } from '../core/agent';
 import { getRalphPaths, resolveRalphHome } from '../core/paths';
+import { TaskExecutionMode } from '../types/task';
 
 interface InitCommandOptions {
   repo?: string;
@@ -12,6 +13,7 @@ interface InitCommandOptions {
   agent?: string;
   backend?: string;
   maxConcurrent?: string;
+  executionMode?: string;
   registerMenubar?: boolean;
   menubarConfig?: string;
 }
@@ -62,6 +64,18 @@ function parsePositiveInteger(value: string | undefined, label: string): number 
     throw new Error(`${label} must be a positive integer`);
   }
   return numericValue;
+}
+
+function parseExecutionMode(value: string | undefined): TaskExecutionMode | undefined {
+  if (value === undefined) {
+    return undefined;
+  }
+
+  if (value === 'worktree' || value === 'direct') {
+    return value;
+  }
+
+  throw new Error('--execution-mode must be either "worktree" or "direct"');
 }
 
 function resolveMenuBarConfigPath(configPath?: string): string {
@@ -201,6 +215,7 @@ export async function initCommand(options: InitCommandOptions = {}): Promise<voi
     const agent = resolveAgentType(options.agent || DEFAULT_AGENT);
     const backend = resolveAgentBackend(options.backend || DEFAULT_BACKEND);
     const maxConcurrent = parsePositiveInteger(options.maxConcurrent, '--max-concurrent');
+    const executionMode = parseExecutionMode(options.executionMode);
 
     fs.mkdirSync(paths.tasksDir, { recursive: true });
     fs.mkdirSync(paths.managerDir, { recursive: true });
@@ -215,6 +230,9 @@ export async function initCommand(options: InitCommandOptions = {}): Promise<voi
     configManager.set('agent.backend', backend);
     if (maxConcurrent !== undefined) {
       configManager.set('runner.maxConcurrent', maxConcurrent);
+    }
+    if (executionMode !== undefined) {
+      configManager.set('runner.executionMode', executionMode);
     }
 
     const shouldRegisterMenuBar = options.registerMenubar !== false;
@@ -237,6 +255,7 @@ export async function initCommand(options: InitCommandOptions = {}): Promise<voi
       configPath: paths.configPath,
       agent,
       backend,
+      executionMode: executionMode ?? configManager.get('runner.executionMode'),
       maxConcurrent: maxConcurrent ?? configManager.get('runner.maxConcurrent'),
       menubarRegistered: shouldRegisterMenuBar,
       menubarConfigPath,

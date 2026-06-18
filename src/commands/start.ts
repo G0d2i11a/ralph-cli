@@ -24,6 +24,7 @@ export async function startCommand(
         status: latestTask.status,
         existing: true,
         worktree: latestTask.worktree,
+        executionMode: latestTask.executionMode || 'worktree',
         logPath: latestTask.logPath,
         backend: latestTask.backend,
         message: 'An active task for this PRD already exists; pass --allow-duplicate to enqueue another one',
@@ -36,6 +37,7 @@ export async function startCommand(
         taskId,
         status: 'started',
         worktree: latestTask.worktree,
+        executionMode: latestTask.executionMode || 'worktree',
         logPath: latestTask.logPath,
         backend: latestTask.backend,
         sessionId: latestTask.sessionId,
@@ -72,6 +74,7 @@ export async function startCommand(
       recoveringBlockers: pendingState.recoveringBlockers,
       coordinationReason: pendingState.coordinationReason,
       integrationLane: pendingState.integrationLane,
+      executionMode: latestTask.executionMode || 'worktree',
       concurrencyLimit: pendingState.maxConcurrent,
       message: pendingState.reason === 'dependencies'
         ? pendingState.failedDependencies?.length

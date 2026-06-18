@@ -157,6 +157,58 @@ test('finalizeTaskOutput runs available quality gates before commit', { concurre
   }
 });
 
+test('finalizeTaskOutput accepts direct execution tasks in the repo checkout', { concurrency: false }, () => {
+  const repoDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-finalizer-direct-'));
+  const prdPath = path.join(repoDir, 'prd.json');
+
+  try {
+    git(['init'], repoDir);
+    git(['checkout', '-b', 'main'], repoDir);
+    git(['config', 'user.name', 'Ralph Test'], repoDir);
+    git(['config', 'user.email', 'ralph@example.com'], repoDir);
+
+    fs.writeFileSync(prdPath, JSON.stringify({
+      id: 'prd-direct',
+      title: 'Direct Queue Task',
+      description: 'Finalize direct task',
+      userStories: [],
+      dependencies: [],
+    }, null, 2));
+    fs.writeFileSync(path.join(repoDir, 'feature.txt'), 'base\n');
+    git(['add', '.'], repoDir);
+    git(['commit', '-m', 'feat: initial'], repoDir);
+    const baseCommitSha = git(['rev-parse', 'HEAD'], repoDir);
+
+    fs.writeFileSync(path.join(repoDir, 'feature.txt'), 'base\nchange\n');
+
+    const result = finalizeTaskOutput({
+      id: 'direct-finalize-task',
+      prdPath,
+      status: 'finalizing',
+      startTime: 1,
+      completedUS: [],
+      worktree: repoDir,
+      executionMode: 'direct',
+      logPath: path.join(repoDir, 'agent.log'),
+      agent: 'codex',
+      repoPath: repoDir,
+      baseCommitSha,
+      loopCount: 0,
+      consecutiveNoProgress: 0,
+      consecutiveErrors: 0,
+      lastProgressTime: 1,
+      lastFilesChanged: 0,
+    });
+
+    assert.equal(result.success, true);
+    assert.equal(result.committed, true);
+    assert.notEqual(git(['rev-parse', 'HEAD'], repoDir), baseCommitSha);
+    assert.equal(git(['status', '--porcelain'], repoDir), '');
+  } finally {
+    fs.rmSync(repoDir, { recursive: true, force: true });
+  }
+});
+
 test('finalizeTaskOutput accepts Ralph task worktrees under a repo that is itself a git worktree', { concurrency: false }, () => {
   const repoDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-finalizer-linked-root-'));
   const linkedRepoDir = path.join(os.tmpdir(), `ralph-finalizer-linked-repo-${process.pid}-${Date.now()}`);

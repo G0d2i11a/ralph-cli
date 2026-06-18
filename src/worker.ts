@@ -242,6 +242,7 @@ async function runWorker(taskId: string) {
               threadId: task.threadId,
               threadStoryId: task.threadStoryId,
               storyId: us.id,
+              executionMode: task.executionMode || 'worktree',
             },
             prd,
           ).finally(() => heartbeat.stop());

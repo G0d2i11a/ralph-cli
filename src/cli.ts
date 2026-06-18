@@ -64,6 +64,7 @@ program
   .option('--agent <name>', 'Default agent path/name to store in config (claude|codex)', DEFAULT_AGENT)
   .option('--backend <name>', `Default backend to store in config (cli|agent-runners, default: ${DEFAULT_BACKEND})`)
   .option('--max-concurrent <count>', 'Runner concurrency for this Ralph home')
+  .option('--execution-mode <mode>', 'Runner execution mode: worktree or direct')
   .option('--menubar-config <path>', 'Ralph Menu Bar config path')
   .option('--no-register-menubar', 'Initialize the Ralph home without adding it to Ralph Menu Bar')
   .addHelpText('after', `

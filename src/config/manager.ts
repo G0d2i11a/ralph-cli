@@ -4,6 +4,7 @@ import { getRalphPaths, RalphHomeOptions } from '../core/paths';
 
 export type RalphMergeStrategy = 'manual' | 'ours' | 'theirs';
 export type DirtyWorktreeReclamationMode = 'retain' | 'archive_only' | 'archive_then_reclaim';
+export type RunnerExecutionMode = 'worktree' | 'direct';
 
 export interface RalphConfig {
   agent: {
@@ -18,6 +19,7 @@ export interface RalphConfig {
     codexConversationScope: 'attempt' | 'story' | 'task';
   };
   runner: {
+    executionMode: RunnerExecutionMode;
     maxConcurrent: number;
     stagnationTimeout: number;
     pollInterval: number;
@@ -217,6 +219,7 @@ const DEFAULT_CONFIG: RalphConfig = {
     codexConversationScope: 'story',
   },
   runner: {
+    executionMode: 'worktree',
     maxConcurrent: 3,
     stagnationTimeout: 0,
     pollInterval: 10,

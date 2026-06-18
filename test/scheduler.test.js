@@ -458,6 +458,89 @@ test('schedulePendingTasks respects maxConcurrent and starts oldest queued task 
   assert.equal(queuedTask.status, 'pending');
 });
 
+test('schedulePendingTasks direct execution uses repo checkout without creating a worktree', async () => {
+  const repoDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-direct-repo-'));
+
+  try {
+    require('node:child_process').execFileSync('git', ['init'], { cwd: repoDir, stdio: 'ignore' });
+    require('node:child_process').execFileSync('git', ['config', 'user.name', 'Ralph Test'], { cwd: repoDir, stdio: 'ignore' });
+    require('node:child_process').execFileSync('git', ['config', 'user.email', 'ralph@example.com'], { cwd: repoDir, stdio: 'ignore' });
+    fs.writeFileSync(path.join(repoDir, 'README.md'), 'base\n');
+    require('node:child_process').execFileSync('git', ['add', '.'], { cwd: repoDir, stdio: 'ignore' });
+    require('node:child_process').execFileSync('git', ['commit', '-m', 'initial'], { cwd: repoDir, stdio: 'ignore' });
+    const head = require('node:child_process').execFileSync('git', ['rev-parse', 'HEAD'], {
+      cwd: repoDir,
+      encoding: 'utf-8',
+    }).trim();
+
+    const pendingTask = createTask({
+      id: 'direct-task',
+      repoPath: repoDir,
+      startTime: 100,
+    });
+    const { scheduler, stateManager, worktreeCalls } = createScheduler(
+      [pendingTask],
+      { '/direct-task.json': { id: 'direct-task', dependencies: [] } },
+      {
+        maxConcurrent: 3,
+        config: { 'runner.executionMode': 'direct' },
+      }
+    );
+
+    assert.equal(scheduler.getConcurrencyLimit(), 1);
+
+    const startedTasks = await scheduler.schedulePendingTasks();
+    const startedTask = await stateManager.loadTask('direct-task');
+
+    assert.equal(startedTasks.length, 1);
+    assert.equal(startedTask.status, 'running');
+    assert.equal(startedTask.worktree, repoDir);
+    assert.equal(startedTask.executionMode, 'direct');
+    assert.equal(startedTask.baseCommitSha, head);
+    assert.equal(worktreeCalls.length, 0);
+  } finally {
+    fs.rmSync(repoDir, { recursive: true, force: true });
+  }
+});
+
+test('schedulePendingTasks direct execution waits when repo checkout is dirty', async () => {
+  const repoDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-direct-dirty-repo-'));
+
+  try {
+    require('node:child_process').execFileSync('git', ['init'], { cwd: repoDir, stdio: 'ignore' });
+    require('node:child_process').execFileSync('git', ['config', 'user.name', 'Ralph Test'], { cwd: repoDir, stdio: 'ignore' });
+    require('node:child_process').execFileSync('git', ['config', 'user.email', 'ralph@example.com'], { cwd: repoDir, stdio: 'ignore' });
+    fs.writeFileSync(path.join(repoDir, 'README.md'), 'base\n');
+    require('node:child_process').execFileSync('git', ['add', '.'], { cwd: repoDir, stdio: 'ignore' });
+    require('node:child_process').execFileSync('git', ['commit', '-m', 'initial'], { cwd: repoDir, stdio: 'ignore' });
+    fs.writeFileSync(path.join(repoDir, 'dirty.txt'), 'dirty\n');
+
+    const pendingTask = createTask({
+      id: 'direct-dirty-task',
+      repoPath: repoDir,
+      startTime: 100,
+    });
+    const { scheduler, stateManager, worktreeCalls, forkCalls } = createScheduler(
+      [pendingTask],
+      { '/direct-dirty-task.json': { id: 'direct-dirty-task', dependencies: [] } },
+      {
+        config: { 'runner.executionMode': 'direct' },
+      }
+    );
+
+    const startedTasks = await scheduler.schedulePendingTasks();
+    const task = await stateManager.loadTask('direct-dirty-task');
+
+    assert.equal(startedTasks.length, 0);
+    assert.equal(task.status, 'pending');
+    assert.match(task.lastError, /requires a clean repository checkout/);
+    assert.equal(worktreeCalls.length, 0);
+    assert.equal(forkCalls.length, 0);
+  } finally {
+    fs.rmSync(repoDir, { recursive: true, force: true });
+  }
+});
+
 test('schedulePendingTasks recreates a recorded worktree path that is not a git worktree', async () => {
   const stalePending = createTask({
     id: 'stale-worktree-task',

@@ -13,6 +13,7 @@ import { Task, TaskStatus } from '../types/task';
 import { appendTaskEvent } from './events';
 import { getRalphPaths, RalphHomeOptions } from './paths';
 import { resolveEffectiveDependencyPrdIdFromPrd } from './dependency-identity';
+import { resolveRunnerExecutionMode } from './execution-mode';
 
 type TaskStateStore = Pick<StateManager, 'saveTask' | 'loadTask' | 'listTasks'> & Partial<Pick<StateManager, 'getTaskDirPath'>>;
 
@@ -224,6 +225,7 @@ export async function enqueueTaskFromPrd(
       updatedAt: enqueuedAt,
     })),
     worktree: '',
+    executionMode: resolveRunnerExecutionMode(configManager),
     logPath,
     eventLogPath,
     agent,

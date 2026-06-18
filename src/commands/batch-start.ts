@@ -23,6 +23,7 @@ export async function batchStartCommand(prdPaths: string[], options: BatchStartO
     success: boolean;
     taskId?: string;
     worktree?: string;
+    executionMode?: string;
     logPath?: string;
     status?: string;
     backend?: string;
@@ -47,6 +48,7 @@ export async function batchStartCommand(prdPaths: string[], options: BatchStartO
         success: true,
         taskId: queuedTask.taskId,
         worktree: queuedTask.latestTask.worktree,
+        executionMode: queuedTask.latestTask.executionMode || 'worktree',
         logPath: queuedTask.latestTask.logPath,
         status: queuedTask.latestTask.status,
         backend: queuedTask.latestTask.backend,

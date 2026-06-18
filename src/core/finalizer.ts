@@ -18,6 +18,7 @@ import {
   classifyQualityGateFailure,
   QualityGateFailure,
 } from './finalize-failure-classifier';
+import { isDirectExecutionTask } from './execution-mode';
 import { buildRalphToolchainEnv } from './toolchain-env';
 import { resolveWorkspacePackageDirs } from './workspaces';
 import { parsePRD } from '../utils/helpers';
@@ -238,6 +239,16 @@ function ensurePathInside(parent: string, candidate: string, label: string): voi
 function assertFinalizerScope(task: Task): void {
   const repoPath = resolveExistingPath(task.repoPath);
   const worktreePath = resolveExistingPath(task.worktree);
+
+  if (isDirectExecutionTask(task)) {
+    if (worktreePath !== repoPath) {
+      throw new Error(`Direct execution task worktree must be the repository checkout: ${worktreePath}`);
+    }
+
+    resolveGitCommonDir(repoPath);
+    return;
+  }
+
   const allowedWorktreeRoot = path.join(repoPath, '.ralph-worktrees');
   const allowedGitWorktreeRoot = path.join(resolveGitCommonDir(repoPath), 'worktrees');
 

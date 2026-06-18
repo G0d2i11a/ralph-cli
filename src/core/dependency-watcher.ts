@@ -29,6 +29,10 @@ import {
   buildMergeRepairProof,
   deriveMergeRepairDisplayStatus,
 } from './merge-task-updates';
+import {
+  buildDirectExecutionIntegrationUpdates,
+  isDirectExecutionTask,
+} from './execution-mode';
 import { resolveIntegrationSyncConflict } from './conflict-resolution';
 import {
   decideFinalizeRepairRequeue,
@@ -5259,7 +5263,9 @@ export class DependencyWatcher {
           finalizeResult = this.finalizer(taskToFinalize);
           finalizerCommittedAt = finalizeResult.committed ? Date.now() : undefined;
 
-          if (requiresPostFinalizeMergeProbe(taskToFinalize)) {
+          const directExecution = isDirectExecutionTask(taskToFinalize);
+
+          if (!directExecution && requiresPostFinalizeMergeProbe(taskToFinalize)) {
             const mergeProbeResult = await this.probeWorktreeMergeability(taskToFinalize, targetBranch, {
               pullLatest: integrationPolicy.pullLatest,
               integrationWorktreeDir: integrationPolicy.integrationWorktreeDir,
@@ -5285,6 +5291,15 @@ export class DependencyWatcher {
               );
             }
           }
+
+          const directIntegrationUpdates = directExecution
+            ? buildDirectExecutionIntegrationUpdates(
+                taskToFinalize,
+                targetBranch,
+                integrationPolicy.strategy,
+                finalizeResult.commitSha || taskToFinalize.baseCommitSha,
+              )
+            : {};
 
           await this.stateManager.updateTask(task.id, {
             status: 'completed',
@@ -5318,6 +5333,7 @@ export class DependencyWatcher {
             leaseExpiresAt: undefined,
             integrationLane,
             ...coordinationState.taskUpdates,
+            ...directIntegrationUpdates,
           });
           appendTaskEvent(taskToFinalize, {
             type: 'finalizer_completed',
@@ -5330,9 +5346,9 @@ export class DependencyWatcher {
             },
           });
 
-          let mergeSuffix = '';
+          let mergeSuffix = directExecution ? '; integrated in direct checkout' : '';
           try {
-            const mergeUpdates = await this.autoMergeTaskIfEnabled(taskToFinalize);
+            const mergeUpdates = directExecution ? {} : await this.autoMergeTaskIfEnabled(taskToFinalize);
             if (Object.keys(mergeUpdates).length > 0) {
               await this.stateManager.updateTask(task.id, mergeUpdates);
               mergeSuffix = mergeUpdates.mergedAt

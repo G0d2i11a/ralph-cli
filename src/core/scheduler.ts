@@ -29,6 +29,10 @@ import {
 } from './worktree-process-cleanup';
 import { comparePendingTaskScheduleOrder } from './scheduler-priority';
 import { buildDependencyRepairIdentityUpdates } from './dependency-identity';
+import {
+  resolveRunnerExecutionMode,
+  resolveTaskExecutionMode,
+} from './execution-mode';
 
 const DEFAULT_MAX_CONCURRENT = 3;
 const LOCK_RETRY_MS = 50;
@@ -93,6 +97,10 @@ export interface PendingTaskState {
 function resolveConcurrencyLimit(
   configManager: Pick<ConfigManager, 'get'> = new ConfigManager()
 ): number {
+  if (resolveRunnerExecutionMode(configManager) === 'direct') {
+    return 1;
+  }
+
   const rawValue = Number(
     configManager.get('runner.maxConcurrent') ?? configManager.get('maxConcurrentTasks')
   );
@@ -114,6 +122,21 @@ function resolveHeadCommit(worktreePath: string): string | undefined {
   } catch {
     return undefined;
   }
+}
+
+function readGitStatusPorcelain(repoPath: string): string {
+  return execFileSync('git', ['status', '--porcelain'], {
+    cwd: repoPath,
+    encoding: 'utf-8',
+    stdio: ['ignore', 'pipe', 'pipe'],
+  }).trim();
+}
+
+function formatGitStatusSummary(status: string): string {
+  const lines = status.split(/\r?\n/).filter(Boolean);
+  const preview = lines.slice(0, 5).join('; ');
+  const suffix = lines.length > 5 ? `; ... ${lines.length - 5} more` : '';
+  return preview + suffix;
 }
 
 function toTimeoutMs(value: unknown, fallbackMs: number): number {
@@ -210,6 +233,19 @@ export class TaskScheduler {
 
   async countRunningTasks(options: { reconcile?: boolean } = {}): Promise<number> {
     const shouldReconcile = options.reconcile !== false;
+    if (resolveRunnerExecutionMode(this.configManager) === 'direct') {
+      if (shouldReconcile) {
+        await this.reconcileRunningTasks();
+      }
+      const tasks = await this.stateManager.listTasks();
+      return tasks.filter((task) => (
+        task.status === 'running'
+        || task.status === 'ready_to_finalize'
+        || task.status === 'finalizing'
+        || task.status === 'failed_finalize'
+      )).length;
+    }
+
     const runningTasks = shouldReconcile
       ? await this.reconcileRunningTasks()
       : await this.stateManager.listTasks('running');
@@ -892,7 +928,66 @@ export class TaskScheduler {
     };
   }
 
+  private async recordDirectExecutionBlock(task: Task, message: string, data?: Record<string, unknown>): Promise<void> {
+    await this.stateManager.updateTask(task.id, {
+      lastError: message,
+      lastErrorKind: 'direct_execution_blocked',
+      lastErrorObservedAt: this.now(),
+    });
+    appendTaskEvent(task, {
+      type: 'direct_execution_blocked',
+      status: task.status,
+      message,
+      data,
+    });
+  }
+
+  private async getDirectExecutionStartBlocker(task: Task): Promise<string | undefined> {
+    const activeTasks = (await this.stateManager.listTasks()).filter((entry) => (
+      entry.id !== task.id
+      && (
+        entry.status === 'running'
+        || entry.status === 'ready_to_finalize'
+        || entry.status === 'finalizing'
+        || entry.status === 'failed_finalize'
+      )
+    ));
+    if (activeTasks.length > 0) {
+      return `Direct execution queue is occupied by ${activeTasks.map((entry) => entry.id).join(', ')}`;
+    }
+
+    const status = readGitStatusPorcelain(task.repoPath);
+    if (status) {
+      return `Direct execution requires a clean repository checkout before start; git status: ${formatGitStatusSummary(status)}`;
+    }
+
+    return undefined;
+  }
+
+  private async ensureDirectExecutionDirectory(task: Task): Promise<Task> {
+    const worktreePath = path.resolve(task.repoPath);
+    const updates: Partial<Task> = {
+      worktree: worktreePath,
+      executionMode: 'direct',
+    };
+    const headCommit = resolveHeadCommit(worktreePath);
+    if (headCommit) {
+      updates.baseCommitSha = headCommit;
+    }
+
+    await this.stateManager.updateTask(task.id, updates);
+    return {
+      ...task,
+      ...updates,
+    };
+  }
+
   private async ensureTaskWorktree(task: Task): Promise<Task> {
+    const executionMode = resolveTaskExecutionMode(task, this.configManager);
+    if (executionMode === 'direct') {
+      return this.ensureDirectExecutionDirectory(task);
+    }
+
     let currentTask = task;
     let shouldCreateWorktree = !currentTask.worktree;
     let inspection: WorktreeInspection | undefined;
@@ -926,10 +1021,14 @@ export class TaskScheduler {
       currentTask.id,
       currentTask.baseRef || currentTask.baseCommitSha
     );
-    await this.stateManager.updateTask(currentTask.id, { worktree: worktreePath });
+    await this.stateManager.updateTask(currentTask.id, {
+      worktree: worktreePath,
+      executionMode: 'worktree',
+    });
     currentTask = {
       ...currentTask,
       worktree: worktreePath,
+      executionMode: 'worktree',
     };
 
     return currentTask;
@@ -937,6 +1036,17 @@ export class TaskScheduler {
 
   private async startTask(task: Task): Promise<Task | null> {
     try {
+      const executionMode = resolveTaskExecutionMode(task, this.configManager);
+      if (executionMode === 'direct') {
+        const blocker = await this.getDirectExecutionStartBlocker(task);
+        if (blocker) {
+          await this.recordDirectExecutionBlock(task, blocker, {
+            repoPath: task.repoPath,
+          });
+          return null;
+        }
+      }
+
       let currentTask = await this.ensureTaskWorktree(task);
 
       if (!currentTask.baseCommitSha) {
@@ -1025,6 +1135,7 @@ export class TaskScheduler {
         data: {
           pid: child.pid,
           worktree: currentTask.worktree,
+          executionMode: currentTask.executionMode || 'worktree',
           baseRef: currentTask.baseRef,
           baseCommitSha: currentTask.baseCommitSha,
         },
