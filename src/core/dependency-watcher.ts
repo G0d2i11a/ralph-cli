@@ -138,6 +138,7 @@ interface DependencyWatcherDeps {
 interface DependencyWatcherLifecycleHooks {
   onStarted?: () => void | Promise<void>;
   onLoopStarted?: () => void | Promise<void>;
+  onLoopStep?: (step: string) => void | Promise<void>;
   onLoopCompleted?: () => void | Promise<void>;
   onLoopError?: (error: unknown) => void | Promise<void>;
   onStopped?: () => void | Promise<void>;
@@ -1351,33 +1352,61 @@ export class DependencyWatcher {
         if (this.isSchedulingPaused()) {
           await this.invokeLifecycleHook('onLoopCompleted');
         } else {
+          await this.invokeLoopStepHook('initialize_auto_ingestor');
           await this.initializeAutoIngestorIfNeeded();
+          await this.invokeLoopStepHook('auto_ingest_scan');
           await this.autoIngestor?.scan();
+          await this.invokeLoopStepHook('recover_stale_tasks');
           await this.scheduler.recoverStaleTasks();
+          await this.invokeLoopStepHook('audit_story_completion_invariants');
           await this.auditStoryCompletionInvariants();
+          await this.invokeLoopStepHook('recover_soft_failed_tasks');
           await this.recoverSoftFailedTasks();
+          await this.invokeLoopStepHook('recover_failed_worker_merge_repair_tasks');
           await this.recoverFailedWorkerMergeRepairTasks();
+          await this.invokeLoopStepHook('recover_failed_agent_context_tasks');
           await this.recoverFailedAgentContextTasks();
+          await this.invokeLoopStepHook('recover_failed_transient_tasks');
           await this.recoverFailedTransientTasks();
+          await this.invokeLoopStepHook('recover_stagnant_tasks');
           await this.recoverStagnantTasks();
+          await this.invokeLoopStepHook('classify_baseline_quality_gate_failures');
           await this.classifyBaselineQualityGateFailures();
+          await this.invokeLoopStepHook('coalesce_baseline_repair_graph');
           await this.coalesceBaselineRepairGraph();
+          await this.invokeLoopStepHook('recover_baseline_blocked_finalize_tasks');
           await this.recoverBaselineBlockedFinalizeTasks();
+          await this.invokeLoopStepHook('normalize_integrated_product_tasks');
           await this.normalizeIntegratedProductTasks();
+          await this.invokeLoopStepHook('recover_blocked_autonomy_tasks');
           await this.recoverBlockedAutonomyTasks();
+          await this.invokeLoopStepHook('recover_stopped_transient_tasks');
           await this.recoverStoppedTransientTasks();
+          await this.invokeLoopStepHook('recover_stopped_agent_context_tasks');
           await this.recoverStoppedAgentContextTasks();
+          await this.invokeLoopStepHook('recover_stopped_story_repair_tasks');
           await this.recoverStoppedStoryRepairTasks();
+          await this.invokeLoopStepHook('recover_stopped_finalize_repair_tasks');
           await this.recoverStoppedFinalizeRepairTasks();
+          await this.invokeLoopStepHook('recover_stopped_generic_recovery_tasks');
           await this.recoverStoppedGenericRecoveryTasks();
+          await this.invokeLoopStepHook('recover_failed_finalize_tasks');
           await this.recoverFailedFinalizeTasks();
+          await this.invokeLoopStepHook('recover_completed_conflict_tasks');
           await this.recoverCompletedConflictTasks();
+          await this.invokeLoopStepHook('integrate_completed_tasks');
           await this.integrateCompletedTasks();
+          await this.invokeLoopStepHook('finalize_ready_tasks');
           await this.finalizeReadyTasks();
+          await this.invokeLoopStepHook('reconcile_deferred_target_syncs');
           await this.reconcileDeferredTargetSyncs();
+          await this.invokeLoopStepHook('recover_failed_story_repair_tasks');
           await this.recoverFailedStoryRepairTasks();
+          await this.invokeLoopStepHook('recover_failed_blockers');
           await this.recoverFailedBlockers();
+          await this.invokeLoopStepHook('check_pending_tasks');
           await this.checkPendingTasks();
+          await this.invokeLoopStepHook('maybe_run_reclamation');
           await this.maybeRunReclamation();
           await this.invokeLifecycleHook('onLoopCompleted');
         }
@@ -1694,7 +1723,7 @@ export class DependencyWatcher {
   }
 
   private async invokeLifecycleHook(
-    hookName: Exclude<keyof DependencyWatcherLifecycleHooks, 'onLoopError'>
+    hookName: Exclude<keyof DependencyWatcherLifecycleHooks, 'onLoopError' | 'onLoopStep'>
   ): Promise<void> {
     const hook = this.lifecycle?.[hookName];
 
@@ -1706,6 +1735,18 @@ export class DependencyWatcher {
       await hook();
     } catch (error) {
       this.logger.error(`Dependency watcher lifecycle hook ${hookName} failed:`, error);
+    }
+  }
+
+  private async invokeLoopStepHook(step: string): Promise<void> {
+    if (!this.lifecycle?.onLoopStep) {
+      return;
+    }
+
+    try {
+      await this.lifecycle.onLoopStep(step);
+    } catch (error) {
+      this.logger.error(`Dependency watcher lifecycle hook onLoopStep(${step}) failed:`, error);
     }
   }
 

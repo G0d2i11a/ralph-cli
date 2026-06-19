@@ -14,6 +14,10 @@ export interface ManagerRuntimeState {
   lastHeartbeatAt: number;
   lastLoopStartedAt?: number;
   lastLoopCompletedAt?: number;
+  lastLoopStep?: string;
+  lastLoopStepAt?: number;
+  startupPhase?: string;
+  startupPhaseAt?: number;
   lastError?: string;
   stoppedAt?: number;
   pollIntervalMs: number;
@@ -78,6 +82,11 @@ export function getManagerStatePath(options: ManagerStatePaths = {}): string {
 }
 
 export function getManagerLockDir(options: ManagerStatePaths = {}): string {
+  const override = process.env.RALPH_MANAGER_LOCK_DIR?.trim();
+  if (override) {
+    return path.resolve(override);
+  }
+
   return getRalphPaths(options).managerLockDir;
 }
 
