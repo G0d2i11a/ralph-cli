@@ -36,7 +36,30 @@ export interface PRDReferenceImplementation {
   completeFiles?: Record<string, string>;
 }
 
+export interface PRDOperatorGate {
+  [key: string]: unknown;
+  status?: string;
+}
+
+export interface PRDOperatorGates {
+  [key: string]: unknown;
+  preEnqueueGate?: PRDOperatorGate;
+  postApplyPreRunGate?: PRDOperatorGate;
+}
+
+export interface PRDExecutionPhase {
+  [key: string]: unknown;
+  successStatus?: string;
+}
+
+export interface PRDExecutionPhases {
+  [key: string]: unknown;
+  requiresTwoPhaseApplyRunHold?: boolean;
+  phase1ApplyAndSeal?: PRDExecutionPhase;
+}
+
 export interface PRD {
+  [key: string]: unknown;
   id: string;
   title: string;
   description: string;
@@ -55,4 +78,12 @@ export interface PRD {
   releasesDependenciesFor?: string[];
   schedulerHints?: PRDSchedulerHints;
   referenceImplementation?: PRDReferenceImplementation;
+  operator?: PRDOperatorGates;
+  ralphExecutionPhases?: PRDExecutionPhases;
+  enqueueBlockedUntil?: string[];
+  runBlockedUntil?: string[];
+  requiredRalphGuarantees?: string[];
+  applyOnlyStatus?: string;
+  ccoReview?: Record<string, unknown>;
+  validationEvidence?: Record<string, unknown>;
 }

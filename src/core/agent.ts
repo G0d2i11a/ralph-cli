@@ -374,6 +374,14 @@ export class AgentRunner {
       safetyBoundaries: prd.safetyBoundaries,
       verificationCommands: prd.verificationCommands,
       referenceImplementation: prd.referenceImplementation,
+      operator: prd.operator,
+      ralphExecutionPhases: prd.ralphExecutionPhases,
+      enqueueBlockedUntil: prd.enqueueBlockedUntil,
+      runBlockedUntil: prd.runBlockedUntil,
+      requiredRalphGuarantees: prd.requiredRalphGuarantees,
+      applyOnlyStatus: prd.applyOnlyStatus,
+      ccoReview: prd.ccoReview,
+      validationEvidence: prd.validationEvidence,
     };
 
     return `

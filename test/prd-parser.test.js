@@ -82,3 +82,46 @@ test('parsePRD falls back to projectName for JSON PRDs without title', () => {
   assert.equal(prd.userStories.length, 1);
   assert.equal(prd.userStories[0].id, 'US-001');
 });
+
+test('parsePRD preserves execution gate metadata for Ralph safety checks', () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-prd-gates-'));
+  const prdPath = path.join(tempDir, 'gated-prd.json');
+
+  fs.writeFileSync(prdPath, JSON.stringify({
+    id: 'gated-prd',
+    title: 'Gated PRD',
+    description: 'Requires external approval before execution',
+    userStories: [
+      {
+        id: 'US-001',
+        title: 'Gated story',
+        description: 'Do gated work',
+        acceptanceCriteria: ['gate respected'],
+      },
+    ],
+    operator: {
+      postApplyPreRunGate: {
+        status: 'BLOCKED_PENDING_OPERATOR_MINT',
+      },
+    },
+    ralphExecutionPhases: {
+      requiresTwoPhaseApplyRunHold: true,
+      phase1ApplyAndSeal: {
+        successStatus: 'APPLY_SEALED',
+      },
+    },
+    enqueueBlockedUntil: ['Claude Code re-adjudication'],
+    runBlockedUntil: ['operator HMAC mint'],
+    requiredRalphGuarantees: ['do not run gated effect before verification'],
+    applyOnlyStatus: 'APPLY_SEALED',
+  }, null, 2));
+
+  const prd = parsePRD(prdPath);
+
+  assert.equal(prd.operator.postApplyPreRunGate.status, 'BLOCKED_PENDING_OPERATOR_MINT');
+  assert.equal(prd.ralphExecutionPhases.requiresTwoPhaseApplyRunHold, true);
+  assert.deepEqual(prd.enqueueBlockedUntil, ['Claude Code re-adjudication']);
+  assert.deepEqual(prd.runBlockedUntil, ['operator HMAC mint']);
+  assert.deepEqual(prd.requiredRalphGuarantees, ['do not run gated effect before verification']);
+  assert.equal(prd.applyOnlyStatus, 'APPLY_SEALED');
+});

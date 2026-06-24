@@ -119,6 +119,7 @@ function createParsePrd(prds) {
     }
 
     return {
+      ...prd,
       id: prd.id,
       title: prd.id,
       description: '',
@@ -273,6 +274,48 @@ test('schedulePendingTasks does not start workers while manager scheduling is pa
   } finally {
     fs.rmSync(ralphHome, { recursive: true, force: true });
   }
+});
+
+test('schedulePendingTasks blocks PRDs with unresolved execution gates', async () => {
+  const prdPath = '/execution-gated-prd.json';
+  const pendingTask = createTask({
+    id: 'execution-gated-task',
+    prdId: 'execution-gated-prd',
+    prdPath,
+    startTime: 100,
+  });
+
+  const { scheduler, stateManager, forkCalls } = createScheduler(
+    [pendingTask],
+    {
+      [prdPath]: {
+        id: 'execution-gated-prd',
+        dependencies: [],
+        enqueueBlockedUntil: ['Claude Code re-adjudication'],
+        operator: {
+          postApplyPreRunGate: {
+            status: 'BLOCKED_PENDING_OPERATOR_MINT',
+          },
+        },
+        ralphExecutionPhases: {
+          requiresTwoPhaseApplyRunHold: true,
+        },
+      },
+    },
+    { maxConcurrent: 1 },
+  );
+
+  const startedTasks = await scheduler.schedulePendingTasks();
+  const task = await stateManager.loadTask('execution-gated-task');
+  const pendingState = await scheduler.describePendingTask(task, { readOnly: true });
+
+  assert.deepEqual(startedTasks, []);
+  assert.deepEqual(forkCalls, []);
+  assert.equal(task.status, 'pending');
+  assert.equal(task.lastErrorKind, 'prd_execution_gate_blocked');
+  assert.equal(pendingState.reason, 'execution_gate');
+  assert.deepEqual(pendingState.blockers, ['Claude Code re-adjudication']);
+  assert.match(pendingState.nextAction, /Claude Code re-adjudication/);
 });
 
 test('schedulePendingTasks cleans worktree lock holders before worker fork', async () => {

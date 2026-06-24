@@ -1,7 +1,15 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import matter from 'gray-matter';
-import type { PRD, PRDReferenceImplementation, PRDRepairOf, PRDSchedulerHints, UserStory } from '../types/prd';
+import type {
+  PRD,
+  PRDExecutionPhases,
+  PRDOperatorGates,
+  PRDReferenceImplementation,
+  PRDRepairOf,
+  PRDSchedulerHints,
+  UserStory,
+} from '../types/prd';
 import type { Task } from '../types/task';
 import type { StateManager } from '../core/state';
 import { deriveTaskDeliveryStatus, resolveTaskIntegrationStatus } from '../core/task-delivery';
@@ -131,6 +139,7 @@ function normalizePrd(prd: Partial<PRD> & Record<string, unknown>, fallbackId: s
     : [];
 
   return {
+    ...prd,
     id: normalizeString(prd.id, fallbackId),
     title: resolvePrdTitle(prd, fallbackId),
     description: normalizeString(prd.description),
@@ -149,6 +158,14 @@ function normalizePrd(prd: Partial<PRD> & Record<string, unknown>, fallbackId: s
     releasesDependenciesFor: normalizeOptionalStringArray(prd.releasesDependenciesFor),
     schedulerHints: normalizeSchedulerHints(prd.schedulerHints),
     referenceImplementation: normalizeOptionalRecord<PRDReferenceImplementation>(prd.referenceImplementation),
+    operator: normalizeOptionalRecord<PRDOperatorGates>(prd.operator),
+    ralphExecutionPhases: normalizeOptionalRecord<PRDExecutionPhases>(prd.ralphExecutionPhases),
+    enqueueBlockedUntil: normalizeOptionalStringArray(prd.enqueueBlockedUntil),
+    runBlockedUntil: normalizeOptionalStringArray(prd.runBlockedUntil),
+    requiredRalphGuarantees: normalizeOptionalStringArray(prd.requiredRalphGuarantees),
+    applyOnlyStatus: normalizeString(prd.applyOnlyStatus) || undefined,
+    ccoReview: normalizeOptionalRecord<Record<string, unknown>>(prd.ccoReview),
+    validationEvidence: normalizeOptionalRecord<Record<string, unknown>>(prd.validationEvidence),
   };
 }
 
@@ -214,6 +231,7 @@ export function parsePRDContent(content: string, prdPath: string = 'prd.json'): 
     : undefined;
 
   return normalizePrd({
+    ...frontmatter,
     id: frontmatter.id,
     title: frontmatter.title,
     description: frontmatter.description,

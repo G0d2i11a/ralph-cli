@@ -33,6 +33,7 @@ import {
   resolveRunnerExecutionMode,
   resolveTaskExecutionMode,
 } from './execution-mode';
+import { describePrdExecutionGateBlock, PRDExecutionGateBlock } from './prd-execution-gates';
 
 const DEFAULT_MAX_CONCURRENT = 3;
 const LOCK_RETRY_MS = 50;
@@ -78,7 +79,7 @@ export interface SchedulerDeps extends RalphHomeOptions {
 }
 
 export interface PendingTaskState {
-  reason: 'dependencies' | 'coordination' | 'queued';
+  reason: 'dependencies' | 'coordination' | 'execution_gate' | 'queued';
   dependencies: string[];
   dependencyBlockers?: DependencyBlocker[];
   failedDependencies?: string[];
@@ -90,6 +91,11 @@ export interface PendingTaskState {
   recoveringBlockers?: string[];
   coordinationReason?: string;
   integrationLane?: string;
+  gate?: PRDExecutionGateBlock;
+  gateReason?: PRDExecutionGateBlock['reason'];
+  gateStatus?: string;
+  gateDetail?: string;
+  nextAction?: string;
   maxConcurrent: number;
   running: number;
 }
@@ -697,6 +703,22 @@ export class TaskScheduler {
     const maxConcurrent = this.getConcurrencyLimit();
     const running = await this.countRunningTasks({ reconcile: !options.readOnly });
     const prd = this.getDependencyPRD(task);
+    const executionGate = describePrdExecutionGateBlock(prd);
+    if (executionGate) {
+      return {
+        reason: 'execution_gate',
+        dependencies: [],
+        blockers: executionGate.blockers,
+        gate: executionGate,
+        gateReason: executionGate.reason,
+        gateStatus: executionGate.status,
+        gateDetail: executionGate.detail,
+        nextAction: executionGate.nextAction,
+        maxConcurrent,
+        running,
+      };
+    }
+
     const dependencyState = await this.checkDependenciesFn(prd, this.stateManager, {
       repoPath: task.repoPath,
       task,
@@ -840,6 +862,33 @@ export class TaskScheduler {
           }
 
           const prd = this.getDependencyPRD(task);
+          const executionGate = describePrdExecutionGateBlock(prd);
+          if (executionGate) {
+            if (
+              task.lastErrorKind !== 'prd_execution_gate_blocked'
+              || task.lastError !== executionGate.detail
+            ) {
+              await this.stateManager.updateTask(task.id, {
+                lastError: executionGate.detail,
+                lastErrorKind: 'prd_execution_gate_blocked',
+                lastErrorRetryable: false,
+                lastErrorObservedAt: this.now(),
+              });
+              appendTaskEvent(task, {
+                type: 'execution_gate_blocked',
+                status: task.status,
+                message: executionGate.detail,
+                data: {
+                  reason: executionGate.reason,
+                  status: executionGate.status,
+                  blockers: executionGate.blockers,
+                  nextAction: executionGate.nextAction,
+                },
+              });
+            }
+            continue;
+          }
+
           const dependencyState = await this.checkDependenciesFn(prd, this.stateManager, {
             repoPath: task.repoPath,
             task,

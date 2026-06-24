@@ -22,7 +22,7 @@ import { ManagerControlSnapshot, readManagerControl } from '../core/manager-cont
 import { detectDuplicateRepoManagers, DuplicateRepoManagerReport } from '../core/repo-manager-registry';
 
 interface PendingSummary {
-  reason: 'dependencies' | 'coordination' | 'queued';
+  reason: 'dependencies' | 'coordination' | 'execution_gate' | 'queued';
   dependencies: string[];
   dependencyBlockers?: unknown[];
   failedDependencies?: string[];
@@ -34,6 +34,17 @@ interface PendingSummary {
   recoveringBlockers?: string[];
   coordinationReason?: string;
   integrationLane?: string;
+  gate?: {
+    reason?: string;
+    blockers?: string[];
+    status?: string;
+    detail?: string;
+    nextAction?: string;
+  };
+  gateReason?: string;
+  gateStatus?: string;
+  gateDetail?: string;
+  nextAction?: string;
   maxConcurrent: number;
   running: number;
 }
@@ -108,6 +119,7 @@ export type QueueStateDetail =
   | 'policy_delivery_marker_reset_unsafe'
   | 'policy_duplicate_managers'
   | 'policy_out_of_scope_write'
+  | 'policy_execution_gate_blocked'
   | 'policy_unclassified_unsafe_failure'
   | 'diagnosing_failure'
   | 'diagnosing_baseline_probe'
@@ -138,7 +150,7 @@ export interface QueuePolicyState {
   reason: string;
   prohibitedAction: string;
   configKey?: string;
-  overridePath?: 'change_config' | 'change_prd' | 'manual_repair' | 'stop_duplicate_manager';
+  overridePath?: 'change_config' | 'change_prd' | 'manual_repair' | 'stop_duplicate_manager' | 'satisfy_prd_gate';
 }
 
 export interface QueueState {
@@ -692,6 +704,12 @@ function buildQueuePolicy(
       prohibitedAction: 'unclassified unsafe repair',
       overridePath: 'manual_repair',
     };
+  case 'policy_execution_gate_blocked':
+    return {
+      reason,
+      prohibitedAction: 'normal worker execution before declared PRD execution gate is satisfied',
+      overridePath: 'satisfy_prd_gate',
+    };
   default:
     return undefined;
   }
@@ -744,6 +762,10 @@ function queueStateFromBlockReason(input: {
   });
 
   switch (reason) {
+  case 'execution_gate_blocked':
+    return state('blocked_by_policy', 'policy_execution_gate_blocked', false, {
+      policy: buildQueuePolicy('policy_execution_gate_blocked', reason),
+    });
   case 'blocked_failed_dependency':
     return state('blocked', 'blocked_by_dependency', false);
   case 'blocked_failed_coordination':
@@ -855,6 +877,13 @@ export function deriveQueueState(
   }
 
   if (task.status === 'pending') {
+    if (pendingState?.reason === 'execution_gate') {
+      return state('blocked_by_policy', 'policy_execution_gate_blocked', false, {
+        reason: pendingState.gateReason ?? 'execution_gate_blocked',
+        policy: buildQueuePolicy('policy_execution_gate_blocked', pendingState.gateReason ?? 'execution_gate_blocked'),
+      });
+    }
+
     if (pendingState?.failedDependencies?.length) {
       return state('blocked', 'blocked_by_dependency', false, {
         reason: 'blocked_failed_dependency',
@@ -1292,6 +1321,12 @@ export function resolveNextAction(
   }
 
   if (task.status === 'pending') {
+    if (pendingState?.reason === 'execution_gate') {
+      return pendingState.nextAction
+        ?? pendingState.gate?.nextAction
+        ?? 'satisfy the declared PRD execution gate before this task can start';
+    }
+
     if (pendingState?.reason === 'dependencies') {
       if (pendingState.failedDependencies?.length) {
         return `blocked by failed dependencies: ${pendingState.failedDependencies.join(', ')}; retry or repair those PRDs before this can start`;

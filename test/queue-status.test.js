@@ -82,6 +82,29 @@ test('queue state labels integration sync conflicts as policy block', () => {
   assert.match(resolveNextAction(task), /integration branch sync conflict/);
 });
 
+test('queue state labels unresolved PRD execution gates as policy block', () => {
+  const task = createTask({
+    status: 'pending',
+  });
+  const pendingState = {
+    reason: 'execution_gate',
+    dependencies: [],
+    blockers: ['Claude Code re-adjudication'],
+    gateReason: 'enqueue_blocked_until',
+    nextAction: 'Resolve PRD enqueue gate: Claude Code re-adjudication',
+    maxConcurrent: 3,
+    running: 0,
+  };
+
+  const queueState = assertQueueState(task, 'blocked_by_policy', 'policy_execution_gate_blocked', pendingState);
+
+  assert.equal(queueState.reason, 'enqueue_blocked_until');
+  assert.deepEqual(queueState.blockers, ['Claude Code re-adjudication']);
+  assert.equal(queueState.policy.prohibitedAction, 'normal worker execution before declared PRD execution gate is satisfied');
+  assert.equal(isActionItem(queueState), true);
+  assert.match(resolveNextAction(task, pendingState), /Resolve PRD enqueue gate/);
+});
+
 test('queue state maps story incomplete failures to autonomous recovery', () => {
   const task = createTask({
     status: 'failed',
