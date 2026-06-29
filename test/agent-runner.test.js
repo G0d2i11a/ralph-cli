@@ -138,6 +138,10 @@ test('AgentRunner defaults Codex to the direct CLI backend', async () => {
     assert.equal(fs.existsSync(path.join(worktreePath, '.ralph-cache', 'prisma')), true);
     assert.ok(!captured.args.includes('--cwd'));
     assert.ok(!captured.args.includes('--log'));
+    assert.deepEqual(
+      captured.args.filter((arg, index) => arg === '-c' && captured.args[index + 1]?.match(/^(mcp_servers=\{\}|plugins=\{\}|notify=\[\])$/)),
+      ['-c', '-c', '-c'],
+    );
   } finally {
     childProcess.spawn = originalSpawn;
     process.env.HOME = previousHome;

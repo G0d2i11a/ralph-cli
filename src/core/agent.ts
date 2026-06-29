@@ -300,6 +300,14 @@ export function resolveCodexWritableDirs(worktreePath: string): string[] {
   return [commonGitDir];
 }
 
+function appendCodexNonInteractiveIsolationArgs(args: string[]): void {
+  // Ralph workers run non-interactively and do not need user MCP/app tools.
+  // Loading browser/computer-use MCP servers can block before Codex reaches the model.
+  args.push('-c', 'mcp_servers={}');
+  args.push('-c', 'plugins={}');
+  args.push('-c', 'notify=[]');
+}
+
 export function resolveCodexCliCommand(config: Pick<ConfigManager, 'get'>): string {
   const configuredPath = config.get('agent.path');
 
@@ -519,6 +527,7 @@ Codex subagents are available in this worker, but use them only when this Ralph 
         for (const writableDir of writableDirs) {
           args.push('--add-dir', writableDir);
         }
+        appendCodexNonInteractiveIsolationArgs(args);
       }
 
       const logDir = path.dirname(logPath);
