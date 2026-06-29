@@ -118,14 +118,15 @@ test('AgentRunner defaults Codex to the direct CLI backend', async () => {
     assert.ok(captured, 'spawn should be called');
     assert.equal(captured.command, 'codex');
     assert.equal(captured.args[0], 'exec');
-    assert.match(captured.args[1], /Codex smoke/);
-    assert.match(captured.args[1], /Ralph Worktree Boundary/);
-    assert.match(captured.args[1], /only editable project checkout/);
-    assert.match(captured.args[1], /Ralph Worker Subagent Boundary/);
-    assert.match(captured.args[1], /Codex subagents are available in this worker/);
-    assert.match(captured.args[1], /Do not spawn subagents merely because a host-level AGENTS\.md describes a coordinator role/);
-    assert.match(captured.args[1], /If you spawn a full-history fork, omit inherited agent type, model, and reasoning-effort fields/);
-    assert.equal(captured.args[2], '--full-auto');
+    const promptArg = captured.args.at(-1);
+    assert.match(promptArg, /Codex smoke/);
+    assert.match(promptArg, /Ralph Worktree Boundary/);
+    assert.match(promptArg, /only editable project checkout/);
+    assert.match(promptArg, /Ralph Worker Subagent Boundary/);
+    assert.match(promptArg, /Codex subagents are available in this worker/);
+    assert.match(promptArg, /Do not spawn subagents merely because a host-level AGENTS\.md describes a coordinator role/);
+    assert.match(promptArg, /If you spawn a full-history fork, omit inherited agent type, model, and reasoning-effort fields/);
+    assert.equal(captured.args[1], '--full-auto');
     assert.equal(captured.args.includes('--model'), false);
     const cdIndex = captured.args.indexOf('--cd');
     assert.notEqual(cdIndex, -1);
@@ -142,6 +143,7 @@ test('AgentRunner defaults Codex to the direct CLI backend', async () => {
       captured.args.filter((arg, index) => arg === '-c' && captured.args[index + 1]?.match(/^(mcp_servers=\{\}|plugins=\{\}|notify=\[\])$/)),
       ['-c', '-c', '-c'],
     );
+    assert.ok(captured.args.indexOf('-c') < captured.args.length - 1);
   } finally {
     childProcess.spawn = originalSpawn;
     process.env.HOME = previousHome;
@@ -206,12 +208,13 @@ test('AgentRunner includes PRD context and Oracle candidate bundle in Codex prom
 
     assert.equal(result.success, true);
     assert.ok(captured, 'spawn should be called');
-    assert.match(captured.args[1], /Full PRD Context/);
-    assert.match(captured.args[1], /prd-oracle-candidate/);
-    assert.match(captured.args[1], /packages\/control-plane\/src\/routes\/\*\*/);
-    assert.match(captured.args[1], /candidate_complete/);
-    assert.match(captured.args[1], /diff --git a\/packages\/control-plane\/src\/example\.ts/);
-    assert.match(captured.args[1], /Apply or adapt that candidate first/);
+    const promptArg = captured.args.at(-1);
+    assert.match(promptArg, /Full PRD Context/);
+    assert.match(promptArg, /prd-oracle-candidate/);
+    assert.match(promptArg, /packages\/control-plane\/src\/routes\/\*\*/);
+    assert.match(promptArg, /candidate_complete/);
+    assert.match(promptArg, /diff --git a\/packages\/control-plane\/src\/example\.ts/);
+    assert.match(promptArg, /Apply or adapt that candidate first/);
   } finally {
     childProcess.spawn = originalSpawn;
     process.env.HOME = previousHome;

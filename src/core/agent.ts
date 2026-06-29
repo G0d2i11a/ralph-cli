@@ -517,9 +517,9 @@ Codex subagents are available in this worker, but use them only when this Ralph 
         if (writableDirs.length > 0) {
           // Linked worktree merges write objects/index state outside the worktree root.
           // Keep the task sandbox bounded to the worktree plus explicit git metadata.
-          args = ['exec', guardedPrompt, '--sandbox', 'workspace-write', '--cd', worktreePath];
+          args = ['exec', '--sandbox', 'workspace-write', '--cd', worktreePath];
         } else {
-          args = ['exec', guardedPrompt, '--full-auto', '--cd', worktreePath];
+          args = ['exec', '--full-auto', '--cd', worktreePath];
         }
         if (model) {
           args.push('--model', model);
@@ -528,6 +528,7 @@ Codex subagents are available in this worker, but use them only when this Ralph 
           args.push('--add-dir', writableDir);
         }
         appendCodexNonInteractiveIsolationArgs(args);
+        args.push(guardedPrompt);
       }
 
       const logDir = path.dirname(logPath);
