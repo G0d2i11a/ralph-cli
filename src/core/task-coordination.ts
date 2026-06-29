@@ -2,6 +2,7 @@ import { execFileSync } from 'child_process';
 import * as fs from 'fs';
 import * as path from 'path';
 import { findInstallRoot } from './bootstrap';
+import { listExistingDeclaredWriteSurfaceFiles } from './declared-write-surface';
 import { filterGitInternalPaths } from './git-internal-paths';
 import { resolveWorkspacePackageDirs } from './workspaces';
 import { PRD } from '../types/prd';
@@ -555,7 +556,7 @@ function toIsoTimestamp(value?: number): string | undefined {
   return value ? new Date(value).toISOString() : undefined;
 }
 
-function getObservedPathSurface(task: Pick<Task, 'worktree' | 'repoPath' | 'baseCommitSha'>): {
+function getObservedPathSurface(task: Pick<Task, 'worktree' | 'repoPath' | 'baseCommitSha' | 'declaredWriteSurface'>): {
   observedWriteSurface?: string[];
   observedPackageSurface?: string[];
 } {
@@ -566,6 +567,7 @@ function getObservedPathSurface(task: Pick<Task, 'worktree' | 'repoPath' | 'base
   const changedFiles = normalizeSurfaceList([
     ...listTrackedDiffFiles(task.worktree, task.baseCommitSha),
     ...listUntrackedFiles(task.worktree),
+    ...listExistingDeclaredWriteSurfaceFiles(task.worktree, task.declaredWriteSurface),
   ]);
 
   if (!changedFiles || changedFiles.length === 0) {
@@ -664,7 +666,7 @@ export function extractDeclaredCoordination(prd: PRD): Pick<Task, 'declaredWrite
   };
 }
 
-export function captureObservedTaskSurface(task: Pick<Task, 'worktree' | 'repoPath' | 'baseCommitSha'>): Pick<Task, 'observedWriteSurface' | 'observedPackageSurface' | 'surfaceCapturedAt'> {
+export function captureObservedTaskSurface(task: Pick<Task, 'worktree' | 'repoPath' | 'baseCommitSha' | 'declaredWriteSurface'>): Pick<Task, 'observedWriteSurface' | 'observedPackageSurface' | 'surfaceCapturedAt'> {
   return {
     ...getObservedPathSurface(task),
     surfaceCapturedAt: Date.now(),
