@@ -611,6 +611,78 @@ test('finalizeTaskOutput excludes turbo cache artifacts from task commits', { co
   }
 });
 
+test('finalizeTaskOutput force-adds declared ignored write-surface artifacts', { concurrency: false }, () => {
+  const repoDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-finalizer-declared-ignored-'));
+  const prdPath = path.join(repoDir, 'prd.json');
+
+  try {
+    git(['init'], repoDir);
+    git(['checkout', '-b', 'main'], repoDir);
+    git(['config', 'user.name', 'Ralph Test'], repoDir);
+    git(['config', 'user.email', 'ralph@example.com'], repoDir);
+
+    fs.writeFileSync(path.join(repoDir, '.gitignore'), '.atta-runtime/*\nnode_modules\n');
+    fs.writeFileSync(prdPath, JSON.stringify({
+      id: 'prd-declared-ignored',
+      title: 'Declared Ignored Artifact Task',
+      description: 'Capture declared ignored artifacts',
+      userStories: [],
+      dependencies: [],
+      writeSurface: [
+        '.atta-runtime/prd283/evidence.json',
+        '.git-local/HEAD',
+        'node_modules/cache.txt',
+      ],
+    }, null, 2));
+    fs.writeFileSync(path.join(repoDir, 'feature.txt'), 'base\n');
+    git(['add', '.'], repoDir);
+    git(['commit', '-m', 'feat: initial'], repoDir);
+    const baseCommitSha = git(['rev-parse', 'HEAD'], repoDir);
+
+    const worktreePath = path.join(repoDir, '.ralph-worktrees', 'task-declared-ignored');
+    fs.mkdirSync(path.dirname(worktreePath), { recursive: true });
+    git(['worktree', 'add', '-b', 'ralph/task-declared-ignored', worktreePath, 'main'], repoDir);
+
+    fs.mkdirSync(path.join(worktreePath, '.atta-runtime', 'prd283'), { recursive: true });
+    fs.writeFileSync(path.join(worktreePath, '.atta-runtime', 'prd283', 'evidence.json'), '{"ok":true}\n');
+    fs.writeFileSync(path.join(worktreePath, '.atta-runtime', 'prd283', 'not-declared.json'), '{"ignored":true}\n');
+    fs.mkdirSync(path.join(worktreePath, 'node_modules'), { recursive: true });
+    fs.writeFileSync(path.join(worktreePath, 'node_modules', 'cache.txt'), 'cache\n');
+
+    const task = {
+      id: 'task-declared-ignored',
+      prdPath,
+      status: 'ready_to_finalize',
+      startTime: Date.now(),
+      completedUS: [],
+      worktree: worktreePath,
+      logPath: path.join(repoDir, '.ralph', 'tasks', 'task-declared-ignored', 'agent.log'),
+      agent: 'codex',
+      repoPath: repoDir,
+      baseCommitSha,
+      loopCount: 0,
+      consecutiveNoProgress: 0,
+      consecutiveErrors: 0,
+      lastProgressTime: Date.now(),
+      lastFilesChanged: 1,
+    };
+
+    const result = finalizeTaskOutput(task);
+
+    assert.equal(result.success, true);
+    assert.equal(result.committed, true);
+    assert.equal(git(['cat-file', '-p', 'HEAD:.atta-runtime/prd283/evidence.json'], worktreePath), '{"ok":true}');
+    assert.throws(
+      () => git(['cat-file', '-e', 'HEAD:.atta-runtime/prd283/not-declared.json'], worktreePath)
+    );
+    assert.throws(
+      () => git(['cat-file', '-e', 'HEAD:node_modules/cache.txt'], worktreePath)
+    );
+  } finally {
+    fs.rmSync(repoDir, { recursive: true, force: true });
+  }
+});
+
 test('finalizeTaskOutput enforces configured quality gate timeouts', { concurrency: false }, () => {
   const repoDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-finalizer-timeout-'));
   const prdPath = path.join(repoDir, 'prd.json');

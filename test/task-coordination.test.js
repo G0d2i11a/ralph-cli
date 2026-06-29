@@ -1182,3 +1182,42 @@ test('captureObservedTaskSurface excludes git-internal paths from the observed w
     fs.rmSync(repoDir, { recursive: true, force: true });
   }
 });
+
+test('captureObservedTaskSurface includes existing declared ignored artifacts', () => {
+  const repoDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-coordination-declared-ignored-'));
+
+  try {
+    git(repoDir, ['init', '-b', 'main']);
+    git(repoDir, ['config', 'user.name', 'Ralph Test']);
+    git(repoDir, ['config', 'user.email', 'ralph@example.com']);
+
+    fs.writeFileSync(path.join(repoDir, '.gitignore'), '.atta-runtime/*\nnode_modules\n');
+    fs.writeFileSync(path.join(repoDir, 'README.md'), 'base\n');
+    git(repoDir, ['add', '.']);
+    git(repoDir, ['commit', '-m', 'chore: base']);
+
+    const baseCommitSha = git(repoDir, ['rev-parse', 'HEAD']);
+    fs.mkdirSync(path.join(repoDir, '.atta-runtime', 'prd283'), { recursive: true });
+    fs.writeFileSync(path.join(repoDir, '.atta-runtime', 'prd283', 'evidence.json'), '{"ok":true}\n');
+    fs.writeFileSync(path.join(repoDir, '.atta-runtime', 'prd283', 'not-declared.json'), '{"ignored":true}\n');
+    fs.mkdirSync(path.join(repoDir, '.git-local'), { recursive: true });
+    fs.writeFileSync(path.join(repoDir, '.git-local', 'HEAD'), 'metadata\n');
+    fs.mkdirSync(path.join(repoDir, 'node_modules'), { recursive: true });
+    fs.writeFileSync(path.join(repoDir, 'node_modules', 'cache.txt'), 'cache\n');
+
+    const observed = captureObservedTaskSurface({
+      worktree: repoDir,
+      repoPath: repoDir,
+      baseCommitSha,
+      declaredWriteSurface: [
+        '.atta-runtime/prd283/evidence.json',
+        '.git-local/HEAD',
+        'node_modules/cache.txt',
+      ],
+    });
+
+    assert.deepEqual(observed.observedWriteSurface, ['.atta-runtime/prd283/evidence.json']);
+  } finally {
+    fs.rmSync(repoDir, { recursive: true, force: true });
+  }
+});

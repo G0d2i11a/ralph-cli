@@ -5,6 +5,7 @@ import * as path from 'path';
 import { ConfigManager } from '../config/manager';
 import { Task } from '../types/task';
 import { bootstrapWorktreeDeps, detectPackageManager, findInstallRoot } from './bootstrap';
+import { listExistingDeclaredWriteSurfaceFiles } from './declared-write-surface';
 import {
   buildGitInternalExcludePathspecs,
   filterGitInternalPaths,
@@ -278,11 +279,12 @@ function buildCommitMessage(task: Task): string {
   return `feat(ralph): complete ${task.id}`;
 }
 
-function runGit(worktreePath: string, args: string[]): string {
+function runGit(worktreePath: string, args: string[], input?: string): string {
   return execFileSync('git', args, {
     cwd: worktreePath,
     encoding: 'utf-8',
-    stdio: ['ignore', 'pipe', 'pipe'],
+    input,
+    stdio: input === undefined ? ['ignore', 'pipe', 'pipe'] : ['pipe', 'pipe', 'pipe'],
   }).trim();
 }
 
@@ -390,7 +392,7 @@ function hasResolvedLocalMerge(worktreePath: string, env: NodeJS.ProcessEnv): bo
   return listUnmergedFiles(worktreePath, env).length === 0;
 }
 
-function listChangedFiles(worktreePath: string, baseCommitSha?: string): string[] {
+function listRegularChangedFiles(worktreePath: string, baseCommitSha?: string): string[] {
   const diffFiles = tryRunGit(
     worktreePath,
     baseCommitSha?.trim()
@@ -404,6 +406,31 @@ function listChangedFiles(worktreePath: string, baseCommitSha?: string): string[
   ];
 
   return filterFinalizerOperationalPaths(changedPaths);
+}
+
+function resolveDeclaredWriteSurface(task: Task): string[] {
+  if (Array.isArray(task.declaredWriteSurface) && task.declaredWriteSurface.length > 0) {
+    return task.declaredWriteSurface;
+  }
+
+  try {
+    return parsePRD(task.prdPath).writeSurface || [];
+  } catch {
+    return [];
+  }
+}
+
+function listDeclaredChangedFiles(task: Task, worktreePath: string): string[] {
+  return filterFinalizerOperationalPaths(
+    listExistingDeclaredWriteSurfaceFiles(worktreePath, resolveDeclaredWriteSurface(task)),
+  );
+}
+
+function listChangedFiles(task: Task, worktreePath: string, baseCommitSha?: string): string[] {
+  return [...new Set([
+    ...listRegularChangedFiles(worktreePath, baseCommitSha),
+    ...listDeclaredChangedFiles(task, worktreePath),
+  ])];
 }
 
 function listDiffFilesRaw(worktreePath: string, fromRef: string, toRef: string): string[] {
@@ -428,6 +455,21 @@ function listStagedFiles(worktreePath: string): string[] {
   return filterFinalizerOperationalPaths((stagedOutput || '').split('\0').filter(Boolean));
 }
 
+function forceAddDeclaredChangedFiles(task: Task, worktreePath: string, env?: NodeJS.ProcessEnv): void {
+  const declaredFiles = listDeclaredChangedFiles(task, worktreePath);
+  if (declaredFiles.length === 0) {
+    return;
+  }
+
+  const args = ['add', '-f', '--pathspec-from-file=-', '--pathspec-file-nul'];
+  const input = declaredFiles.join('\0');
+  if (env) {
+    runGitWithEnv(worktreePath, args, env, input);
+  } else {
+    runGit(worktreePath, args, input);
+  }
+}
+
 interface QualityGateTarget {
   cwd: string;
   label: string;
@@ -444,7 +486,7 @@ function resolveQualityGateTargets(
     return [{ cwd: installRoot, label: path.basename(installRoot), manifest }];
   }
 
-  const changedFiles = listChangedFiles(task.worktree, task.baseCommitSha);
+  const changedFiles = listChangedFiles(task, task.worktree, task.baseCommitSha);
   const targets = new Map<string, QualityGateTarget>();
   let hasRootScopedChange = false;
 
@@ -949,7 +991,7 @@ function runQualityGates(task: Task, timeoutMs: number, configuredScripts: Quali
     return [];
   }
 
-  const changedFiles = listChangedFiles(task.worktree, task.baseCommitSha);
+  const changedFiles = listChangedFiles(task, task.worktree, task.baseCommitSha);
   const packageManager = detectPackageManager(task.worktree, task.repoPath) ?? 'npm';
   const targets = resolveQualityGateTargets(task, installRoot, manifest);
   const executedScripts: string[] = [];
@@ -1209,7 +1251,7 @@ export function finalizeTaskOutput(task: Task): FinalizeResult {
   const worktreePath = path.resolve(task.worktree);
   const localMergeEnv = resolveLocalMergeGitEnv(worktreePath);
   const existingCommitState = detectExistingTaskCommit(task, worktreePath);
-  const changedFilesBeforeFinalize = listChangedFiles(worktreePath);
+  const changedFilesBeforeFinalize = listChangedFiles(task, worktreePath);
 
   if (changedFilesBeforeFinalize.length === 0 && !existingCommitState.hasExistingCommit && !localMergeEnv) {
     return {
@@ -1237,6 +1279,7 @@ export function finalizeTaskOutput(task: Task): FinalizeResult {
           localChangedFiles.join('\0'),
         );
       }
+      forceAddDeclaredChangedFiles(task, worktreePath, localMergeEnv);
 
       const commitMessage = buildCommitMessage(task);
       runGitWithEnv(worktreePath, ['commit', '--no-verify', '--allow-empty', '-m', commitMessage], localMergeEnv);
@@ -1283,6 +1326,7 @@ export function finalizeTaskOutput(task: Task): FinalizeResult {
   }
 
   runGit(worktreePath, ['add', '-A', '--', '.', ...buildFinalizerExcludePathspecs()]);
+  forceAddDeclaredChangedFiles(task, worktreePath);
 
   const stagedFiles = listStagedFiles(worktreePath);
   if (stagedFiles.length === 0) {
