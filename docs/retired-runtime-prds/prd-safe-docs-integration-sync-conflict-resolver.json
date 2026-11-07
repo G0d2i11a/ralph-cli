@@ -1,0 +1,144 @@
+{
+  "id": "PRD-ralph-safe-docs-integration-sync-conflict-resolver",
+  "title": "Safe automatic repair for allowlisted docs/status integration sync conflicts",
+  "description": "Implement the Oracle Workflow result for Ralph CLI itself. Fix Ralph so low-risk integration sync conflicts in status documents such as docs/TODO.md and docs/PROJECT-STATUS.md do not permanently block the queue. Ralph must not weaken merge safety for code, config, schema, migrations, security-sensitive files, or lockfiles, and must not perform automatic ours/theirs winner selection. Instead, add a narrow deterministic docs resolver that preserves both sides' facts, records proof, exposes a manual repair-conflicts command, and lets manager auto-recovery try the resolver before stopping with merge_repair_integration_sync_conflict. Use the complete Oracle bundle at /Users/shawn/.ralph-prds/ralph-cli/oracle-conflict-resolver-full-bundle.md as candidate-only reference; Ralph must validate, adapt, test, and repair against the actual checkout.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Deterministically resolve allowlisted status-doc conflicts",
+      "description": "As a Ralph operator, I want integration-sync conflicts limited to docs/TODO.md and docs/PROJECT-STATUS.md to be repaired by a deterministic union/preservation resolver so low-risk status-doc drift does not block the whole queue.",
+      "acceptanceCriteria": [
+        "Resolver only runs when every conflict file is allowlisted and under configured size/count limits.",
+        "Resolver removes Git conflict markers and preserves facts from both sides of every conflict hunk.",
+        "Resolver refuses code/config/schema/migration/security/lockfile/binary conflicts and leaves the existing blocked_by_policy/manual path intact.",
+        "Resolver does not use git checkout --ours, git checkout --theirs, or equivalent whole-file winner selection.",
+        "Resolver includes deterministic handling for docs/TODO.md and docs/PROJECT-STATUS.md and can safely union TODO bullets, checkbox entries, table rows, headings, and status facts."
+      ]
+    },
+    {
+      "id": "US-002",
+      "title": "Expose repair-conflicts CLI command",
+      "description": "As an operator, I can run ralph repair-conflicts <task-id> --dry-run or --apply to inspect and safely apply deterministic docs conflict repair.",
+      "acceptanceCriteria": [
+        "A repair-conflicts command is wired into the CLI.",
+        "Command supports --dry-run, --apply, --json, and --allow-llm flags.",
+        "--dry-run reports eligibility, files, retained-fact counts, warnings, and candidate proof without writing files.",
+        "--apply writes the resolved files, stages them, commits the integration-sync merge when appropriate, records proof, and reports the exact mergeability probe result where available.",
+        "LLM mode remains optional and disabled or safely stubbed for this first slice; deterministic repair is sufficient."
+      ]
+    },
+    {
+      "id": "US-003",
+      "title": "Manager auto-recovery tries docs repair before policy stop",
+      "description": "As a queue user, I want the Ralph manager to attempt safe deterministic repair for eligible docs/status integration-sync conflicts before declaring a manual policy block.",
+      "acceptanceCriteria": [
+        "recoverFailedWorkerMergeRepairTasks or the equivalent manager recovery path calls the shared resolver when the exact probe fails in integration_sync.",
+        "Successful repair writes an integration_sync_conflict_auto_resolved event and TaskConflictRepairProof evidence.",
+        "If repair is ineligible, unsafe, or post-repair probe still cannot prove a clean state, manager keeps the existing stopped/manual policy path.",
+        "The manager does not duplicate large finalize/promotion logic unnecessarily; it may record repair and let the next manager loop reuse existing clean-probe recovery.",
+        "The current ez4ielts scenario with docs/TODO.md and docs/PROJECT-STATUS.md can be auto-repaired or manually repaired by command without dropping either side; after repair, retry/manager recovery can proceed and unblock the pending overlapping UI QA task."
+      ]
+    },
+    {
+      "id": "US-004",
+      "title": "Proof and queue messaging make the safety boundary explicit",
+      "description": "As a maintainer, I can tell from task state and queue output whether a conflict is auto-repairable docs drift or still a policy-blocked unsafe conflict.",
+      "acceptanceCriteria": [
+        "Task state can record conflict repair proof with strategy, resolver version, conflict files, before/after hashes, retained fact counts, dropped facts, warnings, commit SHA, and exact probe result when available.",
+        "Queue messaging for eligible integration-sync docs conflicts points operators to repair-conflicts --dry-run/--apply instead of only saying manual repair.",
+        "Queue policy still reports that automatic conflict winner selection is prohibited.",
+        "Repair context hints mention repair-conflicts only when all conflict files are allowlisted status docs."
+      ]
+    },
+    {
+      "id": "US-005",
+      "title": "Regression tests protect the conflict safety model",
+      "description": "As a Ralph maintainer, I want tests proving allowlisted docs can be repaired and unsafe conflicts still refuse.",
+      "acceptanceCriteria": [
+        "Tests cover TODO union/checkbox preservation.",
+        "Tests cover PROJECT-STATUS status fact preservation.",
+        "Tests cover repair-conflicts or core resolver apply path for allowlisted docs.",
+        "Tests cover refusal for non-doc/code conflicts.",
+        "Tests cover manager recovery attempting docs repair before stopping integration_sync conflicts.",
+        "npm run build and npm test pass or Ralph records specific pre-existing baseline failures separately from task-induced failures."
+      ]
+    }
+  ],
+  "acceptanceCriteria": [
+    "The full Oracle candidate implementation in /Users/shawn/.ralph-prds/ralph-cli/oracle-conflict-resolver-full-bundle.md is consulted and either applied or consciously adapted.",
+    "No automatic ours/theirs winner selection is introduced anywhere.",
+    "No secrets, local user state, or unrelated dirty working tree changes are committed by this task.",
+    "Given docs/TODO.md conflict where both sides add different TODO bullets, repair-conflicts --apply keeps both bullets, removes conflict markers, records evidence, and permits the exact mergeability probe to proceed.",
+    "Given docs/PROJECT-STATUS.md conflict where both sides add task status entries, resolver preserves both entries and produces stable output.",
+    "Given same TODO item with conflicting states, resolver preserves both facts or emits a conservative combined note; it must not silently discard either side.",
+    "Given any conflict outside the docs/status allowlist, including src/*.ts, lockfiles, migrations, schema, config, or security-sensitive files, resolver refuses and queue remains blocked_by_policy/manual_repair.",
+    "Every applied repair writes TaskConflictRepairProof or equivalent evidence with conflict files, strategy, before/after hashes, retained-fact counts, droppedFacts, warnings, commit SHA, and exact-probe result when available.",
+    "Manager auto-recovery attempts deterministic docs conflict repair before stopping with merge_repair_integration_sync_conflict.",
+    "The built CLI exposes repair-conflicts in help output."
+  ],
+  "writeSurface": [
+    "src/core/conflict-resolution.ts",
+    "src/commands/repair-conflicts.ts",
+    "src/types/task.ts",
+    "src/cli.ts",
+    "src/core/dependency-watcher.ts",
+    "src/commands/queue.ts",
+    "src/core/repair-context.ts",
+    "test/conflict-resolution.test.js",
+    "test/failed-recovery.test.js"
+  ],
+  "conflictDomains": [
+    "ralph-cli conflict resolution",
+    "ralph-cli manager auto-recovery",
+    "ralph-cli task state proof",
+    "ralph-cli operator commands",
+    "integration sync conflict policy",
+    "queue blocked_by_policy messaging"
+  ],
+  "integrationLane": "ralph-cli-control-plane",
+  "dependencies": [],
+  "externalDependencies": [
+    "Node.js and npm available for npm run build and npm test.",
+    "Git available in test fixtures and integration worktrees.",
+    "Current ralph-cli main working tree may contain unrelated dirty changes; Ralph must work in its own task worktree and must not revert those changes.",
+    "The global ralph binary may be built from /Users/shawn/Project/ralph-cli/dist/cli.js; after implementation Ralph should run npm run build before using the new command.",
+    "The ez4ielts blocked queue can be used as a manual scenario after the Ralph CLI build includes repair-conflicts."
+  ],
+  "referenceImplementation": {
+    "status": "candidate_only",
+    "kind": "complete_oracle_workflow_markdown_with_candidate_files_and_diffs",
+    "artifactPath": "/Users/shawn/.ralph-prds/ralph-cli/oracle-conflict-resolver-full-bundle.md",
+    "applyInstructions": "Read the complete Oracle Markdown bundle. Apply the candidate code only if compatible with the actual checkout; otherwise adapt it. The PRD acceptance criteria are authoritative. Preserve existing unrelated work and do not revert dirty main-worktree changes. If the Oracle patch references APIs that differ in the live repo, repair against the live repo with focused tests.",
+    "testCommands": [
+      "npm run build",
+      "npm test",
+      "node --test test/conflict-resolution.test.js",
+      "node --test test/failed-recovery.test.js --test-name-pattern='integration sync'",
+      "node --test test/queue-status.test.js --test-name-pattern='integration sync'",
+      "node dist/cli.js --help",
+      "node dist/cli.js repair-conflicts --help"
+    ],
+    "manualScenarioCommands": [
+      "export RALPH_HOME=/Users/shawn/.ralph-ez4ielts",
+      "cd /Users/shawn/Project/ralph-cli && npm run build",
+      "cd /Users/shawn/Project/ez4ielts",
+      "ralph repair-conflicts task-1778924163997-o2q8jdxkx --dry-run --json",
+      "ralph repair-conflicts task-1778924163997-o2q8jdxkx --apply --json",
+      "ralph retry task-1778924163997-o2q8jdxkx",
+      "ralph queue --compact"
+    ],
+    "assumptions": [
+      "The first implementation slice is deterministic and narrow; LLM fallback can be a safe stub.",
+      "docs/TODO.md and docs/PROJECT-STATUS.md are treated as status docs where union/preservation is safer than winner selection.",
+      "Ralph's existing clean-probe recovery path can complete the state transition after an auto-repair event if immediate promotion would require duplicating complex logic.",
+      "The candidate bundle was generated from a dirty live source snapshot and may need adaptation to the task worktree baseline."
+    ],
+    "knownRisks": [
+      "The ralph-cli repo currently has unrelated dirty changes in the main worktree; Ralph may need to adapt the Oracle candidate to HEAD rather than the dirty snapshot.",
+      "If existing tests or public APIs changed since the attached Oracle files, the candidate patches may need manual repair by Ralph.",
+      "Automatic docs union can preserve stale facts; this is acceptable only for the allowlisted status-doc first slice and should be explicit in proof warnings.",
+      "The new repair-conflicts command must be built before it can be used to unblock the existing ez4ielts queue.",
+      "If the ez4ielts integration worktree has been cleaned and no conflict markers remain, repair-conflicts must reconstruct or re-run the configured integration sync safely rather than guessing."
+    ]
+  }
+}
