@@ -1163,6 +1163,7 @@ export class DependencyWatcher {
   private readonly autoIngestEnabled: boolean;
   private readonly autoIngestExistingOnStartupEnabled: boolean;
   private nextReclamationAtMs: number;
+  private nextDiskPressureReclamationAtMs: number;
   private hasRunStartupReclamation = false;
   private isRunning = false;
 
@@ -1187,6 +1188,7 @@ export class DependencyWatcher {
     this.resolveIntegrationSyncConflictFn = deps.resolveIntegrationSyncConflict ?? resolveIntegrationSyncConflict;
     this.reclamationService = deps.reclamationService ?? new ReclamationService({ stateManager, configManager });
     this.nextReclamationAtMs = Date.now() + this.reclamationService.getStartupDelayMs();
+    this.nextDiskPressureReclamationAtMs = Date.now() + this.getDiskPressureCheckIntervalMs();
     this.scheduler = deps.scheduler ?? new TaskScheduler({ stateManager, managerOwnedScheduling: true });
     this.pollInterval = Number.isFinite(options.interval) && Number(options.interval) > 0
       ? Number(options.interval)
@@ -1304,6 +1306,14 @@ export class DependencyWatcher {
     }
 
     const now = Date.now();
+    if (now >= this.nextDiskPressureReclamationAtMs) {
+      this.nextDiskPressureReclamationAtMs = now + this.getDiskPressureCheckIntervalMs();
+      const reclaimed = await this.runReclamation('disk_pressure');
+      if (reclaimed) {
+        return;
+      }
+    }
+
     if (now < this.nextReclamationAtMs) {
       return;
     }
@@ -1314,13 +1324,24 @@ export class DependencyWatcher {
     this.nextReclamationAtMs = now + this.reclamationService.getIntervalMs();
     this.hasRunStartupReclamation = true;
 
+    await this.runReclamation(mode);
+  }
+
+  private getDiskPressureCheckIntervalMs(): number {
+    return getPositiveNumber(this.configManager.get('reclamation.diskPressure.checkIntervalSeconds'), 60) * 1000;
+  }
+
+  private async runReclamation(mode: ReclamationMode): Promise<boolean> {
     try {
       const report = await this.reclamationService.run({ mode });
-      if (report.removed > 0 || report.errors.length > 0) {
+      const diskPressureActive = report.diskPressure?.active === true;
+      if (report.removed > 0 || report.errors.length > 0 || diskPressureActive) {
         this.logger.log(`Reclamation ${mode} removed ${report.removed} worktree(s), skipped ${report.worktrees.skipped}, errors ${report.errors.length}`);
       }
+      return report.removed > 0 || diskPressureActive;
     } catch (error) {
       this.logger.error('Error running Ralph reclamation:', error);
+      return false;
     }
   }
 

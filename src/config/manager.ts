@@ -103,6 +103,8 @@ export interface RalphConfig {
       failedRetentionHours: number;
       failedFinalizeRetentionHours: number;
       stagnantRetentionHours: number;
+      stoppedCleanRetentionHours: number;
+      dirtyStoppedRetentionHours: number;
       targetSyncDeferredRetentionHours: number;
       orphanRetentionHours: number;
       cleanupOrphans: boolean;
@@ -288,6 +290,8 @@ const DEFAULT_CONFIG: RalphConfig = {
       failedRetentionHours: 168,
       failedFinalizeRetentionHours: 168,
       stagnantRetentionHours: 168,
+      stoppedCleanRetentionHours: 24,
+      dirtyStoppedRetentionHours: 336,
       targetSyncDeferredRetentionHours: 72,
       orphanRetentionHours: 24,
       cleanupOrphans: true,

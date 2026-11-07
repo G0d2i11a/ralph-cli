@@ -39,6 +39,22 @@ export interface ReclamationRunOptions {
   abandonRetryable?: boolean;
 }
 
+export interface DiskPressureSnapshot {
+  enabled: boolean;
+  active: boolean;
+  emergency: boolean;
+  checkedPaths: string[];
+  path?: string;
+  freeBytes?: number;
+  totalBytes?: number;
+  freePercent?: number;
+  minFreeBytes?: number;
+  minFreePercent?: number;
+  targetFreeBytes?: number;
+  emergencyFreeBytes?: number;
+  reason?: string;
+}
+
 export interface ReclamationSectionReport {
   scanned: number;
   candidates: number;
@@ -50,7 +66,7 @@ export interface ReclamationSectionReport {
 export interface ReclamationCandidateReport {
   kind: 'task_worktree' | 'orphan_worktree';
   taskId?: string;
-  status?: TaskStatus | 'orphan';
+  status?: ReclaimableTaskStatus | 'orphan';
   repoPath: string;
   worktree: string;
   existed: boolean;
@@ -67,6 +83,7 @@ export interface ReclamationCandidateReport {
   evidenceManifestPath?: string;
   evidenceComplete?: boolean;
   evidenceBytes?: number;
+  evidenceReused?: boolean;
   dirtySummary?: {
     changedFileCount?: number;
     untrackedFileCount?: number;
@@ -79,6 +96,8 @@ export interface ReclamationCandidateReport {
   safetyGates?: ReclamationSafetyGate[];
   registeredGitWorktree?: boolean;
   pathInsideRalphWorktrees?: boolean;
+  prunableCachePaths?: string[];
+  prunedCachePaths?: string[];
 }
 
 export interface ReclamationReport {
@@ -92,6 +111,7 @@ export interface ReclamationReport {
   removed: number;
   worktrees: ReclamationSectionReport;
   tempDirs: ReclamationSectionReport;
+  diskPressure?: DiskPressureSnapshot;
   candidates: ReclamationCandidateReport[];
   skipped: ReclamationCandidateReport[];
   errors: Array<{
@@ -109,13 +129,14 @@ interface ReclamationServiceDeps extends RalphHomeOptions {
   worktreeManager?: WorktreeManager;
   evidenceArchiver?: WorktreeEvidenceArchiver;
   now?: () => number;
+  diskPressureProvider?: (paths: string[]) => DiskPressureSnapshot;
 }
 
 interface WorktreeCandidate {
   kind: 'task_worktree' | 'orphan_worktree';
   task?: Task;
   taskId?: string;
-  status?: TaskStatus | 'orphan';
+  status?: ReclaimableTaskStatus | 'orphan';
   repoPath: string;
   worktree: string;
   finishedAt?: number;
@@ -129,11 +150,14 @@ interface WorktreeCandidate {
   evidence?: EvidenceArchiveResult;
 }
 
-const TERMINAL_STATUSES = new Set<TaskStatus>([
+type ReclaimableTaskStatus = TaskStatus | 'stopped';
+
+const TERMINAL_STATUSES = new Set<ReclaimableTaskStatus>([
   'completed',
   'failed',
   'failed_finalize',
   'stagnant',
+  'stopped',
 ]);
 
 const RETRY_ATTENTION_ERROR_CLASSES = new Set<TaskErrorClass>([
@@ -144,6 +168,16 @@ const RETRY_ATTENTION_ERROR_CLASSES = new Set<TaskErrorClass>([
   'orphaned_worker',
   'stagnation',
 ]);
+
+const DISK_PRESSURE_WORKTREE_CACHE_DIRS = [
+  'node_modules',
+  '.turbo',
+  'test-results',
+  'playwright-report',
+  path.join('apps', 'web', '.next', 'cache'),
+  path.join('apps', 'web', '.next', 'dev'),
+  path.join('apps', 'web', 'test-results'),
+];
 
 function getNumber(value: unknown, fallback: number): number {
   const numeric = Number(value);
@@ -186,6 +220,10 @@ function getTaskFinishedAt(task: Task): number {
   return task.endTime ?? task.updatedAt ?? task.startTime;
 }
 
+function getTaskStatus(task: Task): ReclaimableTaskStatus {
+  return task.status as ReclaimableTaskStatus;
+}
+
 function sortByFinishedAtDesc(a: WorktreeCandidate, b: WorktreeCandidate): number {
   return (b.finishedAt ?? 0) - (a.finishedAt ?? 0);
 }
@@ -202,6 +240,7 @@ export class ReclamationService {
   private readonly worktreeManager: WorktreeManager;
   private readonly evidenceArchiver: WorktreeEvidenceArchiver;
   private readonly now: () => number;
+  private readonly diskPressureProvider?: (paths: string[]) => DiskPressureSnapshot;
 
   constructor(deps: ReclamationServiceDeps = {}) {
     this.ralphHome = deps.stateManager?.getRalphHome?.() ?? resolveRalphHome(deps);
@@ -209,6 +248,7 @@ export class ReclamationService {
     this.configManager = deps.configManager ?? new ConfigManager({ ralphHome: this.ralphHome });
     this.worktreeManager = deps.worktreeManager ?? new WorktreeManager();
     this.now = deps.now ?? (() => Date.now());
+    this.diskPressureProvider = deps.diskPressureProvider;
     this.evidenceArchiver = deps.evidenceArchiver ?? new WorktreeEvidenceArchiver({
       ralphHome: this.ralphHome,
       configManager: this.configManager,
@@ -234,6 +274,104 @@ export class ReclamationService {
     return Math.max(0, getNumber(this.configManager.get('reclamation.startupDelaySeconds'), 30)) * 1000;
   }
 
+  getDiskPressureCheckIntervalMs(): number {
+    return Math.max(1, getNumber(this.configManager.get('reclamation.diskPressure.checkIntervalSeconds'), 60)) * 1000;
+  }
+
+  private getDiskPressureSnapshot(paths: string[]): DiskPressureSnapshot {
+    const enabled = getBoolean(this.configManager.get('reclamation.diskPressure.enabled'), true);
+    const checkedPaths = [...new Set(paths.map((entry) => path.resolve(entry)))];
+    const minFreeBytes = getNumber(this.configManager.get('reclamation.diskPressure.minFreeBytes'), 10 * 1024 * 1024 * 1024);
+    const minFreePercent = getNumber(this.configManager.get('reclamation.diskPressure.minFreePercent'), 10);
+    const targetFreeBytes = getNumber(this.configManager.get('reclamation.diskPressure.targetFreeBytes'), 30 * 1024 * 1024 * 1024);
+    const emergencyFreeBytes = getNumber(this.configManager.get('reclamation.diskPressure.emergencyFreeBytes'), 5 * 1024 * 1024 * 1024);
+
+    if (!enabled) {
+      return {
+        enabled: false,
+        active: false,
+        emergency: false,
+        checkedPaths,
+        minFreeBytes,
+        minFreePercent,
+        targetFreeBytes,
+        emergencyFreeBytes,
+        reason: 'disk_pressure_disabled',
+      };
+    }
+
+    if (this.diskPressureProvider) {
+      return this.diskPressureProvider(checkedPaths);
+    }
+
+    const snapshots = checkedPaths
+      .map((candidatePath) => this.readDiskPressurePath(candidatePath, {
+        minFreeBytes,
+        minFreePercent,
+        targetFreeBytes,
+        emergencyFreeBytes,
+      }))
+      .filter((snapshot): snapshot is DiskPressureSnapshot => Boolean(snapshot));
+    const mostConstrained = snapshots.sort((a, b) => (a.freeBytes ?? Number.POSITIVE_INFINITY) - (b.freeBytes ?? Number.POSITIVE_INFINITY))[0];
+
+    return mostConstrained ?? {
+      enabled: true,
+      active: false,
+      emergency: false,
+      checkedPaths,
+      minFreeBytes,
+      minFreePercent,
+      targetFreeBytes,
+      emergencyFreeBytes,
+      reason: 'disk_pressure_stat_unavailable',
+    };
+  }
+
+  private readDiskPressurePath(
+    candidatePath: string,
+    thresholds: Pick<DiskPressureSnapshot, 'minFreeBytes' | 'minFreePercent' | 'targetFreeBytes' | 'emergencyFreeBytes'>,
+  ): DiskPressureSnapshot | undefined {
+    try {
+      const statPath = fs.existsSync(candidatePath)
+        ? candidatePath
+        : path.dirname(candidatePath);
+      const stat = fs.statfsSync(statPath);
+      const blockSize = Number(stat.bsize);
+      const availableBlocks = Number(stat.bavail);
+      const totalBlocks = Number(stat.blocks);
+      const freeBytes = availableBlocks * blockSize;
+      const totalBytes = totalBlocks * blockSize;
+      const freePercent = totalBytes > 0 ? (freeBytes / totalBytes) * 100 : undefined;
+      const belowByteFloor = thresholds.minFreeBytes !== undefined && freeBytes < thresholds.minFreeBytes;
+      const belowPercentFloor = thresholds.minFreePercent !== undefined
+        && freePercent !== undefined
+        && freePercent < thresholds.minFreePercent;
+      const emergency = thresholds.emergencyFreeBytes !== undefined && freeBytes < thresholds.emergencyFreeBytes;
+      const active = belowByteFloor || belowPercentFloor || emergency;
+
+      return {
+        enabled: true,
+        active,
+        emergency,
+        checkedPaths: [path.resolve(candidatePath)],
+        path: path.resolve(statPath),
+        freeBytes,
+        totalBytes,
+        freePercent,
+        ...thresholds,
+        reason: active
+          ? emergency
+            ? 'disk_pressure_emergency_free_bytes'
+            : belowByteFloor
+              ? 'disk_pressure_min_free_bytes'
+              : 'disk_pressure_min_free_percent'
+          : 'disk_pressure_ok',
+      };
+    } catch {
+      return undefined;
+    }
+  }
+
   async run(options: ReclamationRunOptions = {}): Promise<ReclamationReport> {
     const mode = options.mode ?? 'manual';
     const dryRun = Boolean(options.dryRun);
@@ -253,6 +391,17 @@ export class ReclamationService {
       errors: [],
     };
     const shouldWriteReport = !(dryRun && mode === 'manual');
+
+    if (mode === 'disk_pressure') {
+      report.diskPressure = this.getDiskPressureSnapshot(
+        [options.repoPath, this.ralphHome].filter(Boolean) as string[],
+      );
+
+      if (!report.diskPressure.active) {
+        report.finishedAt = new Date(this.now()).toISOString();
+        return report;
+      }
+    }
 
     if (shouldWriteReport && getBoolean(this.configManager.get('reclamation.reporting.writeLastRun'), true)) {
       report.reportPath = path.join(this.ralphHome, 'reclamation', 'last-run.json');
@@ -343,7 +492,8 @@ export class ReclamationService {
     const candidates: WorktreeCandidate[] = [];
 
     for (const task of tasks) {
-      if (!TERMINAL_STATUSES.has(task.status) || !task.worktree) {
+      const taskStatus = getTaskStatus(task);
+      if (!TERMINAL_STATUSES.has(taskStatus) || !task.worktree) {
         continue;
       }
 
@@ -355,13 +505,13 @@ export class ReclamationService {
         kind: 'task_worktree',
         task,
         taskId: task.id,
-        status: task.status,
+        status: taskStatus,
         repoPath: task.repoPath,
         worktree: task.worktree,
         finishedAt,
         ageHours,
         retentionHours,
-        tier: this.getTaskTier(task, options),
+        tier: this.getTaskTier(task, options, inspection),
         reclaimable: ageHours >= retentionHours,
         existed: inspection.exists,
         inspection,
@@ -377,7 +527,7 @@ export class ReclamationService {
       candidates.push(candidate);
     }
 
-    if (options.mode !== 'manual' && options.olderThanHours === undefined) {
+    if (options.mode !== 'manual' && options.mode !== 'disk_pressure' && options.olderThanHours === undefined) {
       const keepNewestPerRepo = Math.max(0, getNumber(this.configManager.get('reclamation.worktrees.keepNewestPerRepo'), 5));
 
       for (const repoCandidates of groupedByRepo.values()) {
@@ -414,8 +564,9 @@ export class ReclamationService {
     }
 
     const candidates: WorktreeCandidate[] = [];
-    const cleanRetentionHours = options.olderThanHours ?? getNumber(this.configManager.get('reclamation.worktrees.orphanRetentionHours'), 24);
-    const dirtyRetentionHours = options.olderThanHours ?? getNumber(this.configManager.get('reclamation.worktrees.dirtyOrphanRetentionHours'), 720);
+    const retentionOverrideHours = this.getRetentionOverrideHours(options);
+    const cleanRetentionHours = retentionOverrideHours ?? getNumber(this.configManager.get('reclamation.worktrees.orphanRetentionHours'), 24);
+    const dirtyRetentionHours = retentionOverrideHours ?? getNumber(this.configManager.get('reclamation.worktrees.dirtyOrphanRetentionHours'), 720);
 
     for (const repoPath of repoPaths) {
       if (!fs.existsSync(path.join(repoPath, '.git'))) {
@@ -459,6 +610,7 @@ export class ReclamationService {
     report: ReclamationReport,
     options: ReclamationRunOptions,
   ): Promise<void> {
+    candidate = await this.refreshTaskCandidate(candidate, options);
     const result = this.toReportCandidate(candidate);
     report.worktrees.candidates++;
 
@@ -469,6 +621,7 @@ export class ReclamationService {
     result.safetyGates = decision.safetyGates;
 
     if (decision.action === 'skip' || decision.action === 'retain') {
+      this.pruneRetainedDirtyWorktreeCaches(candidate, result, report, options, decision);
       report.skipped.push(result);
       report.worktrees.skipped++;
       return;
@@ -497,6 +650,7 @@ export class ReclamationService {
         result.evidenceManifestPath = evidence.manifestPath;
         result.evidenceComplete = evidence.complete;
         result.evidenceBytes = evidence.bytes;
+        result.evidenceReused = evidence.reused;
 
         if (!evidence.ok || !evidence.complete) {
           result.reason = evidence.error || 'evidence_archive_incomplete';
@@ -511,7 +665,9 @@ export class ReclamationService {
           return;
         }
 
-        report.worktrees.archived++;
+        if (!evidence.reused) {
+          report.worktrees.archived++;
+        }
 
         if (decision.action === 'archive_only') {
           result.reason = this.getArchiveOnlyReason(decision);
@@ -538,7 +694,9 @@ export class ReclamationService {
       return;
     }
 
-    const removal = await this.worktreeManager.removeWorktreeSafe(candidate.repoPath, candidate.worktree, { force: true });
+    const removal = await this.worktreeManager.removeWorktreeSafe(candidate.repoPath, candidate.worktree, {
+      force: decision.action === 'archive_then_reclaim',
+    });
     if (!removal.removed) {
       result.reason = removal.error || 'remove_failed';
       report.errors.push({
@@ -554,6 +712,56 @@ export class ReclamationService {
     report.removed++;
     report.worktrees.removed++;
     await this.recordTaskWorktreeReclaimed(candidate, report);
+  }
+
+  private async refreshTaskCandidate(candidate: WorktreeCandidate, options: ReclamationRunOptions): Promise<WorktreeCandidate> {
+    if (candidate.kind !== 'task_worktree' || !candidate.taskId) {
+      return candidate;
+    }
+
+    const latestTask = await this.stateManager.loadTask(candidate.taskId);
+    if (!latestTask) {
+      return {
+        ...candidate,
+        task: undefined,
+        reclaimable: false,
+        reason: 'task_state_missing_before_reclaim',
+      };
+    }
+
+    const latestStatus = getTaskStatus(latestTask);
+    const latestWorktree = latestTask.worktree ? path.resolve(latestTask.worktree) : undefined;
+    const candidateWorktree = path.resolve(candidate.worktree);
+    if (!TERMINAL_STATUSES.has(latestStatus) || latestWorktree !== candidateWorktree) {
+      return {
+        ...candidate,
+        task: latestTask,
+        status: latestStatus,
+        reclaimable: false,
+        reason: !TERMINAL_STATUSES.has(latestStatus)
+          ? 'task_state_active_before_reclaim'
+          : 'task_worktree_changed_before_reclaim',
+      };
+    }
+
+    const now = this.now();
+    const finishedAt = getTaskFinishedAt(latestTask);
+    const ageHours = Math.max(0, (now - finishedAt) / (60 * 60 * 1000));
+    const retentionHours = this.getTaskRetentionHours(latestTask, options, candidate.inspection);
+    const stillReclaimable = ageHours >= retentionHours;
+
+    return {
+      ...candidate,
+      task: latestTask,
+      status: latestStatus,
+      finishedAt,
+      ageHours,
+      retentionHours,
+      reclaimable: candidate.reclaimable && stillReclaimable,
+      reason: candidate.reclaimable && !stillReclaimable
+        ? `retained_until_${retentionHours}h`
+        : candidate.reason,
+    };
   }
 
   private decideWorktreeReclamation(
@@ -680,6 +888,10 @@ export class ReclamationService {
         return options.dirtyOrphanModeOverride;
       }
 
+      if (options.mode === 'disk_pressure') {
+        return 'retain';
+      }
+
       if (options.mode === 'manual' && !options.includeDirtyOrphanWorktrees) {
         return 'retain';
       }
@@ -689,6 +901,10 @@ export class ReclamationService {
 
     if (options.dirtyTerminalModeOverride) {
       return options.dirtyTerminalModeOverride;
+    }
+
+    if (options.mode === 'disk_pressure') {
+      return 'retain';
     }
 
     if (options.mode === 'manual') {
@@ -703,6 +919,82 @@ export class ReclamationService {
     return getBoolean(this.configManager.get('reclamation.worktrees.removeDirtyFailedWorktrees'), false)
       ? 'archive_then_reclaim'
       : 'retain';
+  }
+
+  private pruneRetainedDirtyWorktreeCaches(
+    candidate: WorktreeCandidate,
+    result: ReclamationCandidateReport,
+    report: ReclamationReport,
+    options: ReclamationRunOptions,
+    decision: ReclamationDecision,
+  ): void {
+    if (
+      options.mode !== 'disk_pressure'
+      || !candidate.existed
+      || !candidate.inspection?.dirty
+      || !candidate.inspection.pathInsideRalphWorktrees
+      || (decision.reason !== 'dirty_orphan_retained' && decision.reason !== 'dirty_terminal_worktree_retained')
+    ) {
+      return;
+    }
+
+    report.tempDirs.scanned++;
+    const prunableCachePaths: string[] = [];
+    const prunedCachePaths: string[] = [];
+
+    for (const relativeCachePath of DISK_PRESSURE_WORKTREE_CACHE_DIRS) {
+      const cachePath = path.resolve(candidate.worktree, relativeCachePath);
+      if (!isPathInside(candidate.worktree, cachePath) || !fs.existsSync(cachePath)) {
+        continue;
+      }
+
+      let stat: fs.Stats;
+      try {
+        stat = fs.lstatSync(cachePath);
+      } catch (error) {
+        report.errors.push({
+          kind: 'worktree_cache_stat_failed',
+          path: cachePath,
+          taskId: candidate.taskId,
+          message: error instanceof Error ? error.message : String(error),
+        });
+        continue;
+      }
+
+      if (!stat.isDirectory()) {
+        report.tempDirs.skipped++;
+        continue;
+      }
+
+      report.tempDirs.candidates++;
+      prunableCachePaths.push(cachePath);
+
+      if (options.dryRun) {
+        report.tempDirs.skipped++;
+        continue;
+      }
+
+      try {
+        fs.rmSync(cachePath, { recursive: true, force: true });
+        report.tempDirs.removed++;
+        prunedCachePaths.push(cachePath);
+      } catch (error) {
+        report.errors.push({
+          kind: 'worktree_cache_remove_failed',
+          path: cachePath,
+          taskId: candidate.taskId,
+          message: error instanceof Error ? error.message : String(error),
+        });
+      }
+    }
+
+    if (prunableCachePaths.length > 0) {
+      result.prunableCachePaths = prunableCachePaths;
+    }
+
+    if (prunedCachePaths.length > 0) {
+      result.prunedCachePaths = prunedCachePaths;
+    }
   }
 
   private readDirtyMode(key: string, fallback: DirtyWorktreeReclamationMode): DirtyWorktreeReclamationMode {
@@ -792,7 +1084,11 @@ export class ReclamationService {
     };
     const inspection = candidate.inspection;
 
-    addGate('terminal_status_allowed', candidate.kind === 'orphan_worktree' || Boolean(candidate.task && TERMINAL_STATUSES.has(candidate.task.status)), 'status_not_terminal');
+    addGate(
+      'terminal_status_allowed',
+      candidate.kind === 'orphan_worktree' || Boolean(candidate.task && TERMINAL_STATUSES.has(getTaskStatus(candidate.task))),
+      'status_not_terminal',
+    );
     addGate('task_not_active', !candidate.task || (!isPidRunning(candidate.task.pid) && !(candidate.task.leaseExpiresAt && candidate.task.leaseExpiresAt > this.now())), 'task_active_or_leased');
     addGate('path_confined', Boolean(inspection?.pathInsideRalphWorktrees), 'path_outside_ralph_worktrees');
 
@@ -989,11 +1285,28 @@ export class ReclamationService {
     options: ReclamationRunOptions,
     inspection?: WorktreeInspection,
   ): number {
-    if (options.olderThanHours !== undefined) {
-      return options.olderThanHours;
+    const retentionOverrideHours = this.getRetentionOverrideHours(options);
+    if (retentionOverrideHours !== undefined) {
+      return retentionOverrideHours;
     }
 
-    if (task.status === 'completed') {
+    const taskStatus = getTaskStatus(task);
+
+    if (taskStatus === 'stopped') {
+      if (inspection?.dirty) {
+        return getNumber(
+          this.configManager.get('reclamation.worktrees.dirtyStoppedRetentionHours'),
+          getNumber(this.configManager.get('reclamation.worktrees.dirtyFailedRetentionHours'), 336),
+        );
+      }
+
+      return getNumber(
+        this.configManager.get('reclamation.worktrees.stoppedCleanRetentionHours'),
+        getNumber(this.configManager.get('reclamation.worktrees.completedRetentionHours'), 24),
+      );
+    }
+
+    if (taskStatus === 'completed') {
       const targetSyncStatus = resolveTaskTargetSyncStatus(task);
       if (targetSyncStatus === 'deferred_dirty_checkout' || targetSyncStatus === 'failed') {
         return getNumber(this.configManager.get('reclamation.worktrees.targetSyncDeferredRetentionHours'), 72);
@@ -1002,7 +1315,7 @@ export class ReclamationService {
       return getNumber(this.configManager.get('reclamation.worktrees.completedRetentionHours'), 24);
     }
 
-    if (task.status === 'failed_finalize') {
+    if (taskStatus === 'failed_finalize') {
       if (inspection?.dirty) {
         return getNumber(
           this.configManager.get('reclamation.worktrees.dirtyFailedFinalizeRetentionHours'),
@@ -1013,7 +1326,7 @@ export class ReclamationService {
       return getNumber(this.configManager.get('reclamation.worktrees.failedFinalizeRetentionHours'), 168);
     }
 
-    if (task.status === 'stagnant') {
+    if (taskStatus === 'stagnant') {
       if (inspection?.dirty) {
         return getNumber(
           this.configManager.get('reclamation.worktrees.dirtyStagnantRetentionHours'),
@@ -1031,12 +1344,22 @@ export class ReclamationService {
     return getNumber(this.configManager.get('reclamation.worktrees.failedRetentionHours'), 168);
   }
 
-  private getTaskTier(task: Task, options: ReclamationRunOptions): string {
+  private getTaskTier(task: Task, options: ReclamationRunOptions, inspection?: WorktreeInspection): string {
     if (options.olderThanHours !== undefined) {
       return 'manual_retention';
     }
 
-    if (task.status === 'completed') {
+    if (options.mode === 'disk_pressure') {
+      return 'disk_pressure_retention';
+    }
+
+    const taskStatus = getTaskStatus(task);
+
+    if (taskStatus === 'stopped') {
+      return inspection?.dirty ? 'debug_stopped_dirty' : 'safe_stopped_clean';
+    }
+
+    if (taskStatus === 'completed') {
       const targetSyncStatus = resolveTaskTargetSyncStatus(task);
       if (targetSyncStatus === 'deferred_dirty_checkout' || targetSyncStatus === 'failed') {
         return 'safe_completed_target_sync_deferred';
@@ -1045,7 +1368,19 @@ export class ReclamationService {
       return 'safe_completed';
     }
 
-    return `debug_${task.status}`;
+    return `debug_${taskStatus}`;
+  }
+
+  private getRetentionOverrideHours(options: ReclamationRunOptions): number | undefined {
+    if (options.olderThanHours !== undefined) {
+      return options.olderThanHours;
+    }
+
+    if (options.mode === 'disk_pressure') {
+      return 0;
+    }
+
+    return undefined;
   }
 
   private shouldCleanupOrphans(): boolean {

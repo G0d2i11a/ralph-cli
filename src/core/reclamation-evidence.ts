@@ -6,11 +6,13 @@ import { Task, TaskStatus } from '../types/task';
 import { ReclamationDecision } from './reclamation-policy';
 import { WorktreeInspection, WorktreeManager } from './worktree';
 
+type ReclamationEvidenceStatus = TaskStatus | 'stopped' | 'orphan';
+
 export interface ReclamationEvidenceCandidate {
   kind: 'task_worktree' | 'orphan_worktree';
   task?: Task;
   taskId?: string;
-  status?: TaskStatus | 'orphan';
+  status?: ReclamationEvidenceStatus;
   repoPath: string;
   worktree: string;
   tier: string;
@@ -48,7 +50,7 @@ export interface ReclamationEvidenceManifest {
   candidate: {
     kind: 'task_worktree' | 'orphan_worktree';
     taskId?: string;
-    status?: TaskStatus | 'orphan';
+    status?: ReclamationEvidenceStatus;
     repoPath: string;
     worktree: string;
     branch?: string;
@@ -79,6 +81,7 @@ export interface EvidenceArchiveResult {
   dir?: string;
   manifestPath?: string;
   bytes?: number;
+  reused?: boolean;
   error?: string;
 }
 
@@ -140,6 +143,14 @@ function isPathInside(parentPath: string, candidatePath: string): boolean {
   return relative === '' || (!relative.startsWith('..') && !path.isAbsolute(relative));
 }
 
+function isIgnoredUntrackedEvidencePath(relativeFile: string): boolean {
+  const normalized = relativeFile.replace(/\\/g, '/');
+  return normalized === '.git'
+    || normalized.startsWith('.git/')
+    || normalized === '.git-local'
+    || normalized.startsWith('.git-local/');
+}
+
 export class WorktreeEvidenceArchiver {
   private readonly ralphHome: string;
   private readonly configManager: Pick<ConfigManager, 'get'>;
@@ -162,10 +173,15 @@ export class WorktreeEvidenceArchiver {
       return { ok: false, complete: false, error: 'evidence_disabled' };
     }
 
+    const evidenceRoot = resolveEvidenceRoot(this.ralphHome, this.configManager.get('reclamation.evidence.dir'));
+    const reusable = await this.findReusableArchive(candidate, decision, evidenceRoot);
+    if (reusable) {
+      return reusable;
+    }
+
     const createdAt = new Date(this.now()).toISOString();
     const dateSegment = createdAt.slice(0, 10);
     const id = this.buildArchiveId(candidate);
-    const evidenceRoot = resolveEvidenceRoot(this.ralphHome, this.configManager.get('reclamation.evidence.dir'));
     const tempDir = this.uniqueFinalDir(path.join(evidenceRoot, '.tmp', id));
     const finalDir = this.uniqueFinalDir(path.join(evidenceRoot, dateSegment, id));
     const artifacts: ReclamationEvidenceArtifact[] = [];
@@ -269,12 +285,16 @@ export class WorktreeEvidenceArchiver {
         writeText(
           'untracked_file_list',
           'untracked-files.txt',
-          `${untrackedFileList.join('\n')}${untrackedFileList.length > 0 ? '\n' : ''}`,
+          this.formatUntrackedFileList(untrackedFileList),
           ['git', 'ls-files', '--others', '--exclude-standard'],
         );
 
         const worktreeRealPath = fs.realpathSync(candidate.worktree);
         for (const relativeFile of untrackedFileList.slice(0, maxUntrackedFiles)) {
+          if (isIgnoredUntrackedEvidencePath(relativeFile)) {
+            continue;
+          }
+
           const absoluteFile = path.resolve(candidate.worktree, relativeFile);
           if (!isPathInside(worktreeRealPath, fs.existsSync(absoluteFile) ? fs.realpathSync(path.dirname(absoluteFile)) : absoluteFile)) {
             continue;
@@ -379,6 +399,112 @@ export class WorktreeEvidenceArchiver {
         error: message,
       };
     }
+  }
+
+  private async findReusableArchive(
+    candidate: ReclamationEvidenceCandidate,
+    decision: ReclamationDecision,
+    evidenceRoot: string,
+  ): Promise<EvidenceArchiveResult | undefined> {
+    if (decision.action !== 'archive_only') {
+      return undefined;
+    }
+
+    const manifestPath = candidate.task?.worktreeReclaimEvidenceManifestPath;
+    if (!manifestPath) {
+      return undefined;
+    }
+
+    const resolvedManifestPath = path.resolve(manifestPath);
+    const resolvedEvidenceRoot = path.resolve(evidenceRoot);
+    if (!isPathInside(resolvedEvidenceRoot, resolvedManifestPath) || !fs.existsSync(resolvedManifestPath)) {
+      return undefined;
+    }
+
+    try {
+      const manifest = JSON.parse(fs.readFileSync(resolvedManifestPath, 'utf-8')) as ReclamationEvidenceManifest;
+      if (!(await this.isReusableManifest(manifest, candidate, decision))) {
+        return undefined;
+      }
+
+      const dir = path.dirname(resolvedManifestPath);
+      return {
+        ok: true,
+        complete: true,
+        dir,
+        manifestPath: resolvedManifestPath,
+        bytes: this.measureDirectoryBytes(dir),
+        reused: true,
+      };
+    } catch {
+      return undefined;
+    }
+  }
+
+  private async isReusableManifest(
+    manifest: ReclamationEvidenceManifest,
+    candidate: ReclamationEvidenceCandidate,
+    decision: ReclamationDecision,
+  ): Promise<boolean> {
+    if (manifest.schemaVersion !== 1 || manifest.complete !== true) {
+      return false;
+    }
+
+    if (manifest.decision?.action !== decision.action) {
+      return false;
+    }
+
+    const manifestCandidate = manifest.candidate;
+    if (
+      manifestCandidate.kind !== candidate.kind
+      || (manifestCandidate.taskId ?? '') !== (candidate.taskId ?? '')
+      || String(manifestCandidate.status ?? '') !== String(candidate.status ?? '')
+      || path.resolve(manifestCandidate.repoPath) !== path.resolve(candidate.repoPath)
+      || path.resolve(manifestCandidate.worktree) !== path.resolve(candidate.worktree)
+    ) {
+      return false;
+    }
+
+    if (candidate.inspection?.branch && manifestCandidate.branch !== candidate.inspection.branch) {
+      return false;
+    }
+
+    if (candidate.inspection?.head && manifestCandidate.head !== candidate.inspection.head) {
+      return false;
+    }
+
+    return this.currentFingerprintMatches(manifest, candidate);
+  }
+
+  private async currentFingerprintMatches(
+    manifest: ReclamationEvidenceManifest,
+    candidate: ReclamationEvidenceCandidate,
+  ): Promise<boolean> {
+    try {
+      return this.artifactShaMatches(manifest, 'status_porcelain', await this.worktreeManager.getWorktreeStatusPorcelainV2(candidate.worktree))
+        && this.artifactShaMatches(manifest, 'diff_patch', await this.worktreeManager.getWorktreeDiffPatch(candidate.worktree))
+        && this.artifactShaMatches(manifest, 'cached_diff_patch', await this.worktreeManager.getWorktreeCachedDiffPatch(candidate.worktree))
+        && this.artifactShaMatches(
+          manifest,
+          'untracked_file_list',
+          this.formatUntrackedFileList(await this.worktreeManager.listUntrackedFiles(candidate.worktree)),
+        );
+    } catch {
+      return false;
+    }
+  }
+
+  private artifactShaMatches(
+    manifest: ReclamationEvidenceManifest,
+    kind: ReclamationEvidenceArtifact['kind'],
+    content: string,
+  ): boolean {
+    const artifact = manifest.artifacts.find((entry) => entry.kind === kind);
+    return Boolean(artifact?.sha256) && artifact?.sha256 === sha256(Buffer.from(content, 'utf-8'));
+  }
+
+  private formatUntrackedFileList(untrackedFileList: string[]): string {
+    return `${untrackedFileList.join('\n')}${untrackedFileList.length > 0 ? '\n' : ''}`;
   }
 
   private buildArchiveId(candidate: ReclamationEvidenceCandidate): string {

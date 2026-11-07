@@ -121,6 +121,12 @@ test('ConfigManager defaults agent.backend to cli', withTempHome(async () => {
   assert.equal(manager.get('reclamation.intervalSeconds'), 900);
   assert.equal(manager.get('reclamation.startupDelaySeconds'), 30);
   assert.equal(manager.get('reclamation.maxRunSeconds'), 30);
+  assert.equal(manager.get('reclamation.diskPressure.enabled'), true);
+  assert.equal(manager.get('reclamation.diskPressure.checkIntervalSeconds'), 60);
+  assert.equal(manager.get('reclamation.diskPressure.minFreePercent'), 10);
+  assert.equal(manager.get('reclamation.diskPressure.minFreeBytes'), 10 * 1024 * 1024 * 1024);
+  assert.equal(manager.get('reclamation.diskPressure.targetFreeBytes'), 30 * 1024 * 1024 * 1024);
+  assert.equal(manager.get('reclamation.diskPressure.emergencyFreeBytes'), 5 * 1024 * 1024 * 1024);
   assert.equal(manager.get('reclamation.worktrees.enabled'), true);
   assert.equal(manager.get('reclamation.worktrees.completedRetentionHours'), 24);
   assert.equal(manager.get('reclamation.worktrees.failedRetentionHours'), 168);
