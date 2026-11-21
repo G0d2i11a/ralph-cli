@@ -25,6 +25,7 @@ test('toolchain env preserves explicit COREPACK_HOME while HOME is sandboxed', (
     const { env, fingerprint } = buildRalphToolchainEnv({
       baseEnv: {
         ...process.env,
+        CI: undefined,
         HOME: sandboxHome,
         COREPACK_HOME: corepackHome,
       },

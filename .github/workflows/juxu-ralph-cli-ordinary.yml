@@ -7,6 +7,10 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: juxu-ralph-cli-ordinary
+  cancel-in-progress: false
+
 jobs:
   verify:
     name: Test Ralph CLI
